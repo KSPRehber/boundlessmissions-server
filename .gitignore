@@ -1,0 +1,41 @@
+# Git version control
+.git/
+
+# Environment secrets – NEVER commit these
+.env
+firebase-key.json
+*-adminsdk-*.json
+*.json.key
+
+# User data (persistent but not committed)
+data/*.json
+data/*.tmp
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Databases (if added later)
+*.db
+*.sqlite
+*.sqlite3

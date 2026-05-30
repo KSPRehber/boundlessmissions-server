@@ -246,9 +246,6 @@ async def _handle_selection(interaction: discord.Interaction, week_key: str, gui
 
     await interaction.response.defer(ephemeral=True)
 
-    # Save selection
-    _save_selection(guild_id, week_key, uid, mission["id"])
-
     # Post contract in corp channel
     corp_channel_id = int(corp["channel_id"])
     channel = interaction.client.get_channel(corp_channel_id)
@@ -299,6 +296,9 @@ async def _handle_selection(interaction: discord.Interaction, week_key: str, gui
     view = ContractWorkView(c["contract_id"], guild_id)
     msg = await channel.send(embed=embed, view=view)
     cdb.update_contract(guild_id, c["contract_id"], dm_message_id=str(msg.id), status=cdb.ACTIVE)
+
+    # Save selection ONLY after everything succeeded
+    _save_selection(guild_id, week_key, uid, mission["id"])
 
     await interaction.followup.send(
         t(guild_id, "wm.accepted", n=mission["id"], channel=channel.mention),

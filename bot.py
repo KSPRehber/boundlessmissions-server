@@ -122,6 +122,12 @@ class GeneKermanBot(commands.Bot):
                 self.tree.copy_global_to(guild=guild)
                 synced = await self.tree.sync(guild=guild)
                 log.info("Synced %d commands to guild %d", len(synced), guild_id)
+                
+            # Wipe global commands on Discord's side by clearing internal global commands
+            # AFTER we already copied them to the guild.
+            self.tree.clear_commands(guild=None)
+            await self.tree.sync(guild=None)
+            log.info("Wiped any leftover global commands.")
         else:
             synced = await self.tree.sync()
             log.info("Synced %d global slash commands", len(synced))

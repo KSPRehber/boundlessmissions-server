@@ -1,6 +1,6 @@
 # Discord Bot – Gene Kerman
 
-A modular, production-ready Discord bot built with **discord.py 2.x** designed for Kerbal Space Program (KSP) communities. Features a fully-fledged economy, corporation system, contracts, weekly missions, and AI-powered screenshot analysis.
+A modular, non-production-ready Discord bot built with **discord.py 2.x** designed for Kerbal Space Program (KSP) communities. Features a fully-fledged economy, corporation system, contracts, weekly missions, and AI-powered screenshot analysis.
 
 ## Features
 

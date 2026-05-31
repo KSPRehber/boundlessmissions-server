@@ -61,7 +61,7 @@ def _default_user() -> UserData:
         "messages": 0,
         "last_xp_time": 0.0,
         "joined_at": "",
-        "max_unlocked_level": 0,
+        "unlocked_levels": [],
     }
 
 
@@ -239,13 +239,20 @@ class UserStore:
             self._mark_dirty(guild_id, user_id)
             return user["balance"]
 
-    async def update_max_unlocked_level(self, guild_id: int, user_id: int, level: int) -> bool:
-        """Update the max unlocked level if the new level is higher. Returns True if updated."""
+    async def add_unlocked_level(self, guild_id: int, user_id: int, level: int) -> bool:
+        """Add a level to unlocked_levels if not already present. Returns True if newly added."""
         async with self._lock:
             user = self.get_user(guild_id, user_id)
-            current = user.get("max_unlocked_level", 0)
-            if level > current:
-                user["max_unlocked_level"] = level
+            # handle legacy data safely
+            if "unlocked_levels" not in user:
+                # If they had max_unlocked_level, convert it
+                old_max = user.pop("max_unlocked_level", 0)
+                user["unlocked_levels"] = list(range(1, old_max + 1)) if old_max > 0 else []
+                
+            unlocked = set(user["unlocked_levels"])
+            if level not in unlocked:
+                unlocked.add(level)
+                user["unlocked_levels"] = sorted(list(unlocked))
                 self._mark_dirty(guild_id, user_id)
                 return True
             return False

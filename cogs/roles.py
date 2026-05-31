@@ -10,11 +10,11 @@ from i18n import tp
 
 log = logging.getLogger(__name__)
 
-async def sync_user_max_level(bot: commands.Bot, uid: int) -> int:
-    """Scans all guilds to find the highest level role the user has.
-    Updates the store if it's higher than current, and returns the max unlocked level.
+async def sync_user_levels(bot: commands.Bot, uid: int) -> set[int]:
+    """Scans all guilds to find the level roles the user has.
+    Updates the store if it finds new ones, and returns the set of all unlocked levels.
     """
-    max_found = 0
+    found_levels = set()
     
     for guild in bot.guilds:
         member = guild.get_member(uid)
@@ -24,26 +24,29 @@ async def sync_user_max_level(bot: commands.Bot, uid: int) -> int:
         for level, r_info in settings.LEVEL_ROLES.items():
             role_id = r_info[0]
             if any(r.id == role_id for r in member.roles):
-                if level > max_found:
-                    max_found = level
+                found_levels.add(level)
                     
-    # Ensure store is updated if we found a higher level
-    if max_found > 0:
-        # We need a guild_id for store. Let's just use the first guild we share, or a generic one.
-        # Since max_unlocked_level is checked across all guilds later, updating it in one is fine.
-        shared_guilds = [g.id for g in bot.guilds if g.get_member(uid)]
-        if shared_guilds:
-            await store.update_max_unlocked_level(shared_guilds[0], uid, max_found)
+    # Ensure store is updated if we found new levels
+    shared_guilds = [g.id for g in bot.guilds if g.get_member(uid)]
+    if shared_guilds:
+        gid = shared_guilds[0]
+        for lvl in found_levels:
+            await store.add_unlocked_level(gid, uid, lvl)
             
-    # Also check what's already in the store just in case they unlocked it but don't have it equipped
-    store_max = 0
+    # Also grab whatever was already stored
+    all_unlocked = set(found_levels)
     for g in bot.guilds:
         user_data = store.get_user(g.id, uid)
-        s_lvl = user_data.get("max_unlocked_level", 0)
-        if s_lvl > store_max:
-            store_max = s_lvl
+        s_levels = user_data.get("unlocked_levels", [])
+        all_unlocked.update(s_levels)
+        
+        # Legacy fallback
+        old_max = user_data.get("max_unlocked_level", 0)
+        if old_max > 0:
+            for l in range(1, old_max + 1):
+                all_unlocked.add(l)
             
-    return max(max_found, store_max)
+    return all_unlocked
 
 
 def get_equipped_levels(bot: commands.Bot, uid: int) -> set[int]:
@@ -60,10 +63,10 @@ def get_equipped_levels(bot: commands.Bot, uid: int) -> set[int]:
 
 
 class LevelSelector(Select):
-    def __init__(self, max_level: int, equipped: set[int]):
-        self.max_level = max_level
+    def __init__(self, unlocked: set[int], equipped: set[int]):
+        self.unlocked = unlocked
         options = []
-        for lvl in range(1, max_level + 1):
+        for lvl in sorted(list(unlocked)):
             if lvl in settings.LEVEL_ROLES:
                 r_info = settings.LEVEL_ROLES[lvl]
                 options.append(discord.SelectOption(
@@ -94,8 +97,8 @@ class LevelSelector(Select):
         selected_levels = set(int(v) for v in self.values)
         
         # Verify they aren't cheating the client
-        max_unlocked = await sync_user_max_level(interaction.client, uid)
-        if any(lvl > max_unlocked for lvl in selected_levels):
+        unlocked = await sync_user_levels(interaction.client, uid)
+        if any(lvl not in unlocked for lvl in selected_levels):
             await interaction.response.send_message("❌ You selected a level you haven't unlocked.", ephemeral=True)
             return
             
@@ -142,9 +145,9 @@ class LevelSelector(Select):
 
 
 class LevelRoleView(View):
-    def __init__(self, max_level: int, equipped: set[int]):
+    def __init__(self, unlocked: set[int], equipped: set[int]):
         super().__init__(timeout=None)
-        self.add_item(LevelSelector(max_level, equipped))
+        self.add_item(LevelSelector(unlocked, equipped))
 
 
 class GenericRoleView(View):
@@ -154,16 +157,12 @@ class GenericRoleView(View):
         
     @discord.ui.select(custom_id="level_role_dropdown", options=[discord.SelectOption(label="loading", value="0")])
     async def fallback_callback(self, interaction: discord.Interaction, select: Select):
-        # If someone clicks an old dropdown, we just generate a fresh one for them via ephemeral message
-        # Since Discord handles multi-select state on the client, we actually receive the selected values!
-        # But to be safe and accurate with options, let's just ask them to run /gk roles or process it dynamically
         uid = interaction.user.id
-        max_unlocked = await sync_user_max_level(interaction.client, uid)
+        unlocked = await sync_user_levels(interaction.client, uid)
         equipped = get_equipped_levels(interaction.client, uid)
         
-        # We can dynamically recreate the proper selector and delegate
-        proper_selector = LevelSelector(max_unlocked, equipped)
-        proper_selector.values = select.values # Transfer the user's selection
+        proper_selector = LevelSelector(unlocked, equipped)
+        proper_selector.values = select.values
         await proper_selector.callback(interaction)
 
 
@@ -179,9 +178,8 @@ class Roles(commands.Cog, name="Roles"):
     async def roles_cmd(self, interaction: discord.Interaction) -> None:
         uid = interaction.user.id
         
-        # Determine max level and equipped levels
-        max_unlocked = await sync_user_max_level(self.bot, uid)
-        if max_unlocked == 0:
+        unlocked = await sync_user_levels(self.bot, uid)
+        if not unlocked:
             await interaction.response.send_message(
                 "❌ You have not unlocked any KSP titles yet. Complete missions or upload screenshots to earn them!",
                 ephemeral=True
@@ -189,7 +187,7 @@ class Roles(commands.Cog, name="Roles"):
             return
             
         equipped = get_equipped_levels(self.bot, uid)
-        view = LevelRoleView(max_unlocked, equipped)
+        view = LevelRoleView(unlocked, equipped)
         
         embed = discord.Embed(
             title="🎖️ KSP Title Selector",
@@ -213,21 +211,21 @@ class Roles(commands.Cog, name="Roles"):
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(Roles(bot))
     
-    # Register generic view for persistence so old dropdowns don't crash
     bot.add_view(GenericRoleView())
 
 
 async def check_and_award_level(bot: commands.Bot, guild_id: int, user_id: int, level: int):
-    """Check if user achieved a new high level, update store and DM them if so."""
+    """Check if user achieved a new level, update store and DM them if so."""
     if level not in settings.LEVEL_ROLES:
         return
         
-    is_new = await store.update_max_unlocked_level(guild_id, user_id, level)
+    is_new = await store.add_unlocked_level(guild_id, user_id, level)
     
-    # We also check if we need to sync from their existing roles just to be sure
-    max_unlocked = await sync_user_max_level(bot, user_id)
+    # Check if we need to sync from their existing roles just to be sure
+    unlocked = await sync_user_levels(bot, user_id)
     
-    if is_new or level > max_unlocked:
+    if is_new or level not in unlocked:
+        unlocked.add(level)
         user = bot.get_user(user_id) or await bot.fetch_user(user_id)
         if not user:
             return
@@ -243,8 +241,7 @@ async def check_and_award_level(bot: commands.Bot, guild_id: int, user_id: int, 
         )
         
         equipped = get_equipped_levels(bot, user_id)
-        # Assuming the new max is 'level' or higher
-        view = LevelRoleView(max(level, max_unlocked), equipped)
+        view = LevelRoleView(unlocked, equipped)
         
         try:
             await user.send(embed=embed, view=view)

@@ -7,6 +7,7 @@ from discord.ui import View, Select
 import settings
 from data.store import store
 from i18n import tp
+from cogs.moderation import mod_only
 
 log = logging.getLogger(__name__)
 
@@ -166,6 +167,73 @@ class GenericRoleView(View):
         await proper_selector.callback(interaction)
 
 
+class ModLevelRemoveSelector(Select):
+    def __init__(self, target: discord.Member, unlocked: set[int]):
+        self.target = target
+        options = [discord.SelectOption(label="Remove ALL Levels", value="0", description="Revoke all level titles from this user")]
+        
+        for lvl in sorted(list(unlocked)):
+            if lvl in settings.LEVEL_ROLES:
+                r_info = settings.LEVEL_ROLES[lvl]
+                options.append(discord.SelectOption(
+                    label=f"Level {lvl}: {r_info[1]}",
+                    value=str(lvl)
+                ))
+                
+        super().__init__(
+            placeholder=f"Select level(s) to remove from {target.display_name}...",
+            min_values=1,
+            max_values=len(options),
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        selected = set(int(v) for v in self.values)
+        guild = interaction.guild
+        uid = self.target.id
+        
+        # Check if they selected 0 (Remove ALL)
+        remove_all = 0 in selected
+        
+        removed_roles = []
+        if remove_all:
+            await store.remove_unlocked_level(guild.id, uid, 0)
+            # Remove all level roles from discord member
+            for r_info in settings.LEVEL_ROLES.values():
+                role = guild.get_role(r_info[0])
+                if role and role in self.target.roles:
+                    removed_roles.append(role)
+        else:
+            for lvl in selected:
+                await store.remove_unlocked_level(guild.id, uid, lvl)
+                if lvl in settings.LEVEL_ROLES:
+                    role = guild.get_role(settings.LEVEL_ROLES[lvl][0])
+                    if role and role in self.target.roles:
+                        removed_roles.append(role)
+                        
+        if removed_roles:
+            try:
+                await self.target.remove_roles(*removed_roles, reason=f"Mod {interaction.user} removed level roles")
+            except discord.Forbidden:
+                await interaction.response.send_message("❌ Database updated, but I lack permissions to remove Discord roles.", ephemeral=True)
+                return
+                
+        # Disable select
+        self.disabled = True
+        await interaction.response.edit_message(view=self.view)
+        
+        await interaction.followup.send(
+            f"✅ Successfully removed **{'ALL' if remove_all else len(selected)}** level(s) from {self.target.mention}.",
+            ephemeral=True
+        )
+
+
+class ModLevelRemoveView(View):
+    def __init__(self, target: discord.Member, unlocked: set[int]):
+        super().__init__(timeout=300)
+        self.add_item(ModLevelRemoveSelector(target, unlocked))
+
+
 class Roles(commands.Cog, name="Roles"):
     """Role management and level titles."""
     def __init__(self, bot: commands.Bot) -> None:
@@ -206,6 +274,30 @@ class Roles(commands.Cog, name="Roles"):
                 "❌ I cannot send you a DM. Please enable direct messages from server members.", 
                 ephemeral=True
             )
+
+    @app_commands.command(
+        name="removeroles",
+        description="[MOD] Remove KSP level roles from a user"
+    )
+    @app_commands.describe(target="The user to remove level roles from")
+    @mod_only()
+    async def removeroles_cmd(self, interaction: discord.Interaction, target: discord.Member) -> None:
+        unlocked = await sync_user_levels(self.bot, target.id)
+        if not unlocked:
+            await interaction.response.send_message(
+                f"❌ {target.mention} does not have any KSP level roles unlocked.",
+                ephemeral=True
+            )
+            return
+            
+        view = ModLevelRemoveView(target, unlocked)
+        embed = discord.Embed(
+            title="🛠️ Mod Role Removal",
+            description=f"Select the KSP levels to remove from {target.mention}.\nYou can select specific levels, or choose **Remove ALL Levels**.",
+            color=discord.Color.red()
+        )
+        
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
 async def setup(bot: commands.Bot) -> None:

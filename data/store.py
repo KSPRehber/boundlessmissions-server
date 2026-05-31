@@ -245,13 +245,32 @@ class UserStore:
             user = self.get_user(guild_id, user_id)
             # handle legacy data safely
             if "unlocked_levels" not in user:
-                # If they had max_unlocked_level, convert it
                 old_max = user.pop("max_unlocked_level", 0)
                 user["unlocked_levels"] = list(range(1, old_max + 1)) if old_max > 0 else []
                 
             unlocked = set(user["unlocked_levels"])
             if level not in unlocked:
                 unlocked.add(level)
+                user["unlocked_levels"] = sorted(list(unlocked))
+                self._mark_dirty(guild_id, user_id)
+                return True
+            return False
+
+    async def remove_unlocked_level(self, guild_id: int, user_id: int, level: int) -> bool:
+        """Remove a level from unlocked_levels. Use level=0 to clear all. Returns True if changed."""
+        async with self._lock:
+            user = self.get_user(guild_id, user_id)
+            if "unlocked_levels" not in user:
+                old_max = user.pop("max_unlocked_level", 0)
+                user["unlocked_levels"] = list(range(1, old_max + 1)) if old_max > 0 else []
+                
+            unlocked = set(user["unlocked_levels"])
+            if level == 0 and unlocked:
+                user["unlocked_levels"] = []
+                self._mark_dirty(guild_id, user_id)
+                return True
+            elif level in unlocked:
+                unlocked.remove(level)
                 user["unlocked_levels"] = sorted(list(unlocked))
                 self._mark_dirty(guild_id, user_id)
                 return True

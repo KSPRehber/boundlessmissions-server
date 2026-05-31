@@ -44,8 +44,7 @@ async def sync_user_levels(bot: commands.Bot, uid: int) -> set[int]:
         # Legacy fallback
         old_max = user_data.get("max_unlocked_level", 0)
         if old_max > 0:
-            for l in range(1, old_max + 1):
-                all_unlocked.add(l)
+            all_unlocked.add(old_max)
             
     return all_unlocked
 

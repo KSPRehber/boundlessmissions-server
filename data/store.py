@@ -246,7 +246,7 @@ class UserStore:
             # handle legacy data safely
             if "unlocked_levels" not in user:
                 old_max = user.pop("max_unlocked_level", 0)
-                user["unlocked_levels"] = list(range(1, old_max + 1)) if old_max > 0 else []
+                user["unlocked_levels"] = [old_max] if old_max > 0 else []
                 
             unlocked = set(user["unlocked_levels"])
             if level not in unlocked:
@@ -262,7 +262,7 @@ class UserStore:
             user = self.get_user(guild_id, user_id)
             if "unlocked_levels" not in user:
                 old_max = user.pop("max_unlocked_level", 0)
-                user["unlocked_levels"] = list(range(1, old_max + 1)) if old_max > 0 else []
+                user["unlocked_levels"] = [old_max] if old_max > 0 else []
                 
             unlocked = set(user["unlocked_levels"])
             if level == 0 and unlocked:

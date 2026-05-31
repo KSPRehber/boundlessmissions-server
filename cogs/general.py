@@ -15,6 +15,17 @@ class General(commands.Cog, name="General"):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
 
+def mod_only():
+    async def predicate(interaction: discord.Interaction) -> bool:
+        if isinstance(interaction.user, discord.Member):
+            import settings
+            if settings.MOD_ROLE_ID and interaction.user.get_role(settings.MOD_ROLE_ID):
+                return True
+            return (interaction.user.guild_permissions.kick_members
+                    or interaction.user.guild_permissions.administrator)
+        return False
+    return app_commands.check(predicate)
+
     # ── Prefix: !help ────────────────────────────────────────────────────────
     @commands.command(name="help")
     async def help_prefix(self, ctx: commands.Context) -> None:
@@ -104,7 +115,7 @@ class General(commands.Cog, name="General"):
 
     # ── /tsl (server language, mod-only) ─────────────────────────────────────
     @app_commands.command(name="tsl", description="Toggle server-wide bot language (TR/EN) — Mod only")
-    @app_commands.checks.has_permissions(administrator=True)
+    @mod_only()
     async def tsl(self, interaction: discord.Interaction) -> None:
         gid = interaction.guild_id
         current = get_server_lang(gid)

@@ -5,6 +5,12 @@
 #  Adjust these to tune the XP economy for your server.
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ── Moderation & Roles ───────────────────────────────────────────────────────
+
+# Role ID that grants access to moderation commands (/kick, /ban, /gk setchannel, etc.)
+# If set to None, users must have Discord's built-in Kick Members or Admin permissions.
+MOD_ROLE_ID: int | None = None
+
 # ── XP System ────────────────────────────────────────────────────────────────
 
 # XP awarded per qualifying message

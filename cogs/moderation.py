@@ -15,6 +15,9 @@ log = logging.getLogger(__name__)
 def mod_only():
     async def predicate(interaction: discord.Interaction) -> bool:
         if isinstance(interaction.user, discord.Member):
+            import settings
+            if settings.MOD_ROLE_ID and interaction.user.get_role(settings.MOD_ROLE_ID):
+                return True
             return (interaction.user.guild_permissions.kick_members
                     or interaction.user.guild_permissions.administrator)
         return False
@@ -76,7 +79,7 @@ class Moderation(commands.Cog, name="Moderation"):
 
     @app_commands.command(name="purge", description="Bulk-delete messages from this channel")
     @app_commands.describe(amount="Number of messages to delete (1–200)")
-    @app_commands.checks.has_permissions(manage_messages=True)
+    @mod_only()
     async def purge(self, interaction: discord.Interaction, amount: app_commands.Range[int, 1, 200] = 10) -> None:
         await interaction.response.defer(ephemeral=True)
         deleted = await interaction.channel.purge(limit=amount)

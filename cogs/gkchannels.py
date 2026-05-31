@@ -85,11 +85,21 @@ def get_gk_channel_mentions(guild: discord.Guild) -> str:
 
 
 def is_mod(member: discord.Member) -> bool:
-    """Check if a member has mod permissions (kick or admin)."""
+    """Check if a member has mod permissions (kick, admin, or MOD_ROLE_ID)."""
+    import settings
+    if settings.MOD_ROLE_ID and member.get_role(settings.MOD_ROLE_ID):
+        return True
     return (
         member.guild_permissions.kick_members
         or member.guild_permissions.administrator
     )
+
+def mod_only():
+    async def predicate(interaction: discord.Interaction) -> bool:
+        if isinstance(interaction.user, discord.Member):
+            return is_mod(interaction.user)
+        return False
+    return app_commands.check(predicate)
 
 
 def load_gk_channels() -> None:
@@ -136,7 +146,7 @@ class GKChannels(commands.Cog, name="GKChannels"):
         name="setchannel",
         description="Toggle this channel as a Gene Kerman channel (Mod only)",
     )
-    @app_commands.checks.has_permissions(kick_members=True)
+    @mod_only()
     async def setchannel(self, interaction: discord.Interaction) -> None:
         gid = interaction.guild_id
         cid = interaction.channel_id

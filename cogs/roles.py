@@ -6,7 +6,7 @@ from discord.ui import View, Select
 
 import settings
 from data.store import store
-from i18n import tp
+from i18n import tp, t
 from cogs.moderation import mod_only
 
 log = logging.getLogger(__name__)
@@ -63,7 +63,7 @@ def get_equipped_levels(bot: commands.Bot, uid: int) -> set[int]:
 
 
 class LevelSelector(Select):
-    def __init__(self, unlocked: set[int], equipped: set[int]):
+    def __init__(self, unlocked: set[int], equipped: set[int], guild_id: int | None, user_id: int):
         self.unlocked = unlocked
         options = []
         for lvl in sorted(list(unlocked)):
@@ -77,10 +77,13 @@ class LevelSelector(Select):
                 ))
                 
         if not options:
-            options.append(discord.SelectOption(label="None unlocked", value="0"))
+            options.append(discord.SelectOption(
+                label=tp(guild_id, user_id, "roles.none_unlocked"), 
+                value="0"
+            ))
             
         super().__init__(
-            placeholder="Select KSP Titles to equip...",
+            placeholder=tp(guild_id, user_id, "roles.select_placeholder"),
             min_values=0,
             max_values=len(options) if options[0].value != "0" else 1,
             options=options,
@@ -89,9 +92,10 @@ class LevelSelector(Select):
 
     async def callback(self, interaction: discord.Interaction):
         uid = interaction.user.id
+        gid = interaction.guild_id
         
         if "0" in self.values and len(self.values) == 1:
-            await interaction.response.send_message("No titles unlocked yet.", ephemeral=True)
+            await interaction.response.send_message(tp(gid, uid, "roles.no_titles"), ephemeral=True)
             return
 
         selected_levels = set(int(v) for v in self.values)
@@ -99,7 +103,7 @@ class LevelSelector(Select):
         # Verify they aren't cheating the client
         unlocked = await sync_user_levels(interaction.client, uid)
         if any(lvl not in unlocked for lvl in selected_levels):
-            await interaction.response.send_message("❌ You selected a level you haven't unlocked.", ephemeral=True)
+            await interaction.response.send_message(tp(gid, uid, "roles.invalid_selection"), ephemeral=True)
             return
             
         added_count = 0
@@ -139,15 +143,15 @@ class LevelSelector(Select):
                 log.warning("Missing permissions to manage roles for %s in %s", uid, guild.id)
                 
         await interaction.response.send_message(
-            f"✅ Roles updated! Equipped **{len(selected_levels)}** title(s).",
+            tp(gid, uid, "roles.updated", count=len(selected_levels)),
             ephemeral=True
         )
 
 
 class LevelRoleView(View):
-    def __init__(self, unlocked: set[int], equipped: set[int]):
+    def __init__(self, unlocked: set[int], equipped: set[int], guild_id: int | None, user_id: int):
         super().__init__(timeout=None)
-        self.add_item(LevelSelector(unlocked, equipped))
+        self.add_item(LevelSelector(unlocked, equipped, guild_id, user_id))
 
 
 class GenericRoleView(View):
@@ -158,29 +162,34 @@ class GenericRoleView(View):
     @discord.ui.select(custom_id="level_role_dropdown", options=[discord.SelectOption(label="loading", value="0")])
     async def fallback_callback(self, interaction: discord.Interaction, select: Select):
         uid = interaction.user.id
+        gid = interaction.guild_id
         unlocked = await sync_user_levels(interaction.client, uid)
         equipped = get_equipped_levels(interaction.client, uid)
         
-        proper_selector = LevelSelector(unlocked, equipped)
+        proper_selector = LevelSelector(unlocked, equipped, gid, uid)
         proper_selector.values = select.values
         await proper_selector.callback(interaction)
 
 
 class ModLevelRemoveSelector(Select):
-    def __init__(self, target: discord.Member, unlocked: set[int]):
+    def __init__(self, target: discord.Member, unlocked: set[int], guild_id: int, user_id: int):
         self.target = target
-        options = [discord.SelectOption(label="Remove ALL Levels", value="0", description="Revoke all level titles from this user")]
+        options = [discord.SelectOption(
+            label=tp(guild_id, user_id, "roles.mod_remove_all"), 
+            value="0", 
+            description=tp(guild_id, user_id, "roles.mod_remove_all_desc")
+        )]
         
         for lvl in sorted(list(unlocked)):
             if lvl in settings.LEVEL_ROLES:
                 r_info = settings.LEVEL_ROLES[lvl]
                 options.append(discord.SelectOption(
-                    label=f"Level {lvl}: {r_info[1]}",
+                    label=tp(guild_id, user_id, "roles.mod_level_name", lvl=lvl, name=r_info[1]),
                     value=str(lvl)
                 ))
                 
         super().__init__(
-            placeholder=f"Select level(s) to remove from {target.display_name}...",
+            placeholder=tp(guild_id, user_id, "roles.mod_select_placeholder", name=target.display_name),
             min_values=1,
             max_values=len(options),
             options=options
@@ -190,6 +199,8 @@ class ModLevelRemoveSelector(Select):
         selected = set(int(v) for v in self.values)
         guild = interaction.guild
         uid = self.target.id
+        mod_uid = interaction.user.id
+        gid = interaction.guild_id
         
         # Check if they selected 0 (Remove ALL)
         remove_all = 0 in selected
@@ -214,7 +225,7 @@ class ModLevelRemoveSelector(Select):
             try:
                 await self.target.remove_roles(*removed_roles, reason=f"Mod {interaction.user} removed level roles")
             except discord.Forbidden:
-                await interaction.response.send_message("❌ Database updated, but I lack permissions to remove Discord roles.", ephemeral=True)
+                await interaction.response.send_message(tp(gid, mod_uid, "roles.mod_no_perms"), ephemeral=True)
                 return
                 
         # Disable select
@@ -222,15 +233,15 @@ class ModLevelRemoveSelector(Select):
         await interaction.response.edit_message(view=self.view)
         
         await interaction.followup.send(
-            f"✅ Successfully removed **{'ALL' if remove_all else len(selected)}** level(s) from {self.target.mention}.",
+            tp(gid, mod_uid, "roles.mod_success", count='ALL' if remove_all else len(selected), user=self.target.mention),
             ephemeral=True
         )
 
 
 class ModLevelRemoveView(View):
-    def __init__(self, target: discord.Member, unlocked: set[int]):
+    def __init__(self, target: discord.Member, unlocked: set[int], guild_id: int, user_id: int):
         super().__init__(timeout=300)
-        self.add_item(ModLevelRemoveSelector(target, unlocked))
+        self.add_item(ModLevelRemoveSelector(target, unlocked, guild_id, user_id))
 
 
 class Roles(commands.Cog, name="Roles"):
@@ -244,33 +255,34 @@ class Roles(commands.Cog, name="Roles"):
     )
     async def roles_cmd(self, interaction: discord.Interaction) -> None:
         uid = interaction.user.id
+        gid = interaction.guild_id
         
         unlocked = await sync_user_levels(self.bot, uid)
         if not unlocked:
             await interaction.response.send_message(
-                "❌ You have not unlocked any KSP titles yet. Complete missions or upload screenshots to earn them!",
+                tp(gid, uid, "roles.cmd_no_unlocked"),
                 ephemeral=True
             )
             return
             
         equipped = get_equipped_levels(self.bot, uid)
-        view = LevelRoleView(unlocked, equipped)
+        view = LevelRoleView(unlocked, equipped, gid, uid)
         
         embed = discord.Embed(
-            title="🎖️ KSP Title Selector",
-            description="Select which KSP achievement titles you want to display on your profile. You can equip multiple titles!",
+            title=tp(gid, uid, "roles.embed_title"),
+            description=tp(gid, uid, "roles.embed_desc"),
             color=discord.Color.blue()
         )
         
         try:
             await interaction.user.send(embed=embed, view=view)
             await interaction.response.send_message(
-                "✅ Check your DMs for the title selector!", 
+                tp(gid, uid, "roles.check_dm"), 
                 ephemeral=True
             )
         except discord.Forbidden:
             await interaction.response.send_message(
-                "❌ I cannot send you a DM. Please enable direct messages from server members.", 
+                tp(gid, uid, "roles.no_dm"), 
                 ephemeral=True
             )
 
@@ -281,18 +293,21 @@ class Roles(commands.Cog, name="Roles"):
     @app_commands.describe(target="The user to remove level roles from")
     @mod_only()
     async def removeroles_cmd(self, interaction: discord.Interaction, target: discord.Member) -> None:
+        mod_uid = interaction.user.id
+        gid = interaction.guild_id
+        
         unlocked = await sync_user_levels(self.bot, target.id)
         if not unlocked:
             await interaction.response.send_message(
-                f"❌ {target.mention} does not have any KSP level roles unlocked.",
+                tp(gid, mod_uid, "roles.mod_no_unlocked", user=target.mention),
                 ephemeral=True
             )
             return
             
-        view = ModLevelRemoveView(target, unlocked)
+        view = ModLevelRemoveView(target, unlocked, gid, mod_uid)
         embed = discord.Embed(
-            title="🛠️ Mod Role Removal",
-            description=f"Select the KSP levels to remove from {target.mention}.\nYou can select specific levels, or choose **Remove ALL Levels**.",
+            title=tp(gid, mod_uid, "roles.mod_embed_title"),
+            description=tp(gid, mod_uid, "roles.mod_embed_desc", user=target.mention),
             color=discord.Color.red()
         )
         
@@ -325,14 +340,15 @@ async def check_and_award_level(bot: commands.Bot, guild_id: int, user_id: int, 
         title_name = role_info[1]
         desc = role_info[2]
         
+        # We use user_id to respect their personal language setting!
         embed = discord.Embed(
-            title="🎉 New KSP Achievement Unlocked!",
-            description=f"Congratulations! You've achieved **{title_name}** (`{desc}`).\n\nYou can now equip this title in the server using the menu below. You can display multiple titles at once!",
+            title=tp(guild_id, user_id, "roles.unlocked_title"),
+            description=tp(guild_id, user_id, "roles.unlocked_desc", title_name=title_name, desc=desc),
             color=discord.Color.gold()
         )
         
         equipped = get_equipped_levels(bot, user_id)
-        view = LevelRoleView(unlocked, equipped)
+        view = LevelRoleView(unlocked, equipped, guild_id, user_id)
         
         try:
             await user.send(embed=embed, view=view)

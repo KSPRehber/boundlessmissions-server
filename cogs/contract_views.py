@@ -130,12 +130,7 @@ class ContractWorkView(View):
                 ephemeral=True)
             return
         view = FileSelectView(cid, gid, files_found)
-        desc = "\n".join(
-            f"{'🚀' if f['filename'].lower().endswith(craft_exts) else '🖼️'} `{f['filename']}`"
-            for f in files_found
-        )
-        e = discord.Embed(title="📎 Select files to submit", description=desc, color=discord.Color.blue())
-        await interaction.response.send_message(embed=e, view=view, ephemeral=True)
+        await interaction.response.send_message(embed=view._generate_embed(), view=view, ephemeral=True)
 
 
 # ── File Selection (ephemeral, no persistence needed) ────────────────────────
@@ -146,12 +141,74 @@ class FileSelectView(View):
         self.cid = contract_id
         self.gid = guild_id
         self.files = files
+        self.active_indices = set(range(len(files)))
+        self.current_idx = 0
 
-    @button(label="✅ Confirm & Send", style=discord.ButtonStyle.green, row=4)
+    def _generate_embed(self) -> discord.Embed:
+        craft_exts = (".craft",)
+        lines = []
+        for i, f in enumerate(self.files):
+            icon = "🚀" if f["filename"].lower().endswith(craft_exts) else "🖼️"
+            status = "✅" if i in self.active_indices else "❌"
+            pointer = "▶️" if i == self.current_idx else "  "
+            lines.append(f"{pointer} {status} {icon} `{f['filename']}`")
+
+        desc = "\n".join(lines)
+        return discord.Embed(title="📎 Select files to submit", description=desc, color=discord.Color.blue())
+
+    @button(emoji="⬆️", style=discord.ButtonStyle.grey, row=0)
+    async def up_btn(self, interaction: discord.Interaction, btn: Button):
+        if self.files:
+            self.current_idx = (self.current_idx - 1) % len(self.files)
+        await interaction.response.edit_message(embed=self._generate_embed(), view=self)
+
+    @button(emoji="⬇️", style=discord.ButtonStyle.grey, row=0)
+    async def down_btn(self, interaction: discord.Interaction, btn: Button):
+        if self.files:
+            self.current_idx = (self.current_idx + 1) % len(self.files)
+        await interaction.response.edit_message(embed=self._generate_embed(), view=self)
+
+    @button(emoji="🔄", label="Toggle Active", style=discord.ButtonStyle.blurple, row=0)
+    async def toggle_btn(self, interaction: discord.Interaction, btn: Button):
+        if self.current_idx in self.active_indices:
+            self.active_indices.remove(self.current_idx)
+        else:
+            self.active_indices.add(self.current_idx)
+        await interaction.response.edit_message(embed=self._generate_embed(), view=self)
+
+    @button(label="✅ Confirm & Send", style=discord.ButtonStyle.green, row=1)
     async def confirm(self, interaction: discord.Interaction, btn: Button):
-        await interaction.response.defer(ephemeral=True)
+        c = cdb.get_contract(self.gid, self.cid)
+        if not c or c.get("status") != cdb.ACTIVE:
+            await interaction.response.send_message("❌ Contract already submitted or no longer active.", ephemeral=True)
+            return
+
+        selected_files = [f for i, f in enumerate(self.files) if i in self.active_indices]
+        if not selected_files:
+            await interaction.response.send_message("❌ You must select at least one file.", ephemeral=True)
+            return
+
+        craft_exts = (".craft",)
+        has_craft = any(f["filename"].lower().endswith(craft_exts) for f in selected_files)
+        has_image = any(f["content_type"].startswith("image/") for f in selected_files)
+
+        missing = []
+        if not has_craft:
+            missing.append("`.craft` file")
+        if not has_image:
+            missing.append("screenshot (image)")
+        if missing:
+            await interaction.response.send_message(
+                f"❌ Missing in selection: {', '.join(missing)}. Select both a craft file and a screenshot.",
+                ephemeral=True)
+            return
+
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(view=self)
+
         stored = []
-        for f in self.files:
+        for f in selected_files:
             try:
                 data = await cdb.download_url(f["url"])
                 url = await cdb.upload_to_storage(self.cid, f["filename"], data, f.get("content_type", ""))

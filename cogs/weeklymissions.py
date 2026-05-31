@@ -230,8 +230,14 @@ async def _handle_selection(interaction: discord.Interaction, week_key: str, gui
 
     # Locked?
     if _is_locked():
-        await interaction.response.send_message(t(guild_id, "wm.locked"), ephemeral=True)
-        return
+        is_exempt = False
+        if getattr(settings, "WEEKLY_MISSIONS_MODS_IGNORE_LOCK", False):
+            from cogs.gkchannels import is_mod
+            if isinstance(interaction.user, discord.Member) and is_mod(interaction.user):
+                is_exempt = True
+        if not is_exempt:
+            await interaction.response.send_message(t(guild_id, "wm.locked"), ephemeral=True)
+            return
 
     # Has corp?
     corp = _get_corp(guild_id, uid)

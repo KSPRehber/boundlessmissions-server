@@ -94,6 +94,9 @@ WEEKLY_COINS_PER_DIFFICULTY = 30
 # Fine = 50% of money reward
 WEEKLY_FINE_PERCENT = 50
 
+# Allow mods to select missions even when the week is locked (e.g., Sundays)
+WEEKLY_MISSIONS_MODS_IGNORE_LOCK = True
+
 # ── Data Persistence ─────────────────────────────────────────────────────────
 
 # Path to the JSON data file (relative to project root)

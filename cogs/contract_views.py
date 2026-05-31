@@ -298,8 +298,13 @@ class FileSelectView(View):
             f"You are reviewing a KSP contract submission.\n"
             f"The mission was: \"{mission_desc}\"\n\n"
             f"Analyze the screenshot(s) and determine if the mission was completed successfully.\n"
+            f"Additionally, assign the highest applicable KSP achievement level (1-15) based on the mission and screenshot.\n"
+            f"1. Kerbin Orbit | 2. Mun Landing | 3. Docking (Space Stations) | 4. Duna Landing | 5. RSS Earth Orbit\n"
+            f"6. Eve Landing | 7. Asteroid Redirect | 8. RSS Moon Landing | 9. Jool 5 | 10. Interstellar Mission\n"
+            f"11. RSS Mars | 12. RSS Venus Landing | 13. RSS Gas Giant | 14. Kerbol Grand Tour | 15. RSS Interstellar\n"
+            f"If none clearly apply, set ksp_level to 0.\n\n"
             f"Return ONLY valid JSON:\n"
-            f'{{"approved": true/false, "reason": "brief explanation in the same language as the mission description"}}'
+            f'{{\n  "approved": true/false,\n  "reason": "brief explanation in the same language as the mission description",\n  "ksp_level": integer\n}}'
         )
 
         parts = [types.Part.from_text(text=review_prompt)]
@@ -325,11 +330,11 @@ class FileSelectView(View):
             return
 
         if result.get("approved", False):
-            await self._auto_accept(interaction, c, result.get("reason", ""))
+            await self._auto_accept(interaction, c, result.get("reason", ""), result.get("ksp_level", 0))
         else:
             await self._auto_refuse(interaction, c, result.get("reason", ""))
 
-    async def _auto_accept(self, interaction: discord.Interaction, c: dict, reason: str = ""):
+    async def _auto_accept(self, interaction: discord.Interaction, c: dict, reason: str = "", ksp_level: int = 0):
         from datetime import datetime
         cdb.update_contract(self.gid, self.cid, status=cdb.COMPLETED,
                             completed_at=datetime.utcnow().isoformat())
@@ -341,6 +346,12 @@ class FileSelectView(View):
             user = store.get_user(self.gid, int(c["contractor_id"]))
             from data.store import store as _store
             await _store.set_xp(self.gid, int(c["contractor_id"]), user["xp"] + xp)
+
+        if ksp_level > 0:
+            from cogs.roles import check_and_award_level
+            interaction.client.loop.create_task(
+                check_and_award_level(interaction.client, self.gid, int(c["contractor_id"]), ksp_level)
+            )
 
         sym = settings.CURRENCY_SYMBOL
         e = discord.Embed(

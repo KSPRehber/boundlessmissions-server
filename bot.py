@@ -54,6 +54,7 @@ class GeneKermanBot(commands.Bot):
             "cogs.screenshots",
             "cogs.contracts",
             "cogs.weeklymissions",
+            "cogs.roles",
         ]
 
         if cfg.ENABLE_MOD_COMMANDS:

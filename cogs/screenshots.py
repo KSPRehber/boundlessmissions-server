@@ -94,6 +94,26 @@ Rate how difficult the DEPICTED mission/achievement would be to accomplish AND R
 9. **9** — Grand tour, interstellar travel (Kcalbeloh), full colonization
 10. **10** — Completing seemingly impossible feats: Eve SSTO return, full interstellar colonization, grand tour SSTO
 
+## Achievement Levels (1-15)
+Assign the highest applicable KSP achievement level from this exact list:
+1. Kerbin Orbit
+2. Mun Landing
+3. Docking (Space Stations)
+4. Duna Landing
+5. RSS Earth Orbit
+6. Eve Landing
+7. Asteroid Redirect
+8. RSS Moon Landing
+9. Jool 5 (Land on all 5 Jool moons)
+10. Interstellar Mission
+11. RSS Mars
+12. RSS Venus Landing
+13. RSS Gas Giant
+14. Kerbol Grand Tour to all planets at once
+15. RSS Interstellar Mission
+
+Set "ksp_level" to the corresponding integer (1-15). If the screenshot does not clearly depict one of these achievements, set it to 0.
+
 ## Crew Detection
 - Look for crew portraits in bottom-right corner
 - Look for IVA (interior) views showing kerbals
@@ -120,6 +140,7 @@ Rate how difficult the DEPICTED mission/achievement would be to accomplish AND R
   "visual_mods": ["list of visual mods detected: EVE, Scatterer, Parallax, Restock, Waterfall, etc."],
   "difficulty_rating": 5,
   "difficulty_reason": "Brief explanation of why this rating",
+  "ksp_level": 2,
   "description": "2-3 sentence description of what the screenshot shows",
   "mission_phase": "ascent/transfer/orbit_insertion/landing/surface_ops/return/docking/eva/construction/reentry/recovery"
 }
@@ -424,9 +445,14 @@ class Screenshots(commands.Cog, name="Screenshots"):
             rating = data.get("difficulty_rating", 0)
             xp_r, coin_r = await _grant_rewards(gid, uid, rating)
 
+            ksp_level = data.get("ksp_level", 0)
+            if ksp_level > 0:
+                from cogs.roles import check_and_award_level
+                self.bot.loop.create_task(check_and_award_level(self.bot, gid, uid, ksp_level))
+
             await interaction.followup.send(embed=embed)
-            log.info("%s analyzed %d direct upload(s) — difficulty %d (+%d XP, +%d coins)",
-                     interaction.user, len(direct), rating, xp_r, coin_r)
+            log.info("%s analyzed %d direct upload(s) — difficulty %d (+%d XP, +%d coins), ksp_level %d",
+                     interaction.user, len(direct), rating, xp_r, coin_r, ksp_level)
             return
 
         # ── Mode 2: Auto-detect the most recent image message above ──────────
@@ -497,15 +523,20 @@ class Screenshots(commands.Cog, name="Screenshots"):
         rating = data.get("difficulty_rating", 0)
         xp_r, coin_r = await _grant_rewards(gid, uid, rating)
 
+        ksp_level = data.get("ksp_level", 0)
+        if ksp_level > 0:
+            from cogs.roles import check_and_award_level
+            self.bot.loop.create_task(check_and_award_level(self.bot, gid, uid, ksp_level))
+
         await target_msg.reply(embed=embed, mention_author=False)
         await interaction.followup.send("✅", ephemeral=True)
 
         log.info(
-            "%s analyzed screenshot (msg %d, %d imgs): %s @ %s — difficulty %d (+%d XP, +%d coins)",
+            "%s analyzed screenshot (msg %d, %d imgs): %s @ %s — difficulty %d (+%d XP, +%d coins), ksp_level %d",
             interaction.user, target_msg.id, len(images),
             data.get("location", {}).get("celestial_body", "?"),
             data.get("location", {}).get("situation", "?"),
-            rating, xp_r, coin_r,
+            rating, xp_r, coin_r, ksp_level
         )
 
     # ── Error handler ─────────────────────────────────────────────────────────

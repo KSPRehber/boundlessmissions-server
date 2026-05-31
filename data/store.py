@@ -61,6 +61,7 @@ def _default_user() -> UserData:
         "messages": 0,
         "last_xp_time": 0.0,
         "joined_at": "",
+        "max_unlocked_level": 0,
     }
 
 
@@ -237,6 +238,17 @@ class UserStore:
             user["balance"] = max(0, user["balance"] + amount)
             self._mark_dirty(guild_id, user_id)
             return user["balance"]
+
+    async def update_max_unlocked_level(self, guild_id: int, user_id: int, level: int) -> bool:
+        """Update the max unlocked level if the new level is higher. Returns True if updated."""
+        async with self._lock:
+            user = self.get_user(guild_id, user_id)
+            current = user.get("max_unlocked_level", 0)
+            if level > current:
+                user["max_unlocked_level"] = level
+                self._mark_dirty(guild_id, user_id)
+                return True
+            return False
 
     # ── Leaderboard ──────────────────────────────────────────────────────────
 

@@ -9,7 +9,7 @@
 
 # Role ID that grants access to moderation commands (/kick, /ban, /gk setchannel, etc.)
 # If set to None, users must have Discord's built-in Kick Members or Admin permissions.
-MOD_ROLE_ID: int | None = None
+MOD_ROLE_ID: int | None = 1492234876273823916
 
 # ── XP System ────────────────────────────────────────────────────────────────
 
@@ -110,3 +110,24 @@ DATA_FILE = "data/users.json"
 
 # How often to auto-save in-memory data to disk (seconds)
 AUTO_SAVE_INTERVAL = 300  # 5 minutes
+
+# ── KSP Achievement Levels ───────────────────────────────────────────────────
+
+# Mapping of level integers (1-15) to a tuple of (Role ID, Title Name, Description)
+LEVEL_ROLES = {
+    1:  (1492381704948551740, "Level-1", "Kerbin Orbit"),
+    2:  (1492382379329851422, "Level-2", "Mun Landing"),
+    3:  (1492382794498703551, "Level-3", "Docking (Space Stations are also considered to be on this level)"),
+    4:  (1492382733769506876, "Level-4", "Duna Landing"),
+    5:  (1492383069141864488, "Level-5", "RSS Earth Orbit"),
+    6:  (1492384757139378197, "Level-6", "Eve Landing"),
+    7:  (1492957576621719693, "Level-7", "Asteroid Redirect"),
+    8:  (1492383446566310081, "Level-8", "RSS Moon Landing"),
+    9:  (1492383547519012934, "Level-9", "Jool 5"),
+    10: (1492383718357340362, "Level-10", "Interstellar Mission"),
+    11: (1492383914851827874, "Level-11", "RSS Mars"),
+    12: (1498035194760790108, "Level-12", "RSS Venus Landing"),
+    13: (1492384267798450277, "Level-13", "RSS Gas Giant"),
+    14: (1498035361564065892, "Level-14", "Kerbol Grand Tour to all planets at once"),
+    15: (1492384471775707146, "Level-15", "RSS Interstellar Mission"),
+}

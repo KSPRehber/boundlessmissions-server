@@ -77,7 +77,7 @@ MAX_ACTIVE_CONTRACTS_PER_USER = 5
 CONTRACT_MOD_CHANNEL_ID: int | None = None
 
 # Allow users to send contracts to themselves (for testing only!)
-CONTRACT_ALLOW_SELF = True
+CONTRACT_ALLOW_SELF = False
 
 # ── Weekly Missions ──────────────────────────────────────────────────────────
 
@@ -95,7 +95,7 @@ WEEKLY_COINS_PER_DIFFICULTY = 30
 WEEKLY_FINE_PERCENT = 50
 
 # Allow mods to select missions even when the week is locked (e.g., Sundays)
-WEEKLY_MISSIONS_MODS_IGNORE_LOCK = True
+WEEKLY_MISSIONS_MODS_IGNORE_LOCK = False
 
 # ── Data Persistence ─────────────────────────────────────────────────────────
 

@@ -131,7 +131,8 @@ def get_server_lang(guild_id: int | None) -> str:
     """Get the server-wide language (for public messages)."""
     if guild_id is None:
         return DEFAULT_LANG
-    return _guild_langs.get(str(guild_id), DEFAULT_LANG)
+    lang = _guild_langs.get(str(guild_id))
+    return lang if lang else DEFAULT_LANG
 
 
 def set_server_lang(guild_id: int, lang: str) -> None:
@@ -156,8 +157,9 @@ def get_user_lang(guild_id: int | None, user_id: int | None) -> str:
     """Get user's personal language. Falls back to server lang, then default."""
     if guild_id is not None and user_id is not None:
         key = (str(guild_id), str(user_id))
-        if key in _user_langs:
-            return _user_langs[key]
+        lang = _user_langs.get(key)
+        if lang:
+            return lang
     return get_server_lang(guild_id)
 
 
@@ -186,7 +188,7 @@ def load_all_langs() -> None:
     try:
         for doc in _db.collection("guilds").stream():
             data = doc.to_dict() or {}
-            if "language" in data:
+            if "language" in data and data["language"]:
                 _guild_langs[doc.id] = data["language"]
     except Exception as exc:
         log.error("Failed to load server language prefs: %s", exc)
@@ -195,7 +197,7 @@ def load_all_langs() -> None:
     user_count = 0
     for guild_id, users in store._data.items():
         for user_id, data in users.items():
-            if "language" in data:
+            if "language" in data and data["language"]:
                 _user_langs[(guild_id, user_id)] = data["language"]
                 user_count += 1
 

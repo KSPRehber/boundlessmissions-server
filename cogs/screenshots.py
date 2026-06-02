@@ -112,7 +112,7 @@ Assign the highest applicable KSP achievement level from this exact list:
 14. Kerbol Grand Tour to all planets at once
 15. RSS Interstellar Mission
 
-Set "ksp_level" to the corresponding integer (1-15). If the screenshot does not clearly depict one of these achievements, set it to 0.
+Set "ksp_level" to the corresponding integer (1-15). If the screenshot does not clearly depict one of these achievements, set it to 0. NOTE: Both crewed and uncrewed (probe) missions count equally for all achievements. A probe landing on Eve qualifies for Eve Landing.
 
 ## Crew Detection
 - Look for crew portraits in bottom-right corner
@@ -445,7 +445,10 @@ class Screenshots(commands.Cog, name="Screenshots"):
             rating = data.get("difficulty_rating", 0)
             xp_r, coin_r = await _grant_rewards(gid, uid, rating)
 
-            ksp_level = data.get("ksp_level", 0)
+            try:
+                ksp_level = int(data.get("ksp_level", 0))
+            except (ValueError, TypeError):
+                ksp_level = 0
             if ksp_level > 0:
                 from cogs.roles import check_and_award_level
                 self.bot.loop.create_task(check_and_award_level(self.bot, gid, uid, ksp_level))
@@ -523,7 +526,10 @@ class Screenshots(commands.Cog, name="Screenshots"):
         rating = data.get("difficulty_rating", 0)
         xp_r, coin_r = await _grant_rewards(gid, uid, rating)
 
-        ksp_level = data.get("ksp_level", 0)
+        try:
+            ksp_level = int(data.get("ksp_level", 0))
+        except (ValueError, TypeError):
+            ksp_level = 0
         if ksp_level > 0:
             from cogs.roles import check_and_award_level
             self.bot.loop.create_task(check_and_award_level(self.bot, gid, uid, ksp_level))

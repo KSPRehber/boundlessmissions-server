@@ -21,7 +21,7 @@ XP_BONUS_MIN = 0
 XP_BONUS_MAX = 10
 
 # Cooldown in seconds between XP-eligible messages (prevents spam farming)
-XP_COOLDOWN_SECONDS = 60
+XP_COOLDOWN_SECONDS = 45
 
 # XP multiplier for server boosters (2.0 = double XP)
 BOOSTER_XP_MULTIPLIER = 2.0

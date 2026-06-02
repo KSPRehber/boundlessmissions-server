@@ -115,18 +115,11 @@ class ContractWorkView(View):
         if not files_found:
             await interaction.response.send_message("❌ No files found. Upload files here first.", ephemeral=True)
             return
-        # Require at least one .craft file and one image
-        craft_exts = (".craft",)
-        has_craft = any(f["filename"].lower().endswith(craft_exts) for f in files_found)
+        # Require at least one image (screenshot)
         has_image = any(f["content_type"].startswith("image/") for f in files_found)
-        missing = []
-        if not has_craft:
-            missing.append("`.craft` file")
         if not has_image:
-            missing.append("screenshot (image)")
-        if missing:
             await interaction.response.send_message(
-                f"❌ Missing: {', '.join(missing)}. Upload both a craft file and a screenshot.",
+                "❌ Missing screenshot (image). Upload at least a screenshot.",
                 ephemeral=True)
             return
         view = FileSelectView(cid, gid, files_found)
@@ -188,18 +181,11 @@ class FileSelectView(View):
             await interaction.response.send_message("❌ You must select at least one file.", ephemeral=True)
             return
 
-        craft_exts = (".craft",)
-        has_craft = any(f["filename"].lower().endswith(craft_exts) for f in selected_files)
         has_image = any(f["content_type"].startswith("image/") for f in selected_files)
 
-        missing = []
-        if not has_craft:
-            missing.append("`.craft` file")
         if not has_image:
-            missing.append("screenshot (image)")
-        if missing:
             await interaction.response.send_message(
-                f"❌ Missing in selection: {', '.join(missing)}. Select both a craft file and a screenshot.",
+                "❌ Missing in selection: screenshot (image). Select at least a screenshot.",
                 ephemeral=True)
             return
 
@@ -244,6 +230,8 @@ class FileSelectView(View):
             file_parts = []
             if craft_count:
                 file_parts.append(f"🚀 {craft_count} craft file(s) *(revealed after acceptance)*")
+            else:
+                file_parts.append("⚠️ **WARNING: No craft file included!**")
             for s in screenshots:
                 file_parts.append(f"🖼️ [{s['filename']}]({s['url']})")
             e.add_field(name="📁 Files", value="\n".join(file_parts) or "—", inline=False)

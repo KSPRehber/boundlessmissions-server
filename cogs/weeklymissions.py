@@ -227,6 +227,7 @@ class MissionSelectView(discord.ui.View):
 
 
 async def _handle_selection(interaction: discord.Interaction, week_key: str, guild_id: int, mission: dict):
+    await interaction.response.defer(ephemeral=True)
     uid = interaction.user.id
 
     # Locked?
@@ -237,21 +238,19 @@ async def _handle_selection(interaction: discord.Interaction, week_key: str, gui
             if isinstance(interaction.user, discord.Member) and is_mod(interaction.user):
                 is_exempt = True
         if not is_exempt:
-            await interaction.response.send_message(t(guild_id, "wm.locked"), ephemeral=True)
+            await interaction.followup.send(t(guild_id, "wm.locked"), ephemeral=True)
             return
 
     # Has corp?
     corp = _get_corp(guild_id, uid)
     if not corp:
-        await interaction.response.send_message(t(guild_id, "wm.no_corp"), ephemeral=True)
+        await interaction.followup.send(t(guild_id, "wm.no_corp"), ephemeral=True)
         return
 
     # Already selected?
     if _has_selected(guild_id, week_key, uid, mission["id"]):
-        await interaction.response.send_message(t(guild_id, "wm.already"), ephemeral=True)
+        await interaction.followup.send(t(guild_id, "wm.already"), ephemeral=True)
         return
-
-    await interaction.response.defer(ephemeral=True)
 
     # Post contract in corp channel
     corp_channel_id = int(corp["channel_id"])
@@ -322,12 +321,13 @@ class CustomMissionAcceptView(discord.ui.View):
 
     @discord.ui.button(label="Accept Custom Mission", style=discord.ButtonStyle.green, custom_id="cm:accept")
     async def accept_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
         guild_id = interaction.guild_id
         uid = interaction.user.id
 
         corp = _get_corp(guild_id, uid)
         if not corp:
-            await interaction.response.send_message(t(guild_id, "wm.no_corp"), ephemeral=True)
+            await interaction.followup.send(t(guild_id, "wm.no_corp"), ephemeral=True)
             return
 
         embed = interaction.message.embeds[0]
@@ -339,15 +339,13 @@ class CustomMissionAcceptView(discord.ui.View):
         duration_days = int(parts.get("duration_days", "7"))
         
         if datetime.now(TZ).timestamp() > expires:
-            await interaction.response.send_message("❌ This custom mission has expired.", ephemeral=True)
+            await interaction.followup.send("❌ This custom mission has expired.", ephemeral=True)
             return
             
         msg_id = interaction.message.id
         if _has_selected(guild_id, "custom", uid, msg_id):
-            await interaction.response.send_message(t(guild_id, "wm.already"), ephemeral=True)
+            await interaction.followup.send(t(guild_id, "wm.already"), ephemeral=True)
             return
-
-        await interaction.response.defer(ephemeral=True)
         
         corp_channel_id = int(corp["channel_id"])
         channel = interaction.client.get_channel(corp_channel_id)

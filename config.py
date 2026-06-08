@@ -56,6 +56,12 @@ class Config:
     # Set to "false" (case-insensitive) to disable the moderation cog entirely
     ENABLE_MOD_COMMANDS: bool = _optional("ENABLE_MOD_COMMANDS", "true").lower() not in ("false", "0", "no", "off")
 
+    # ── KSP API Server ──────────────────────────
+    KSP_API_ENABLED: bool = _optional("KSP_API_ENABLED", "true").lower() not in ("false", "0", "no", "off")
+    API_HOST: str = _optional("API_HOST", "0.0.0.0")
+    API_PORT: int = int(_optional("API_PORT", "5850"))
+    API_SECRET_KEY: str = _optional("API_SECRET_KEY", "gk-change-this-secret-key")
+
     # ── Firebase / Firestore ────────────────────
     # Path to the Firebase service account JSON key file
     FIREBASE_CREDENTIALS: str = _require("FIREBASE_CREDENTIALS")

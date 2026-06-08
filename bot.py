@@ -55,6 +55,7 @@ class GeneKermanBot(commands.Bot):
             "cogs.contracts",
             "cogs.weeklymissions",
             "cogs.roles",
+            "cogs.ksp_bridge",
         ]
 
         if cfg.ENABLE_MOD_COMMANDS:
@@ -190,6 +191,12 @@ class GeneKermanBot(commands.Bot):
                 state="Unified Players of KSP Bot",
             )
         )
+        # Set bot user ID and instance for the KSP API server
+        if cfg.KSP_API_ENABLED:
+            from api_server import set_bot_user_id, set_bot_instance
+            set_bot_user_id(self.user.id)
+            set_bot_instance(self)
+            log.info("KSP API: bot user ID set to %s", self.user.id)
 
     async def on_command_error(
         self, ctx: commands.Context, error: commands.CommandError
@@ -242,6 +249,25 @@ async def main() -> None:
 
     async with bot:
         asyncio.create_task(console_listener())
+
+        # Start KSP API server alongside the bot
+        if cfg.KSP_API_ENABLED:
+            import uvicorn
+            from api_server import app as api_app
+
+            api_config = uvicorn.Config(
+                api_app,
+                host=cfg.API_HOST,
+                port=cfg.API_PORT,
+                log_level="info",
+                access_log=False,
+            )
+            api_server = uvicorn.Server(api_config)
+            asyncio.create_task(api_server.serve())
+            log.info("KSP API server starting on %s:%d", cfg.API_HOST, cfg.API_PORT)
+        else:
+            log.info("KSP API server: DISABLED (KSP_API_ENABLED=false)")
+
         await bot.start(cfg.TOKEN)
 
 

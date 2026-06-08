@@ -1,0 +1,58 @@
+"""
+cogs/ksp_bridge.py – Discord ↔ KSP bridge commands.
+
+Provides:
+  /g linkcode — Generate a 6-digit code for KSP account linking
+  Persistent "🎮 Link KSP" button in missions channel
+"""
+
+import logging
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+from api_auth import generate_link_code
+from i18n import S, tp
+
+log = logging.getLogger(__name__)
+
+# ── i18n ─────────────────────────────────────────────────────────────────────
+S.update({
+    "ksp.linkcode.title":  {"tr": "🎮 KSP Bağlantı Kodu", "en": "🎮 KSP Link Code"},
+    "ksp.linkcode.desc":   {"tr": "KSP'de bu kodu girin:\n\n# `{code}`\n\n⏰ 10 dakika içinde geçerliliğini yitirir.",
+                            "en": "Enter this code in KSP:\n\n# `{code}`\n\n⏰ Expires in 10 minutes."},
+    "ksp.linkcode.footer": {"tr": "Gene Kerman KSP Mod", "en": "Gene Kerman KSP Mod"},
+    "ksp.linked.title":    {"tr": "✅ KSP Bağlandı", "en": "✅ KSP Linked"},
+    "ksp.linked.desc":     {"tr": "KSP hesabınız başarıyla bağlandı!", "en": "Your KSP account has been linked successfully!"},
+})
+
+
+class KSPBridge(commands.Cog, name="KSPBridge"):
+    """Discord ↔ KSP mod integration commands."""
+
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+
+    @app_commands.command(name="linkcode", description="Generate a 6-digit code to link your KSP game")
+    async def linkcode(self, interaction: discord.Interaction):
+        """Generate a link code for KSP account linking."""
+        gid = interaction.guild_id
+        uid = interaction.user.id
+        username = interaction.user.display_name
+
+        code = generate_link_code(gid, uid, username)
+
+        embed = discord.Embed(
+            title=tp(gid, uid, "ksp.linkcode.title"),
+            description=tp(gid, uid, "ksp.linkcode.desc", code=code),
+            color=discord.Color.from_rgb(0, 180, 100),
+        )
+        embed.set_footer(text=tp(gid, uid, "ksp.linkcode.footer"))
+        embed.set_thumbnail(url="https://cdn.discordapp.com/emojis/1510200111253291258.webp")
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        log.info("%s generated KSP link code", interaction.user)
+
+
+async def setup(bot: commands.Bot):
+    await bot.add_cog(KSPBridge(bot))

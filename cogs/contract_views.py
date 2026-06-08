@@ -396,6 +396,10 @@ class ContractReviewView(View):
         c = cdb.get_contract(gid, cid)
         if not c or c["status"] != cdb.SUBMITTED:
             return
+        # Only the issuer can review
+        if str(interaction.user.id) != str(c.get("issuer_id")):
+            await interaction.response.send_message("❌ Only the contract issuer can review submissions.", ephemeral=True)
+            return
         from datetime import datetime
         cdb.update_contract(gid, cid, status=cdb.COMPLETED, completed_at=datetime.utcnow().isoformat())
         await store.add_balance(gid, int(c["contractor_id"]), c["payment"])
@@ -427,6 +431,10 @@ class ContractReviewView(View):
         cid, gid = _parse(btn.custom_id)
         c = cdb.get_contract(gid, cid)
         if not c or c["status"] != cdb.SUBMITTED:
+            return
+        # Only the issuer can review
+        if str(interaction.user.id) != str(c.get("issuer_id")):
+            await interaction.response.send_message("❌ Only the contract issuer can review submissions.", ephemeral=True)
             return
         cdb.update_contract(gid, cid, status=cdb.DISPUTED)
         c["status"] = cdb.DISPUTED

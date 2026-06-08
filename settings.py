@@ -83,7 +83,7 @@ MAX_ACTIVE_CONTRACTS_PER_USER = 5
 CONTRACT_MOD_CHANNEL_ID: int | None = None
 
 # Allow users to send contracts to themselves (for testing only!)
-CONTRACT_ALLOW_SELF = False
+CONTRACT_ALLOW_SELF = True
 
 # ── Weekly Missions ──────────────────────────────────────────────────────────
 
@@ -131,3 +131,11 @@ LEVEL_ROLES = {
     14: (1498035361564065892, "Level-14", "Kerbol Grand Tour to all planets at once"),
     15: (1492384471775707146, "Level-15", "RSS Interstellar Mission"),
 }
+
+# ── KSP Mod Integration ──────────────────────────────────────────────────────
+
+# How often the KSP mod should check for new notifications (seconds)
+KSP_NOTIFICATION_CHECK_INTERVAL = 600  # 10 minutes
+
+# API server port (should match API_PORT in .env)
+KSP_API_PORT = 5850

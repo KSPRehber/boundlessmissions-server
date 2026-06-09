@@ -76,11 +76,11 @@ CORP_CATEGORY_ID = 1492379906925924352
 # ── Contracts ────────────────────────────────────────────────────────────────
 
 # Max active contracts a user can have at once (as either issuer or contractor)
-MAX_ACTIVE_CONTRACTS_PER_USER = 5
+MAX_ACTIVE_CONTRACTS_PER_USER = 10
 
 # Channel ID where mod escalations ("sue" button) are posted.
 # Set to None to disable suing. Must be set for the sue flow to work.
-CONTRACT_MOD_CHANNEL_ID: int | None = None
+CONTRACT_MOD_CHANNEL_ID: int | None = 1513934242315374744
 
 # Allow users to send contracts to themselves (for testing only!)
 CONTRACT_ALLOW_SELF = True

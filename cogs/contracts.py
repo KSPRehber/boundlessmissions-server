@@ -180,13 +180,7 @@ class Contracts(commands.Cog, name="Contracts"):
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(Contracts(bot))
-    # Persistent views — discord.py needs these registered with no args
-    bot.add_view(ContractOfferView())
-    bot.add_view(ContractWorkView())
-    bot.add_view(ContractReviewView())
-    bot.add_view(DisputeView())
-    bot.add_view(SettleApprovalView())
-    bot.add_view(ModReviewView())
-    from cogs.contract_views import MoreTimeApprovalView
-    bot.add_view(MoreTimeApprovalView())
+    # Register DynamicItem button classes — regex-matched, survives restarts
+    from cogs.contract_views import ALL_DYNAMIC_ITEMS
+    bot.add_dynamic_items(*ALL_DYNAMIC_ITEMS)
 

@@ -117,6 +117,38 @@ class Admin(commands.Cog, name="Admin"):
         )
         log.info("%s changed prefix to '%s'", interaction.user, prefix)
 
+    # ── /mimic ────────────────────────────────────────────────────────────────
+    @app_commands.command(
+        name="mimic", description="Act as another user for testing (Admin only)"
+    )
+    @app_commands.describe(target="The user to mimic")
+    @is_admin()
+    async def mimic(self, interaction: discord.Interaction, target: discord.Member) -> None:
+        if not hasattr(self.bot, "mimic_map"):
+            self.bot.mimic_map = {}
+        self.bot.mimic_map[interaction.user.id] = target
+        await interaction.response.send_message(
+            f"🎭 You are now mimicking {target.mention}. Interactions will run as them.", ephemeral=True
+        )
+        log.info("%s is now mimicking %s", interaction.user, target)
+
+    # ── /unmimic ──────────────────────────────────────────────────────────────
+    @app_commands.command(
+        name="unmimic", description="Stop mimicking another user (Admin only)"
+    )
+    @is_admin()
+    async def unmimic(self, interaction: discord.Interaction) -> None:
+        if hasattr(self.bot, "mimic_map") and interaction.user.id in self.bot.mimic_map:
+            target = self.bot.mimic_map.pop(interaction.user.id)
+            await interaction.response.send_message(
+                f"🎭 Stopped mimicking {target.mention}.", ephemeral=True
+            )
+            log.info("%s stopped mimicking %s", interaction.user, target)
+        else:
+            await interaction.response.send_message(
+                "❌ You are not mimicking anyone.", ephemeral=True
+            )
+
     # ── Error handler ─────────────────────────────────────────────────────────
     async def cog_app_command_error(
         self,

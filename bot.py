@@ -24,6 +24,60 @@ _SYNC_COMMANDS = "--sync" in sys.argv
 
 log = logging.getLogger(__name__)
 
+# ── Mimic System ─────────────────────────────────────────────────────────────
+# We monkey-patch the three internal dispatch points in discord.py to swap
+# interaction.user with the mimicked target BEFORE handlers run. The 'user'
+# slot on Interaction is writable, so direct assignment works fine.
+
+# Patch CommandTree._from_interaction (slash commands + autocomplete)
+_original_from_interaction = discord.app_commands.CommandTree._from_interaction
+
+def _patched_from_interaction(self, interaction):
+    bot = self.client
+    if hasattr(bot, "mimic_map"):
+        real_user = interaction.user
+        real_id = getattr(real_user, "id", None)
+        if real_id in bot.mimic_map:
+            cmd = interaction.command
+            cmd_name = getattr(cmd, "name", None) if cmd else None
+            if cmd_name not in ("mimic", "unmimic"):
+                interaction.extras["_mimic_real_user"] = real_user
+                interaction.user = bot.mimic_map[real_id]
+    _original_from_interaction(self, interaction)
+
+discord.app_commands.CommandTree._from_interaction = _patched_from_interaction
+
+# Also patch view dispatch for button/dropdown interactions
+_original_view_dispatch = discord.ui.view.ViewStore.dispatch_view
+
+def _patched_view_dispatch(self, component_type, custom_id, interaction):
+    bot = getattr(interaction, "client", None) or getattr(interaction, "_client", None)
+    if bot and hasattr(bot, "mimic_map"):
+        real_user = interaction.user
+        real_id = getattr(real_user, "id", None)
+        if real_id in bot.mimic_map:
+            interaction.extras["_mimic_real_user"] = real_user
+            interaction.user = bot.mimic_map[real_id]
+    _original_view_dispatch(self, component_type, custom_id, interaction)
+
+discord.ui.view.ViewStore.dispatch_view = _patched_view_dispatch
+
+# Also patch modal dispatch
+_original_modal_dispatch = discord.ui.view.ViewStore.dispatch_modal
+
+def _patched_modal_dispatch(self, custom_id, interaction, components, resolved):
+    bot = getattr(interaction, "client", None) or getattr(interaction, "_client", None)
+    if bot and hasattr(bot, "mimic_map"):
+        real_user = interaction.user
+        real_id = getattr(real_user, "id", None)
+        if real_id in bot.mimic_map:
+            interaction.extras["_mimic_real_user"] = real_user
+            interaction.user = bot.mimic_map[real_id]
+    _original_modal_dispatch(self, custom_id, interaction, components, resolved)
+
+discord.ui.view.ViewStore.dispatch_modal = _patched_modal_dispatch
+
+
 # ── Intents ──────────────────────────────────────────────────────────────────
 # All intents enabled so the bot can react to every guild event.
 # Admin bots typically need the full set; trim down for production if desired.
@@ -39,6 +93,8 @@ class GeneKermanBot(commands.Bot):
             owner_id=cfg.OWNER_ID or None,
             help_command=None,  # We provide our own in cogs/general.py
         )
+        self.mimic_map: dict[int, discord.Member] = {}
+        self.extlog_enabled = False
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
     async def setup_hook(self) -> None:
@@ -198,6 +254,22 @@ class GeneKermanBot(commands.Bot):
             set_bot_instance(self)
             log.info("KSP API: bot user ID set to %s", self.user.id)
 
+    async def on_interaction(self, interaction: discord.Interaction) -> None:
+        if getattr(self, "extlog_enabled", False):
+            real_user = interaction.extras.get("_mimic_real_user", interaction.user)
+            spoofed_user = interaction.user
+            spoof_str = f" (Mimicking {spoofed_user})" if getattr(real_user, "id", None) != getattr(spoofed_user, "id", None) else ""
+            
+            if interaction.type == discord.InteractionType.component:
+                custom_id = interaction.data.get("custom_id")
+                print(f"[ExtLog] {real_user}{spoof_str} clicked button/select: {custom_id}")
+            elif interaction.type == discord.InteractionType.application_command:
+                command = interaction.data.get("name")
+                print(f"[ExtLog] {real_user}{spoof_str} used command: /{command}")
+            elif interaction.type == discord.InteractionType.modal_submit:
+                custom_id = interaction.data.get("custom_id")
+                print(f"[ExtLog] {real_user}{spoof_str} submitted modal: {custom_id}")
+
     async def on_command_error(
         self, ctx: commands.Context, error: commands.CommandError
     ) -> None:
@@ -246,6 +318,11 @@ async def main() -> None:
                 log.info("Stop command received from console. Shutting down...")
                 await bot.close()
                 break
+            elif line.strip().lower() == "extlog":
+                bot.extlog_enabled = not getattr(bot, "extlog_enabled", False)
+                state = "ON" if bot.extlog_enabled else "OFF"
+                print(f"[ExtLog] Extensive logging is now {state}")
+                log.info("Extensive logging is now %s", state)
 
     async with bot:
         asyncio.create_task(console_listener())

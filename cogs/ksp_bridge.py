@@ -6,6 +6,7 @@ Provides:
   Persistent "🎮 Link KSP" button in missions channel
 """
 
+import asyncio
 import logging
 import discord
 from discord import app_commands
@@ -36,11 +37,17 @@ class KSPBridge(commands.Cog, name="KSPBridge"):
     @app_commands.command(name="linkcode", description="Generate a 6-digit code to link your KSP game")
     async def linkcode(self, interaction: discord.Interaction):
         """Generate a link code for KSP account linking."""
+        # Acknowledge immediately: generate_link_code makes blocking Firestore
+        # calls (query + deletes + write) that can exceed Discord's 3-second
+        # interaction window and otherwise raise 10062 (Unknown interaction).
+        await interaction.response.defer(ephemeral=True)
+
         gid = interaction.guild_id
         uid = interaction.user.id
         username = interaction.user.display_name
 
-        code = generate_link_code(gid, uid, username)
+        # Run the blocking Firestore work off the event loop.
+        code = await asyncio.to_thread(generate_link_code, gid, uid, username)
 
         embed = discord.Embed(
             title=tp(gid, uid, "ksp.linkcode.title"),
@@ -50,7 +57,7 @@ class KSPBridge(commands.Cog, name="KSPBridge"):
         embed.set_footer(text=tp(gid, uid, "ksp.linkcode.footer"))
         embed.set_thumbnail(url="https://cdn.discordapp.com/emojis/1510200111253291258.webp")
 
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
         log.info("%s generated KSP link code", interaction.user)
 
 

@@ -32,6 +32,7 @@ def create_contract(
     guild_id: int, issuer_id: int, issuer_name: str,
     contractor_id: int, contractor_name: str,
     mission: str, payment: int, fine: int, due_date: str,
+    modlist: str | None = None,
 ) -> ContractData:
     cid = uuid.uuid4().hex[:12]
     now = datetime.utcnow().isoformat()
@@ -53,6 +54,7 @@ def create_contract(
         "submitted_files": [],
         "dm_message_id": None,
         "issuer_review_msg_id": None,
+        "modlist": modlist,
     }
     _col(guild_id).document(cid).set(doc)
     log.info("Contract %s created: %s -> %s (%d coins)", cid, issuer_name, contractor_name, payment)

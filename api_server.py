@@ -554,6 +554,8 @@ async def get_active_contracts(user: dict = Depends(get_current_user)):
                 status=c["status"],
                 created_at=c.get("created_at"),
                 is_bot_issued=(c.get("issuer_id") == bot_uid),
+                is_outgoing=(c.get("issuer_id") == uid),
+                modlist=c.get("modlist"),
                 mission_type=mission_type,
                 required_situation=req_sit,
                 required_body=req_body,
@@ -724,6 +726,7 @@ async def create_contract_from_ksp(req: ContractCreateRequest, user: dict = Depe
         payment=req.payment,
         fine=req.fine,
         due_date=req.due_date,
+        modlist=req.modlist,
     )
 
     # AI-classify the contract
@@ -774,6 +777,8 @@ async def submit_contract(
     screenshot1: Optional[UploadFile] = File(None),
     screenshot2: Optional[UploadFile] = File(None),
     screenshot3: Optional[UploadFile] = File(None),
+    modlist: Optional[str] = Form(None),
+    used_modlist: Optional[str] = Form(None),
     user: dict = Depends(get_current_user),
 ):
     """
@@ -793,6 +798,32 @@ async def submit_contract(
 
     if c.get("status") != cdb.ACTIVE:
         return SubmissionResult(success=False, message="Contract is not active.")
+
+    # Server-side part-restriction check (defense-in-depth — the client also gates this,
+    # but an old/modified DLL must not bypass it). The contract's modlist is an allow-list
+    # of top-level mod folders (tokens prefixed with "-" are client-only exclude paths we
+    # can't evaluate at folder granularity, so they're ignored here). used_modlist is the
+    # set of folders the submitted craft actually uses. Skipped if either side is absent.
+    required_modlist = c.get("modlist")
+    if required_modlist and used_modlist:
+        allowed = {
+            tok.strip().lower()
+            for tok in required_modlist.split(",")
+            if tok.strip() and not tok.strip().startswith("-")
+        }
+        if allowed:
+            illegal = sorted(
+                f.strip()
+                for f in used_modlist.split(",")
+                if f.strip() and f.strip().lower() not in allowed
+            )
+            if illegal:
+                log.info("Submission rejected for contract %s: craft uses disallowed mods %s",
+                         contract_id, illegal)
+                return SubmissionResult(
+                    success=False,
+                    message=f"Craft uses parts outside this contract's allowed mods: {', '.join(illegal)}.",
+                )
 
     # Upload files to Firebase Storage
     stored_files = []
@@ -837,6 +868,7 @@ async def submit_contract(
         "status": cdb.SUBMITTED,
         "submitted_files": stored_files,
         "submitted_at": now,
+        "contractor_modlist": modlist,
     }
 
     # Store vessel data and loadmeta if provided

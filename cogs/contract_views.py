@@ -33,6 +33,14 @@ def _embed(c, guild_id):
     e.add_field(name=t(guild_id, "ct.fine"), value=f"**{c['fine']}** {sym}", inline=True)
     e.add_field(name=t(guild_id, "ct.due"), value=c["due_date"], inline=True)
     e.add_field(name=t(guild_id, "ct.status"), value=f"`{c['status']}`", inline=True)
+    
+    if c.get("modlist"):
+        # Truncate if necessary to fit in Discord's 1024 char limit for fields
+        mod_text = c["modlist"]
+        if len(mod_text) > 1000:
+            mod_text = mod_text[:1000] + "..."
+        e.add_field(name="Required Mods", value=f"```\n{mod_text}\n```", inline=False)
+        
     return e
 
 

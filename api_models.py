@@ -79,6 +79,8 @@ class ContractSummary(BaseModel):
     status: str
     created_at: Optional[str] = None
     is_bot_issued: bool = False
+    is_outgoing: bool = False  # True when the current user is the issuer (sent, not received)
+    modlist: Optional[str] = None  # Comma-separated mod folder names from issuer's KSP client
     # Classification (from mission)
     mission_type: str = "active_vessel"
     required_situation: Optional[str] = None
@@ -108,6 +110,7 @@ class ContractCreateRequest(BaseModel):
     payment: int = Field(..., gt=0)
     fine: int = Field(default=0, ge=0)
     due_date: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$")
+    modlist: Optional[str] = None  # Comma-separated list of loaded assembly names
 
 
 # ── Submissions ──────────────────────────────────────────────────────────────
@@ -144,6 +147,7 @@ class FlightSubmission(BaseModel):
     contract_id: str
     active_vessel: VesselSnapshot
     nearby_vessels: list[VesselSnapshot] = []
+    modlist: Optional[str] = None  # Comma-separated list of loaded assembly names
 
 
 # ── Notifications ────────────────────────────────────────────────────────────

@@ -83,7 +83,7 @@ MAX_ACTIVE_CONTRACTS_PER_USER = 10
 CONTRACT_MOD_CHANNEL_ID: int | None = 1513934242315374744
 
 # Allow users to send contracts to themselves (for testing only!)
-CONTRACT_ALLOW_SELF = True
+CONTRACT_ALLOW_SELF = False
 
 # ── Weekly Missions ──────────────────────────────────────────────────────────
 

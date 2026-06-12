@@ -7,13 +7,19 @@ session token (Authorization: Bearer <token>) except /auth/link.
 No API keys, Firebase creds, or secrets are exposed to clients.
 """
 
+import asyncio
+import io
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from fastapi import FastAPI, Depends, HTTPException, Header, UploadFile, File, Form
+from fastapi import (
+    FastAPI, Depends, HTTPException, Header, UploadFile, File, Form,
+    WebSocket, WebSocketDisconnect,
+)
 from fastapi.middleware.cors import CORSMiddleware
+from firebase_admin import firestore
 
 import settings
 from config import cfg
@@ -26,6 +32,7 @@ from api_models import (
     WeeklyMissionsResponse, Mission, MissionSelectRequest, MissionSelectResponse,
     ContractSummary, ContractListResponse, ContractAcceptResponse,
     CorpInfo, CorpListResponse, ContractCreateRequest, ContractReviewRequest,
+    ContractDisputeRequest,
     SubmissionResult, FlightSubmission, VesselSnapshot,
     Notification, NotificationsResponse,
 )
@@ -51,6 +58,65 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ── WebSocket Notification Hub ───────────────────────────────────────────────
+
+class NotificationHub:
+    """Tracks live WebSocket connections per (guild_id, user_id) and pushes
+    notifications to them. All public methods are coroutines and must run on
+    the server event loop."""
+
+    def __init__(self):
+        self._conns: dict[tuple[int, int], set[WebSocket]] = {}
+
+    async def connect(self, gid: int, uid: int, ws: WebSocket):
+        await ws.accept()
+        self._conns.setdefault((gid, uid), set()).add(ws)
+        log.info("WS: user %d (guild %d) connected (%d live)", uid, gid, len(self._conns[(gid, uid)]))
+
+    def disconnect(self, gid: int, uid: int, ws: WebSocket):
+        conns = self._conns.get((gid, uid))
+        if not conns:
+            return
+        conns.discard(ws)
+        if not conns:
+            self._conns.pop((gid, uid), None)
+
+    async def push(self, gid: int, uid: int, payload: dict):
+        conns = self._conns.get((gid, uid))
+        if not conns:
+            return
+        dead = []
+        for ws in list(conns):
+            try:
+                await ws.send_json({"type": "notification", "notification": payload})
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            conns.discard(ws)
+
+
+_hub = NotificationHub()
+_loop: asyncio.AbstractEventLoop | None = None
+
+
+@app.on_event("startup")
+async def _capture_loop():
+    """Capture the running event loop so the sync _create_notification helper can
+    schedule pushes onto it from any context."""
+    global _loop
+    _loop = asyncio.get_running_loop()
+
+
+def _push_notification(gid: int, uid: int, payload: dict):
+    """Thread-safe fire-and-forget push of a notification to live sockets."""
+    if _loop is None:
+        return
+    try:
+        asyncio.run_coroutine_threadsafe(_hub.push(gid, uid, payload), _loop)
+    except Exception as exc:
+        log.warning("WS: failed to schedule push for user %d: %s", uid, exc)
 
 
 # ── Auth Dependency ──────────────────────────────────────────────────────────
@@ -676,6 +742,149 @@ async def review_submission(contract_id: str, req: ContractReviewRequest,
     return ContractAcceptResponse(success=True, message="Submission refused. Dispute opened on Discord.")
 
 
+@app.post("/api/v1/contracts/{contract_id}/dispute", response_model=ContractAcceptResponse)
+async def resolve_dispute(contract_id: str, req: ContractDisputeRequest,
+                          user: dict = Depends(get_current_user)):
+    """Contractor resolves a refused (disputed) submission from the KSP mod,
+    mirroring the Discord DisputeView buttons: settle / more_time / pay_fine / sue.
+
+    Actions needing the other party's approval (settle, more_time on human
+    contracts) hand off to the existing Discord approval views, exactly like
+    review_submission does for the dispute itself."""
+    gid = int(user["guild_id"])
+    uid = str(user["user_id"])
+
+    c = cdb.get_contract(gid, contract_id)
+    if not c:
+        raise HTTPException(status_code=404, detail="Contract not found")
+
+    # Only the contractor (whose submission was refused) drives the dispute.
+    if str(c.get("contractor_id")) != uid:
+        raise HTTPException(status_code=403, detail="Only the contractor can resolve this dispute.")
+
+    if c.get("status") != cdb.DISPUTED:
+        return ContractAcceptResponse(success=False, message="Contract is not in dispute.")
+
+    action = (req.action or "").lower()
+    issuer_id = int(c["issuer_id"])
+    contractor_id = int(c["contractor_id"])
+    is_bot_issued = issuer_id == _get_bot_user_id()
+
+    # ── Pay Fine ── deduct the fine and release escrow; closes the contract.
+    if action == "pay_fine":
+        bal = store.get_user(gid, contractor_id)["balance"]
+        if bal < c["fine"]:
+            return ContractAcceptResponse(success=False, message="Insufficient balance to pay the fine.")
+        await store.add_balance(gid, contractor_id, -c["fine"])
+        await store.add_balance(gid, issuer_id, c["fine"] + c["payment"])
+        cdb.update_contract(gid, contract_id, status=cdb.COMPLETED,
+                            completed_at=datetime.utcnow().isoformat())
+        if not is_bot_issued:
+            _create_notification(
+                gid, issuer_id, "review_result", "💰 Fine Paid",
+                f"{c['contractor_name']} paid the fine for \"{c['mission'][:80]}\". "
+                f"+{c['fine'] + c['payment']} {settings.CURRENCY_SYMBOL}.",
+                {"contract_id": contract_id},
+            )
+        log.info("KSP: %s paid fine for contract %s", user["username"], contract_id)
+        return ContractAcceptResponse(success=True, message="Fine paid. Contract closed.")
+
+    # ── Sue ── escalate to the moderator channel for review.
+    if action == "sue":
+        mod_ch_id = settings.CONTRACT_MOD_CHANNEL_ID
+        if not mod_ch_id:
+            return ContractAcceptResponse(success=False, message="Moderator review is not configured.")
+        cdb.update_contract(gid, contract_id, status=cdb.MOD_REVIEW)
+        c["status"] = cdb.MOD_REVIEW
+        if _bot_instance:
+            try:
+                import discord
+                from i18n import t
+                from cogs.contract_views import ModReviewView, _embed
+                ch = _bot_instance.get_channel(mod_ch_id) or await _bot_instance.fetch_channel(mod_ch_id)
+                e = _embed(c, gid)
+                e.title = f"⚖️ {t(gid, 'ct.mod_review')}"
+                e.color = discord.Color.purple()
+                # Why the submission was refused (AI verdict or issuer note), so mods
+                # can judge whether the refusal was wrong.
+                reason = c.get("review_reason")
+                if reason:
+                    e.add_field(name="Refusal Reason", value=str(reason)[:1024], inline=False)
+                # Blueprint (.craft) + screenshots the player submitted.
+                files = c.get("submitted_files", [])
+                if files:
+                    e.add_field(name="📁 Submitted Files", value="\n".join(
+                        f"📎 [{f['filename']}]({f['url']})" for f in files), inline=False)
+                await ch.send(embed=e, view=ModReviewView(contract_id, gid))
+            except Exception as exc:
+                log.warning("Could not post sue case to mod channel: %s", exc)
+        log.info("KSP: %s sued contract %s", user["username"], contract_id)
+        return ContractAcceptResponse(success=True, message="Case escalated to moderators.")
+
+    # ── Settle ── ask the issuer to drop the contract with no exchange.
+    if action == "settle":
+        if is_bot_issued:
+            return ContractAcceptResponse(success=False, message="AI contracts cannot be settled.")
+        if _bot_instance:
+            try:
+                import discord
+                from i18n import t
+                from cogs.contract_views import SettleApprovalView
+                issuer = await _bot_instance.fetch_user(issuer_id)
+                e = discord.Embed(
+                    title=f"🤝 {t(gid, 'ct.settle_request')}",
+                    description=t(gid, 'ct.settle_desc', name=c['contractor_name']),
+                    color=discord.Color.light_grey())
+                await issuer.send(embed=e, view=SettleApprovalView(contract_id, gid))
+            except Exception as exc:
+                log.warning("Could not send settle request: %s", exc)
+                return ContractAcceptResponse(success=False, message="Could not reach the issuer on Discord.")
+        log.info("KSP: %s requested settlement for contract %s", user["username"], contract_id)
+        return ContractAcceptResponse(success=True, message="Settlement request sent to the issuer.")
+
+    # ── More Time ── extend the deadline (bot: auto; human: issuer approves).
+    if action == "more_time":
+        if is_bot_issued:
+            tz = timezone(timedelta(hours=3))
+            now = datetime.now(tz)
+            days_to_sunday = 6 - now.weekday()
+            if days_to_sunday <= 0:
+                days_to_sunday = 7
+            end_of_week = (now + timedelta(days=days_to_sunday)).strftime("%Y-%m-%d")
+            cdb.update_contract(gid, contract_id, due_date=end_of_week, status=cdb.ACTIVE)
+            log.info("KSP: %s auto-extended bot contract %s to %s",
+                     user["username"], contract_id, end_of_week)
+            return ContractAcceptResponse(
+                success=True, message=f"Deadline extended to {end_of_week}. Submit again!")
+
+        new_date = (req.new_date or "").strip()
+        try:
+            datetime.strptime(new_date, "%Y-%m-%d")
+        except ValueError:
+            return ContractAcceptResponse(
+                success=False, message="A valid new date (YYYY-MM-DD) is required.")
+        if _bot_instance:
+            try:
+                import discord
+                from i18n import t
+                from cogs.contract_views import MoreTimeApprovalView
+                issuer = await _bot_instance.fetch_user(issuer_id)
+                e = discord.Embed(
+                    title=f"⏰ {t(gid, 'ct.moretime_request')}",
+                    description=t(gid, 'ct.moretime_desc', name=c['contractor_name'],
+                                 old=c['due_date'], new=new_date),
+                    color=discord.Color.blue())
+                await issuer.send(embed=e, view=MoreTimeApprovalView(contract_id, gid, new_date))
+            except Exception as exc:
+                log.warning("Could not send more-time request: %s", exc)
+                return ContractAcceptResponse(success=False, message="Could not reach the issuer on Discord.")
+        log.info("KSP: %s requested more time (%s) for contract %s",
+                 user["username"], new_date, contract_id)
+        return ContractAcceptResponse(success=True, message="Time extension request sent to the issuer.")
+
+    return ContractAcceptResponse(success=False, message=f"Unknown dispute action: {action}")
+
+
 @app.post("/api/v1/contracts/{contract_id}/cancel", response_model=ContractAcceptResponse)
 async def cancel_contract(contract_id: str, user: dict = Depends(get_current_user)):
     """Cancel a contract (available to issuer or contractor for pending/active contracts)."""
@@ -931,10 +1140,12 @@ async def submit_contract(
     }
 
     # Store vessel data and loadmeta if provided
+    parsed_vessel_data: dict | None = None
     if vessel_data:
         import json
         try:
-            update_fields["vessel_data"] = json.loads(vessel_data)
+            parsed_vessel_data = json.loads(vessel_data)
+            update_fields["vessel_data"] = parsed_vessel_data
         except Exception:
             update_fields["vessel_data_raw"] = vessel_data
 
@@ -972,7 +1183,8 @@ async def submit_contract(
 
     # Also post to the issuer's corp channel in Discord
     await _discord_notify_issuer(
-        gid, int(c["issuer_id"]), contract_id, c, user["username"], stored_files
+        gid, int(c["issuer_id"]), contract_id, c, user["username"], stored_files,
+        parsed_vessel_data,
     )
 
     log.info("KSP: %s submitted contract %s (human-issued)", user["username"], contract_id)
@@ -1062,8 +1274,9 @@ async def _ai_review_submission(
             result.get("reason", ""), result.get("ksp_level", 0)
         )
     else:
-        cdb.update_contract(gid, contract_id, status=cdb.DISPUTED)
         reason = result.get("reason", "AI review did not approve this submission.")
+        # Persist the reason so it can be shown to mods if the player sues.
+        cdb.update_contract(gid, contract_id, status=cdb.DISPUTED, review_reason=reason)
         _create_notification(gid, uid, "review_result",
                              "❌ Submission Refused",
                              reason,
@@ -1123,9 +1336,10 @@ def _create_notification(
     guild_id: int, user_id: int, notif_type: str,
     title: str, message: str, data: dict | None = None,
 ):
-    """Create a notification in Firestore for a user."""
+    """Create a notification in Firestore for a user and push it to any live
+    WebSocket connections."""
     doc_id = uuid.uuid4().hex[:12]
-    _notifications_col(guild_id, user_id).document(doc_id).set({
+    payload = {
         "id": doc_id,
         "type": notif_type,
         "title": title,
@@ -1133,29 +1347,54 @@ def _create_notification(
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "read": False,
         "data": data or {},
-    })
+    }
+    _notifications_col(guild_id, user_id).document(doc_id).set(payload)
+    _push_notification(guild_id, user_id, payload)
+
+
+@app.websocket("/ws/v1/notifications")
+async def notifications_ws(websocket: WebSocket):
+    """Live notification stream. The KSP client connects with the session token
+    in the query string (UnityWebRequest cannot set headers on a WS handshake)."""
+    token = websocket.query_params.get("token", "")
+    user = verify_session_token(token, _get_api_secret()) if token else None
+    if user is None:
+        await websocket.close(code=1008)  # policy violation
+        return
+
+    gid = int(user["guild_id"])
+    uid = int(user["user_id"])
+    await _hub.connect(gid, uid, websocket)
+    try:
+        # Keep the socket open; client may send keepalive pings we just discard.
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        log.debug("WS: receive loop ended for user %d: %s", uid, exc)
+    finally:
+        _hub.disconnect(gid, uid, websocket)
 
 
 @app.get("/api/v1/user/notifications", response_model=NotificationsResponse)
 async def get_notifications(user: dict = Depends(get_current_user)):
-    """Get unread notifications for the current user."""
+    """Get recent notifications (read + unread) for the current user, newest first."""
     gid = int(user["guild_id"])
     uid = int(user["user_id"])
 
     col = _notifications_col(gid, uid)
     notifs = []
 
-    # Query only on `read` — avoid composite index requirement.
-    # Sort client-side (small result set, ≤50 docs).
-    for doc in col.where("read", "==", False).limit(50).stream():
-        d = doc.to_dict()
-        notifs.append(Notification(**d))
-
-    notifs.sort(key=lambda n: n.timestamp or "", reverse=True)
+    # Single-field order_by is auto-indexed — no composite index needed.
+    for doc in col.order_by(
+        "timestamp", direction=firestore.Query.DESCENDING
+    ).limit(50).stream():
+        notifs.append(Notification(**doc.to_dict()))
 
     return NotificationsResponse(
         notifications=notifs,
-        unread_count=len(notifs),
+        unread_count=sum(1 for n in notifs if not n.read),
     )
 
 
@@ -1169,6 +1408,24 @@ async def mark_notifications_read(user: dict = Depends(get_current_user)):
     for doc in col.where("read", "==", False).stream():
         doc.reference.update({"read": True})
 
+    return {"success": True}
+
+
+@app.post("/api/v1/user/notifications/{notif_id}/mark_read")
+async def mark_notification_read(notif_id: str, user: dict = Depends(get_current_user)):
+    """Mark a single notification as read."""
+    gid = int(user["guild_id"])
+    uid = int(user["user_id"])
+    _notifications_col(gid, uid).document(notif_id).update({"read": True})
+    return {"success": True}
+
+
+@app.delete("/api/v1/user/notifications/{notif_id}")
+async def dismiss_notification(notif_id: str, user: dict = Depends(get_current_user)):
+    """Dismiss (delete) a single notification."""
+    gid = int(user["guild_id"])
+    uid = int(user["user_id"])
+    _notifications_col(gid, uid).document(notif_id).delete()
     return {"success": True}
 
 
@@ -1228,6 +1485,7 @@ def _get_bot_user_id() -> int:
 async def _discord_notify_issuer(
     gid: int, issuer_id: int, contract_id: str,
     contract: dict, submitter_name: str, stored_files: list[dict],
+    vessel_data: dict | None = None,
 ):
     """Post a submission notification to the issuer's Discord corp channel."""
     if _bot_instance is None:
@@ -1276,13 +1534,37 @@ async def _discord_notify_issuer(
 
         embed.set_footer(text="Use the buttons below to accept or refuse this submission.")
 
+        # Orbit telemetry diagram (rendered from the vessel data captured at
+        # submission). Sent as a second embed so it sits below the screenshot.
+        embeds = [embed]
+        orbit_file = None
+        if vessel_data:
+            try:
+                from orbit_render import render_orbit
+                orbit_png = render_orbit(vessel_data)
+                if orbit_png:
+                    orbit_file = discord.File(io.BytesIO(orbit_png), filename="orbit.png")
+                    body = vessel_data.get("body") or "—"
+                    orbit_embed = discord.Embed(
+                        title="🛰️ Orbital Telemetry",
+                        description=f"Submitted vessel state around **{body}**.",
+                        color=discord.Color.teal(),
+                    )
+                    orbit_embed.set_image(url="attachment://orbit.png")
+                    embeds.append(orbit_embed)
+            except Exception as exc:
+                log.warning("Failed to render orbit diagram for %s: %s", contract_id, exc)
+
         # Attach review buttons (✅ Accept / ❌ Refuse) — uses the same
         # persistent view that the Discord-native contract flow uses
         view = ContractReviewView(contract_id, gid)
 
         # Mention the issuer
         issuer_mention = f"<@{issuer_id}>"
-        await channel.send(content=issuer_mention, embed=embed, view=view)
+        send_kwargs: dict = {"content": issuer_mention, "embeds": embeds, "view": view}
+        if orbit_file is not None:
+            send_kwargs["file"] = orbit_file
+        await channel.send(**send_kwargs)
         log.info("Discord: Notified issuer %d in channel %s about submission", issuer_id, corp["channel_id"])
 
     except Exception as exc:

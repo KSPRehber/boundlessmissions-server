@@ -117,6 +117,14 @@ class ContractReviewRequest(BaseModel):
     approve: bool  # True = accept the submission, False = refuse (→ dispute)
 
 
+class ContractDisputeRequest(BaseModel):
+    # Contractor's response to a refused submission, mirroring the Discord
+    # DisputeView buttons.
+    action: str  # "settle" | "more_time" | "pay_fine" | "sue"
+    # Required for "more_time" on human-issued contracts (YYYY-MM-DD).
+    new_date: Optional[str] = None
+
+
 # ── Submissions ──────────────────────────────────────────────────────────────
 
 class SubmissionResult(BaseModel):

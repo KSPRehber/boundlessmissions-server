@@ -68,6 +68,26 @@ class MissionSelectResponse(BaseModel):
 
 # ── Contracts ────────────────────────────────────────────────────────────────
 
+class RescueTarget(BaseModel):
+    """Where stranded kerbals must be recovered from / delivered to.
+
+    mode == "orbit"   → ap/pe define the target orbit (metres above the body
+                        surface); margin_alt is the allowed +/- on each.
+    mode == "surface" → lat/lon define the landing spot (degrees); margin_pos is
+                        the allowed great-circle tolerance (degrees).
+    is_modded is flagged by the issuer's client (it scans the real body list).
+    """
+    body: str
+    mode: str = "orbit"  # "orbit" | "surface"
+    ap: Optional[float] = None
+    pe: Optional[float] = None
+    lat: Optional[float] = None
+    lon: Optional[float] = None
+    margin_alt: float = 0.0
+    margin_pos: float = 0.0
+    is_modded: bool = False
+
+
 class ContractSummary(BaseModel):
     contract_id: str
     mission: str
@@ -85,6 +105,10 @@ class ContractSummary(BaseModel):
     mission_type: str = "active_vessel"
     required_situation: Optional[str] = None
     required_body: Optional[str] = None
+    # Rescue-mission fields (only set when mission_type == "rescue")
+    rescue_target: Optional[RescueTarget] = None
+    rescue_kerbals: list[str] = []  # renamed names the rescuer must recover
+    is_modded_target: bool = False
 
 class ContractListResponse(BaseModel):
     contracts: list[ContractSummary]
@@ -92,6 +116,10 @@ class ContractListResponse(BaseModel):
 class ContractAcceptResponse(BaseModel):
     success: bool
     message: str
+    # Set on rescue accept so the rescuer's client can spawn the wreck.
+    rescue_vessel_node_url: Optional[str] = None
+    rescue_target: Optional[RescueTarget] = None
+    rescue_kerbals: list[str] = []
 
 
 # ── Corporations ─────────────────────────────────────────────────────────────
@@ -111,6 +139,10 @@ class ContractCreateRequest(BaseModel):
     fine: int = Field(default=0, ge=0)
     due_date: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$")
     modlist: Optional[str] = None  # Comma-separated list of loaded assembly names
+    # "auto" keeps the existing AI classification; "craft_build" / "active_vessel"
+    # force the type and skip AI. (Rescue contracts use the separate multipart
+    # /contracts/create_rescue endpoint.)
+    contract_type: str = "auto"
 
 
 class ContractReviewRequest(BaseModel):
@@ -160,6 +192,30 @@ class FlightSubmission(BaseModel):
     active_vessel: VesselSnapshot
     nearby_vessels: list[VesselSnapshot] = []
     modlist: Optional[str] = None  # Comma-separated list of loaded assembly names
+
+
+# ── Marketplace ──────────────────────────────────────────────────────────────
+
+class MarketplaceListResult(BaseModel):
+    success: bool
+    message: str
+    listing_id: Optional[str] = None
+
+class MarketplaceListing(BaseModel):
+    listing_id: str
+    seller_id: str
+    seller_name: str
+    craft_name: str
+    craft_type: str
+    part_count: int
+    mass: float
+    cost: float
+    price: int
+    sales_count: int = 0
+    created_at: Optional[str] = None
+
+class MarketplaceListingsResponse(BaseModel):
+    listings: list[MarketplaceListing]
 
 
 # ── Notifications ────────────────────────────────────────────────────────────

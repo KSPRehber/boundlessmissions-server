@@ -95,6 +95,21 @@ def _get_corp(guild_id: int, user_id: int) -> dict | None:
     return doc.to_dict() if doc.exists else None
 
 
+def find_user_corp(guild_id: int, user_id: int) -> dict | None:
+    """Find the corp a user belongs to, as owner or member. None if they're in none.
+
+    Corps are keyed by the owner's id, so an owner is a direct lookup; members are
+    found via the `members` array.
+    """
+    own = _get_corp(guild_id, user_id)
+    if own:
+        return own
+    col = _db.collection("guilds").document(str(guild_id)).collection("corps")
+    for doc in col.where("members", "array_contains", str(user_id)).stream():
+        return doc.to_dict()
+    return None
+
+
 def _delete_corp(guild_id: int, user_id: int) -> None:
     """Delete a corporation record from Firestore."""
     _get_corp_ref(guild_id, user_id).delete()

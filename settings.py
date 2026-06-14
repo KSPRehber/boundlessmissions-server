@@ -85,6 +85,17 @@ CONTRACT_MOD_CHANNEL_ID: int | None = 1513934242315374744
 # Allow users to send contracts to themselves (for testing only!)
 CONTRACT_ALLOW_SELF = False
 
+# ── Marketplace ──────────────────────────────────────────────────────────────
+
+# Channel where craft sale listings are posted. Set to None to disable the
+# marketplace (listing attempts from the KSP mod will be rejected).
+MARKETPLACE_CHANNEL_ID: int | None = 1515424482020429875
+
+# Bounds on the price a seller may set for a listing (in KCoins).
+MARKETPLACE_MIN_PRICE = 1
+MARKETPLACE_MAX_PRICE = 10_000_000
+
+
 # ── Weekly Missions ──────────────────────────────────────────────────────────
 
 # Channel where the weekly missions embed is posted
@@ -102,6 +113,13 @@ WEEKLY_FINE_PERCENT = 50
 
 # Allow mods to select missions even when the week is locked (e.g., Sundays)
 WEEKLY_MISSIONS_MODS_IGNORE_LOCK = False
+
+# ── Checkpoint Photos ────────────────────────────────────────────────────────
+
+# Channel where milestone "hero shots" captured in-game (rendezvous, flyby,
+# asteroid/comet) are posted. Set to None to disable — uploads from the KSP mod
+# will then be rejected.
+CHECKPOINT_PHOTOS_CHANNEL_ID: int | None = 1492244166418108467
 
 # ── Data Persistence ─────────────────────────────────────────────────────────
 

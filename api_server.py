@@ -32,12 +32,15 @@ from api_models import (
     WeeklyMissionsResponse, Mission, MissionSelectRequest, MissionSelectResponse,
     ContractSummary, ContractListResponse, ContractAcceptResponse,
     CorpInfo, CorpListResponse, ContractCreateRequest, ContractReviewRequest,
-    ContractDisputeRequest,
+    ContractDisputeRequest, RescueTarget,
     SubmissionResult, FlightSubmission, VesselSnapshot,
     Notification, NotificationsResponse,
+    MarketplaceListResult, MarketplaceListing, MarketplaceListingsResponse,
 )
 from data.store import store, _db, _storage_bucket
 from data import contracts as cdb
+from data import marketplace as mkt
+from data import imports as imp
 
 log = logging.getLogger(__name__)
 
@@ -583,11 +586,21 @@ async def get_active_contracts(user: dict = Depends(get_current_user)):
             req_sit = c.get("required_situation")
             req_body = c.get("required_body")
 
-            if not mission_type:
+            # Rescue contracts carry an explicit type — never AI-classify them.
+            if not mission_type and c.get("mission_type") != cdb.RESCUE:
                 cls = await _classify_single_contract(gid, c["contract_id"], c["mission"])
                 mission_type = cls.get("mission_type", "active_vessel")
                 req_sit = cls.get("required_situation")
                 req_body = cls.get("required_body")
+
+            rescue_target = None
+            rescue_kerbals = []
+            is_modded_target = False
+            if c.get("mission_type") == cdb.RESCUE:
+                rt = c.get("rescue_target") or {}
+                rescue_target = RescueTarget(**rt) if rt else None
+                rescue_kerbals = c.get("rescue_kerbals", [])
+                is_modded_target = bool(rt.get("is_modded"))
 
             contracts.append(ContractSummary(
                 contract_id=c["contract_id"],
@@ -605,6 +618,9 @@ async def get_active_contracts(user: dict = Depends(get_current_user)):
                 mission_type=mission_type,
                 required_situation=req_sit,
                 required_body=req_body,
+                rescue_target=rescue_target,
+                rescue_kerbals=rescue_kerbals,
+                is_modded_target=is_modded_target,
             ))
 
     # Sort newest first
@@ -660,6 +676,29 @@ async def accept_contract(contract_id: str, user: dict = Depends(get_current_use
     cdb.update_contract(gid, contract_id, status=cdb.ACTIVE)
     log.info("KSP: %s accepted contract %s", user["username"], contract_id)
 
+    # Tell the issuer their offer was accepted so their in-game contract list
+    # refreshes live (the contractor already sees the result of their own click).
+    issuer_id = int(c["issuer_id"])
+    if issuer_id != _get_bot_user_id():
+        _create_notification(
+            gid, issuer_id, "contract_accepted",
+            "🤝 Contract Accepted",
+            f"{user['username']} accepted your contract \"{c['mission'][:80]}\".",
+            data={"contract_id": contract_id},
+        )
+
+    # Rescue: hand the rescuer the wreck snapshot + target so their client can
+    # spawn the stranded vessel at the chosen orbit/surface. The issuer's vessel
+    # was already removed at creation, so nothing to do on their side here.
+    if c.get("mission_type") == cdb.RESCUE:
+        rt = c.get("rescue_target") or {}
+        return ContractAcceptResponse(
+            success=True, message="Rescue accepted! Spawning the stranded vessel.",
+            rescue_vessel_node_url=c.get("rescue_vessel_node_url"),
+            rescue_target=RescueTarget(**rt) if rt else None,
+            rescue_kerbals=c.get("rescue_kerbals", []),
+        )
+
     return ContractAcceptResponse(success=True, message="Contract accepted!")
 
 
@@ -711,6 +750,17 @@ async def review_submission(contract_id: str, req: ContractReviewRequest,
                 await contractor.send(embed=ne)
             except Exception as exc:
                 log.warning("Could not DM contractor after KSP review-approve: %s", exc)
+        # Rescue: return the kerbals to the issuer. Restore their original names,
+        # queue the rescue craft for live import into the issuer's save, and tell
+        # the rescuer's client to remove the craft it just handed over.
+        if c.get("mission_type") == cdb.RESCUE:
+            await _deliver_rescue_craft(gid, contract_id, c)
+            _create_notification(
+                gid, contractor_id, "rescue_craft_removed",
+                "🚀 Rescue Craft Transferred",
+                "Your rescue craft and the rescued kerbals were delivered to the issuer.",
+                {"contract_id": contract_id},
+            )
         log.info("KSP: %s approved submission for contract %s", user["username"], contract_id)
         return ContractAcceptResponse(success=True, message="Submission approved! Payment released.")
 
@@ -786,6 +836,10 @@ async def resolve_dispute(contract_id: str, req: ContractDisputeRequest,
                 f"+{c['fine'] + c['payment']} {settings.CURRENCY_SYMBOL}.",
                 {"contract_id": contract_id},
             )
+        # Rescue: the rescuer gave up (paid the fine) — kerbals weren't returned,
+        # so hand the issuer their stranded vessel back.
+        if c.get("mission_type") == cdb.RESCUE:
+            await _restore_issuer_vessel(gid, contract_id, c)
         log.info("KSP: %s paid fine for contract %s", user["username"], contract_id)
         return ContractAcceptResponse(success=True, message="Fine paid. Contract closed.")
 
@@ -914,6 +968,21 @@ async def cancel_contract(contract_id: str, user: dict = Depends(get_current_use
     log.info("KSP: %s cancelled contract %s (refunded %d to issuer %s)",
              user["username"], contract_id, c["payment"], c["issuer_id"])
 
+    # Notify the other party (not the one who cancelled) so their in-game contract
+    # list updates live. Skip bot-issued counterparties.
+    other_id = c["contractor_id"] if str(c.get("issuer_id")) == uid else c.get("issuer_id")
+    if other_id and int(other_id) != bot_uid:
+        _create_notification(
+            gid, int(other_id), "contract_cancelled",
+            "🚫 Contract Cancelled",
+            f"{user['username']} cancelled \"{c['mission'][:80]}\".",
+            data={"contract_id": contract_id},
+        )
+
+    # Rescue: the rescue won't happen — return the issuer's vessel to its spot.
+    if c.get("mission_type") == cdb.RESCUE:
+        await _restore_issuer_vessel(gid, contract_id, c)
+
     return ContractAcceptResponse(success=True, message="Contract cancelled. Escrow refunded.")
 
 # ── Corporations ─────────────────────────────────────────────────────────────
@@ -997,8 +1066,13 @@ async def create_contract_from_ksp(req: ContractCreateRequest, user: dict = Depe
         modlist=req.modlist,
     )
 
-    # AI-classify the contract
-    cls = await _classify_single_contract(gid, c["contract_id"], req.mission)
+    # Type: "auto" keeps the AI classification; an explicit craft_build /
+    # active_vessel forces the type and skips the AI call.
+    ctype = (req.contract_type or "auto").lower()
+    if ctype in ("craft_build", "active_vessel"):
+        cdb.update_contract(gid, c["contract_id"], mission_type=ctype)
+    else:
+        cls = await _classify_single_contract(gid, c["contract_id"], req.mission)
 
     # DM the contractor via Discord
     if _bot_instance:
@@ -1031,6 +1105,255 @@ async def create_contract_from_ksp(req: ContractCreateRequest, user: dict = Depe
              user["username"], c["contract_id"], contractor_id, req.payment)
 
     return ContractAcceptResponse(success=True, message=f"Contract sent! ID: {c['contract_id']}")
+
+
+# Stock Kerbol-system bodies — used as a server-side fallback to flag a rescue
+# target as "modded" when the client didn't send is_modded. (KNOWN_CELESTIAL_BODIES
+# deliberately also lists popular modded bodies, so it can't be used for this.)
+_STOCK_BODIES = {
+    "kerbol", "sun", "moho", "eve", "gilly", "kerbin", "mun", "minmus",
+    "duna", "ike", "dres", "jool", "laythe", "vall", "tylo", "bop", "pol", "eeloo",
+}
+
+
+@app.post("/api/v1/contracts/create_rescue", response_model=ContractAcceptResponse)
+async def create_rescue_contract(
+    contractor_id: str = Form(...),
+    mission: str = Form(...),
+    payment: int = Form(...),
+    fine: int = Form(0),
+    due_date: str = Form(...),
+    modlist: Optional[str] = Form(None),
+    body: str = Form(...),
+    mode: str = Form("orbit"),
+    ap: Optional[float] = Form(None),
+    pe: Optional[float] = Form(None),
+    lat: Optional[float] = Form(None),
+    lon: Optional[float] = Form(None),
+    margin_alt: float = Form(0.0),
+    margin_pos: float = Form(0.0),
+    is_modded: bool = Form(False),
+    rescue_pid: Optional[str] = Form(None),
+    kerbals: str = Form("[]"),         # JSON list of tagged names: ["{issuer}'s Jeb Kerman", ...]
+    vessel_node: UploadFile = File(...),  # gzipped issuer vessel snapshot (the wreck)
+    user: dict = Depends(get_current_user),
+):
+    """Create a rescue contract from the KSP mod.
+
+    The issuer is in flight on a crewed vessel; their client snapshots that vessel
+    (crew kept as-is — they're tagged "{issuer}'s {kerbal}" when the rescuer imports
+    the wreck), captures the delivery target, and uploads it here. The wreck node is
+    stored so the rescuer's client can spawn it on accept. The issuer's client removes
+    its own copy of the vessel locally once this returns success.
+    """
+    import json
+
+    gid = int(user["guild_id"])
+    uid = int(user["user_id"])
+    try:
+        contractor_uid = int(contractor_id)
+    except (TypeError, ValueError):
+        return ContractAcceptResponse(success=False, message="Invalid contractor.")
+
+    if contractor_uid == uid and not settings.CONTRACT_ALLOW_SELF:
+        return ContractAcceptResponse(success=False, message="You can't contract yourself.")
+
+    # Validate date
+    from datetime import date
+    try:
+        dt = datetime.strptime(due_date, "%Y-%m-%d").date()
+        if dt <= date.today():
+            return ContractAcceptResponse(success=False, message="Due date must be in the future.")
+    except ValueError:
+        return ContractAcceptResponse(success=False, message="Invalid date format. Use YYYY-MM-DD.")
+
+    # The tagged kerbal names the rescuer must recover ("{issuer}'s {kerbal}").
+    try:
+        rescue_kerbals = json.loads(kerbals) if kerbals else []
+        if not isinstance(rescue_kerbals, list):
+            rescue_kerbals = []
+    except Exception:
+        rescue_kerbals = []
+    rescue_kerbals = [str(k) for k in rescue_kerbals if k]
+    if not rescue_kerbals:
+        return ContractAcceptResponse(success=False, message="No crew aboard to rescue.")
+
+    # Balance + active-contract limit (same gates as a regular contract).
+    u = store.get_user(gid, uid)
+    if u.get("balance", 0) < payment:
+        return ContractAcceptResponse(
+            success=False, message=f"Insufficient balance ({payment} needed).")
+    if cdb.count_active(gid, uid) >= settings.MAX_ACTIVE_CONTRACTS_PER_USER:
+        return ContractAcceptResponse(
+            success=False,
+            message=f"Active contract limit reached ({settings.MAX_ACTIVE_CONTRACTS_PER_USER}).")
+
+    from cogs.corps import _get_corp
+    corp = _get_corp(gid, contractor_uid)
+    contractor_name = corp.get("owner_name", "Unknown") if corp else "Unknown"
+
+    if not is_modded and body.strip().lower() not in _STOCK_BODIES:
+        is_modded = True
+
+    rescue_target = {
+        "body": body, "mode": (mode or "orbit").lower(),
+        "ap": ap, "pe": pe, "lat": lat, "lon": lon,
+        "margin_alt": margin_alt, "margin_pos": margin_pos, "is_modded": is_modded,
+    }
+
+    # Escrow the payment.
+    await store.add_balance(gid, uid, -payment)
+
+    c = cdb.create_contract(
+        guild_id=gid, issuer_id=uid, issuer_name=user["username"],
+        contractor_id=contractor_uid, contractor_name=contractor_name,
+        mission=mission, payment=payment, fine=fine, due_date=due_date,
+        modlist=modlist,
+        mission_type=cdb.RESCUE,
+        rescue_target=rescue_target,
+        rescue_kerbals=rescue_kerbals,
+        rescue_pid=rescue_pid,
+    )
+
+    # Store the wreck snapshot (gzipped ConfigNode) in Firebase Storage.
+    try:
+        node_bytes = await vessel_node.read()
+        node_url = await cdb.upload_to_storage(
+            c["contract_id"], "rescue_vessel.cfg", node_bytes, "application/gzip")
+        cdb.update_contract(gid, c["contract_id"], rescue_vessel_node_url=node_url)
+    except Exception as exc:
+        # Roll the contract back — without the wreck node the rescue can't happen.
+        log.error("Rescue vessel upload failed for %s: %s", c["contract_id"], exc)
+        cdb.update_contract(gid, c["contract_id"], status=cdb.CANCELLED)
+        await store.add_balance(gid, uid, payment)
+        return ContractAcceptResponse(success=False, message="Failed to store the rescue vessel.")
+
+    # DM + notify the contractor, exactly like create_contract_from_ksp.
+    if _bot_instance:
+        try:
+            import discord
+            from cogs.contract_views import ContractOfferView, _embed
+            guild = _bot_instance.get_guild(gid)
+            if guild:
+                member = guild.get_member(contractor_uid) or await guild.fetch_member(contractor_uid)
+                if member:
+                    e = _embed(c, gid)
+                    e.description = (f"🛟 **{user['username']}** needs a rescue at **{body}** "
+                                     f"({len(rescue_kerbals)} kerbal(s)) — via KSP!")
+                    dm_msg = await member.send(embed=e, view=ContractOfferView(c["contract_id"], gid))
+                    cdb.update_contract(gid, c["contract_id"], dm_message_id=str(dm_msg.id))
+        except Exception as exc:
+            log.error("Failed to DM rescue contractor %d: %s", contractor_uid, exc)
+
+    _create_notification(
+        gid, contractor_uid, "contract_incoming",
+        "🛟 New Rescue Mission",
+        f"{user['username']} needs {len(rescue_kerbals)} kerbal(s) rescued at {body}.",
+        {"contract_id": c["contract_id"]},
+    )
+
+    log.info("KSP: %s created RESCUE contract %s for user %d (%d coins, %d kerbals)",
+             user["username"], c["contract_id"], contractor_uid, payment, len(rescue_kerbals))
+    return ContractAcceptResponse(success=True, message=f"Rescue contract sent! ID: {c['contract_id']}")
+
+
+def _extract_crew_names(vn_data: bytes | None) -> set[str]:
+    """Pull assigned crew names out of a (gzipped) vessel ConfigNode. KSP stores
+    assigned crew as `crew = <Name>` lines on PART nodes; rescued kerbals keep
+    their renamed "{issuer}'s {kerbal} Kerman" names in the rescue craft."""
+    import gzip
+    import re
+    if not vn_data:
+        return set()
+    try:
+        text = gzip.decompress(vn_data).decode("utf-8", "ignore")
+    except (OSError, EOFError):
+        text = vn_data.decode("utf-8", "ignore")
+    except Exception:
+        return set()
+    names: set[str] = set()
+    for m in re.finditer(r"^\s*crew\s*=\s*(.+?)\s*$", text, re.MULTILINE):
+        val = m.group(1).strip()
+        if val and not val.isdigit():
+            names.add(val)
+    return names
+
+
+def _validate_rescue_submission(c: dict, vessel_data: str | None, vn_data: bytes | None):
+    """Defense-in-depth recheck of a rescue submission: right body + situation
+    (from telemetry) and every stranded kerbal aboard (from the node). Returns
+    (ok, reason). Orbit/surface margins are enforced authoritatively client-side."""
+    rt = c.get("rescue_target") or {}
+    body = (rt.get("body") or "").strip().lower()
+    mode = (rt.get("mode") or "orbit").lower()
+
+    vd: dict = {}
+    if vessel_data:
+        import json
+        try:
+            vd = json.loads(vessel_data)
+        except Exception:
+            vd = {}
+    if vd:
+        vbody = (vd.get("body") or "").strip().lower()
+        if body and vbody and vbody != body:
+            return False, f"Rescue craft is at {vd.get('body')}, must be at {rt.get('body')}."
+        sit = (vd.get("situation") or "").upper()
+        if mode == "orbit" and sit and sit != "ORBITING":
+            return False, "Rescue craft must be ORBITING the target."
+        if mode == "surface" and sit and sit not in ("LANDED", "SPLASHED"):
+            return False, "Rescue craft must be LANDED/SPLASHED at the target."
+
+    names = _extract_crew_names(vn_data)
+    if names:
+        missing = [k for k in c.get("rescue_kerbals", []) if k not in names]
+        if missing:
+            return False, f"Rescue craft is missing kerbals: {', '.join(missing)}."
+    return True, ""
+
+
+async def _deliver_rescue_craft(gid: int, contract_id: str, c: dict):
+    """On approval: deliver the rescue craft (now carrying the kerbals home) to the
+    issuer as a live-vessel import. Crew names are tagged/stripped by the issuer's
+    client on import (their own kerbals strip back to original), so no server-side
+    rename is needed. owner_name = the contractor who handed the craft over."""
+    url = c.get("delivered_vessel_node_url") or c.get("vessel_node_url")
+    if not url:
+        log.warning("Rescue %s approved but has no delivered vessel node.", contract_id)
+        return
+    issuer_id = int(c["issuer_id"])
+    craft_name = (c.get("vessel_data") or {}).get("vessel_name") or "Rescue Craft"
+    imp.enqueue(gid, issuer_id, "rescue_delivery", contract_id, craft_name,
+                vessel_node_url=url, owner_name=c.get("contractor_name", ""))
+    _create_notification(
+        gid, issuer_id, "rescue_delivered", "🛟 Kerbals Returned!",
+        "Your rescued kerbals are home — the rescue craft will appear in your save.",
+        {"contract_id": contract_id},
+    )
+    log.info("Rescue %s: delivered craft to issuer %d", contract_id, issuer_id)
+
+
+async def _restore_issuer_vessel(gid: int, contract_id: str, c: dict):
+    """On failure (cancel / rescuer paid fine / etc.): give the issuer their original
+    vessel back at its original spot. The stored wreck node holds the original orbit
+    and crew; owner_name = the issuer, so their client strips any tag back to the
+    original kerbal names on import."""
+    if not c.get("issuer_vessel_removed"):
+        return  # never removed (e.g. failed before acceptance) → nothing to do
+    url = c.get("rescue_vessel_node_url")
+    if not url:
+        log.warning("Rescue %s failed but has no stored wreck node to restore.", contract_id)
+        return
+    issuer_id = int(c["issuer_id"])
+    imp.enqueue(gid, issuer_id, "rescue_delivery", contract_id, "Stranded Vessel",
+                vessel_node_url=url, owner_name=c.get("issuer_name", ""))
+    cdb.update_contract(gid, contract_id, issuer_vessel_removed=False)
+    _create_notification(
+        gid, issuer_id, "rescue_failed", "↩️ Rescue Cancelled",
+        "The rescue didn't go through — your vessel is being returned to its place.",
+        {"contract_id": contract_id},
+    )
+    log.info("Rescue %s: restored issuer %d vessel", contract_id, issuer_id)
 
 
 # ── Submissions ──────────────────────────────────────────────────────────────
@@ -1066,6 +1389,18 @@ async def submit_contract(
 
     if c.get("status") != cdb.ACTIVE:
         return SubmissionResult(success=False, message="Contract is not active.")
+
+    # Read the vessel node once (used by both the rescue check below and the
+    # Storage upload further down). UploadFile.read() can only be consumed once.
+    vn_data = await vessel_node.read() if vessel_node else None
+
+    # Rescue: server-side defense-in-depth before accepting the submission — the
+    # rescue craft must be at the target body/situation and carry every stranded
+    # kerbal. The client gates this too, but a modified DLL must not bypass it.
+    if c.get("mission_type") == cdb.RESCUE:
+        ok, reason = _validate_rescue_submission(c, vessel_data, vn_data)
+        if not ok:
+            return SubmissionResult(success=False, message=reason)
 
     # Server-side part-restriction check (defense-in-depth — the client also gates this,
     # but an old/modified DLL must not bypass it). The contract's modlist is an allow-list
@@ -1153,13 +1488,16 @@ async def submit_contract(
         update_fields["loadmeta"] = loadmeta
 
     # Upload vessel node (full vessel state for transfer) to Storage
-    if vessel_node:
-        vn_data = await vessel_node.read()
+    if vn_data is not None:
         try:
             vn_url = await cdb.upload_to_storage(
                 contract_id, "vessel_node.cfg", vn_data, "application/gzip"
             )
             update_fields["vessel_node_url"] = vn_url
+            # For rescue, this is the craft that carries the kerbals home — delivered
+            # to the issuer (with restored names) once they approve.
+            if c.get("mission_type") == cdb.RESCUE:
+                update_fields["delivered_vessel_node_url"] = vn_url
             log.info("Vessel node uploaded: %d bytes (gzipped)", len(vn_data))
         except Exception as exc:
             log.error("Vessel node upload failed: %s", exc)
@@ -1317,6 +1655,9 @@ async def _auto_accept_contract(
     log.info("KSP: Auto-accepted contract %s for user %d (+%d coins, +%d XP, level %d)",
              contract_id, uid, c["payment"], xp, ksp_level)
 
+    # The finished craft goes to the builder's corporation channel.
+    await _deliver_craft_to_corp(gid, uid, contract_id)
+
     return SubmissionResult(
         success=True, message="Mission approved!",
         review_status="approved", reason=reason,
@@ -1433,16 +1774,32 @@ async def dismiss_notification(notif_id: str, user: dict = Depends(get_current_u
 
 @app.get("/api/v1/craft/download/{contract_id}")
 async def download_craft(contract_id: str, user: dict = Depends(get_current_user)):
-    """Get craft file download URL from a completed contract."""
+    """Get craft file download URL from a completed contract.
+
+    Player-to-player contract crafts stay private to the two parties (issuer +
+    contractor), who import them in the mod as usual. Bot-contract crafts are NOT
+    served here — they're delivered to the builder's corp channel instead.
+    """
     gid = int(user["guild_id"])
+    uid = str(user["user_id"])
 
     c = cdb.get_contract(gid, contract_id)
     if not c:
         raise HTTPException(status_code=404, detail="Contract not found")
 
-    # Only issuer can download craft from completed contracts
     if c.get("status") != cdb.COMPLETED:
         raise HTTPException(status_code=400, detail="Contract not completed yet")
+
+    is_bot_issued = str(c.get("issuer_id")) == str(_get_bot_user_id())
+    if is_bot_issued:
+        # Bot-contract crafts are delivered to the builder's corp channel, never
+        # imported — this also blocks re-importing the live vessel into a save.
+        raise HTTPException(
+            status_code=403,
+            detail="Bot-contract crafts are delivered to your corporation channel, not imported.",
+        )
+    if uid not in (str(c.get("issuer_id")), str(c.get("contractor_id"))):
+        raise HTTPException(status_code=403, detail="This craft is private to the contract parties.")
 
     files = c.get("submitted_files", [])
     craft_files = [f for f in files if f.get("filename", "").endswith(".craft")]
@@ -1456,6 +1813,304 @@ async def download_craft(contract_id: str, user: dict = Depends(get_current_user
         "loadmeta": c.get("loadmeta"),
         "vessel_node_url": vessel_node_url,
     }
+
+
+@app.get("/api/v1/contracts/{contract_id}/submission")
+async def get_submission_preview(contract_id: str, user: dict = Depends(get_current_user)):
+    """Return the contractor's submitted images (vessel render / blueprint) so the
+    issuer can preview the work in-game before approving or refusing it.
+
+    Restricted to the contract's two parties. Only the image files are returned —
+    the craft file itself stays gated behind the existing /craft endpoint, which
+    only opens up once the contract is completed.
+    """
+    gid = int(user["guild_id"])
+    uid = str(user["user_id"])
+
+    c = cdb.get_contract(gid, contract_id)
+    if not c:
+        raise HTTPException(status_code=404, detail="Contract not found")
+
+    if uid not in (str(c.get("issuer_id")), str(c.get("contractor_id"))):
+        raise HTTPException(status_code=403, detail="This submission is private to the contract parties.")
+
+    images = [
+        {"filename": f.get("filename"), "url": f.get("url")}
+        for f in c.get("submitted_files", [])
+        if (f.get("content_type") or "").startswith("image/") and f.get("url")
+    ]
+
+    vessel_name = (c.get("vessel_data") or {}).get("vessel_name") or ""
+    return {"images": images, "vessel_name": vessel_name}
+
+
+@app.get("/api/v1/craft/imports/pending")
+async def craft_imports_pending(user: dict = Depends(get_current_user)):
+    """Crafts the player queued (in Discord) for auto-import into their save.
+
+    The mod polls this at the Space Center, imports each entry, then acks it via
+    POST /api/v1/craft/imports/{import_id}/done so it isn't imported twice.
+    """
+    gid = int(user["guild_id"])
+    uid = int(user["user_id"])
+
+    imports = []
+    for e in imp.list_pending(gid, uid):
+        # dedup_key lets the mod skip a craft it already imported into this save.
+        dedup = e["ref_id"] if e.get("source") == "contract" else f"{e.get('source')}:{e['ref_id']}"
+        imports.append({**e, "dedup_key": dedup})
+
+    imports.sort(key=lambda x: x.get("created_at") or "")
+    return {"imports": imports}
+
+
+@app.post("/api/v1/craft/imports/{import_id}/done")
+async def craft_import_done(import_id: str, user: dict = Depends(get_current_user)):
+    """Ack a completed import — removes it from the player's queue."""
+    gid = int(user["guild_id"])
+    uid = int(user["user_id"])
+    deleted = imp.delete(gid, uid, import_id)
+    return {"success": deleted}
+
+
+# ── Marketplace ────────────────────────────────────────────────────────────────
+
+@app.post("/api/v1/marketplace/list", response_model=MarketplaceListResult)
+async def marketplace_list_craft(
+    craft_file: UploadFile = File(...),
+    blueprint: Optional[UploadFile] = File(None),
+    craft_name: str = Form(...),
+    craft_type: str = Form("VAB"),
+    part_count: int = Form(0),
+    mass: float = Form(0.0),
+    cost: float = Form(0.0),
+    price: int = Form(...),
+    user: dict = Depends(get_current_user),
+):
+    """List a craft (.craft blueprint) for sale on the marketplace.
+
+    The mod uploads the craft gzip-compressed (like contract submissions). We
+    decompress and store the raw .craft so the buyer's DM delivery is a straight
+    download. The listing is then posted to the marketplace Discord channel.
+    """
+    import gzip
+
+    if not settings.MARKETPLACE_CHANNEL_ID:
+        return MarketplaceListResult(success=False, message="The marketplace is not available right now.")
+
+    if price < settings.MARKETPLACE_MIN_PRICE or price > settings.MARKETPLACE_MAX_PRICE:
+        return MarketplaceListResult(
+            success=False,
+            message=f"Price must be between {settings.MARKETPLACE_MIN_PRICE} and "
+                    f"{settings.MARKETPLACE_MAX_PRICE} KCoins.",
+        )
+
+    gid = int(user["guild_id"])
+    uid = int(user["user_id"])
+
+    raw = await craft_file.read()
+    # The mod gzips the craft; fall back to raw bytes if it wasn't compressed.
+    try:
+        craft_bytes = gzip.decompress(raw)
+    except (OSError, EOFError):
+        craft_bytes = raw
+
+    filename = craft_file.filename or "craft.craft"
+    if not filename.lower().endswith(".craft"):
+        filename += ".craft"
+
+    listing = mkt.create_listing(
+        gid, uid, user["username"],
+        craft_name=craft_name, craft_type=craft_type, part_count=part_count,
+        mass=mass, cost=cost, price=price,
+        craft_url="", craft_filename=filename,
+    )
+
+    try:
+        url = await mkt.upload_craft(listing["listing_id"], filename, craft_bytes)
+    except Exception as exc:
+        log.error("Marketplace craft upload failed: %s", exc)
+        return MarketplaceListResult(success=False, message="Failed to upload craft file.")
+
+    mkt.update_listing(gid, listing["listing_id"], craft_url=url)
+    listing["craft_url"] = url
+
+    # Rendered blueprint image — shown publicly on the listing. Optional: if the
+    # render failed client-side, the listing still posts without an image.
+    if blueprint is not None:
+        try:
+            bp_data = await blueprint.read()
+            bp_url = await mkt.upload_blueprint(
+                listing["listing_id"], bp_data, blueprint.content_type or "image/png"
+            )
+            mkt.update_listing(gid, listing["listing_id"], blueprint_url=bp_url)
+            listing["blueprint_url"] = bp_url
+        except Exception as exc:
+            log.error("Marketplace blueprint upload failed: %s", exc)
+
+    # Post the listing to the Discord marketplace channel (runs on the bot loop).
+    try:
+        from cogs.marketplace import post_listing
+        await post_listing(_bot_instance, gid, listing)
+    except Exception as exc:
+        log.error("Failed to post marketplace listing %s: %s", listing["listing_id"], exc)
+
+    log.info("KSP: %s listed craft '%s' for %d (listing %s)",
+             user["username"], craft_name, price, listing["listing_id"])
+    return MarketplaceListResult(
+        success=True,
+        message="Your craft is now for sale!",
+        listing_id=listing["listing_id"],
+    )
+
+
+@app.get("/api/v1/marketplace/listings", response_model=MarketplaceListingsResponse)
+async def marketplace_listings(user: dict = Depends(get_current_user)):
+    """Return all active marketplace listings."""
+    gid = int(user["guild_id"])
+    listings = [
+        MarketplaceListing(
+            listing_id=l["listing_id"],
+            seller_id=l["seller_id"],
+            seller_name=l.get("seller_name", ""),
+            craft_name=l.get("craft_name", ""),
+            craft_type=l.get("craft_type", ""),
+            part_count=l.get("part_count", 0),
+            mass=l.get("mass", 0.0),
+            cost=l.get("cost", 0.0),
+            price=l.get("price", 0),
+            sales_count=l.get("sales_count", 0),
+            created_at=l.get("created_at"),
+        )
+        for l in mkt.list_active(gid)
+    ]
+    return MarketplaceListingsResponse(listings=listings)
+
+
+@app.post("/api/v1/marketplace/{listing_id}/delist", response_model=MarketplaceListResult)
+async def marketplace_delist(listing_id: str, user: dict = Depends(get_current_user)):
+    """Delist a craft the caller owns."""
+    gid = int(user["guild_id"])
+    uid = int(user["user_id"])
+
+    listing = mkt.get_listing(gid, listing_id)
+    if not listing:
+        raise HTTPException(status_code=404, detail="Listing not found")
+    if listing.get("seller_id") != str(uid):
+        raise HTTPException(status_code=403, detail="Not your listing")
+
+    if listing.get("status") == mkt.ACTIVE:
+        mkt.update_listing(gid, listing_id, status=mkt.DELISTED)
+        listing["status"] = mkt.DELISTED
+
+    # Disable the channel message buttons if we can find it.
+    msg_id = listing.get("channel_msg_id")
+    if msg_id and settings.MARKETPLACE_CHANNEL_ID and _bot_instance is not None:
+        try:
+            from cogs.marketplace import listing_embed
+            channel = _bot_instance.get_channel(settings.MARKETPLACE_CHANNEL_ID)
+            if channel:
+                msg = await channel.fetch_message(int(msg_id))
+                await msg.edit(embed=listing_embed(listing), view=None)
+        except Exception as exc:
+            log.warning("Could not update delisted message for %s: %s", listing_id, exc)
+
+    return MarketplaceListResult(success=True, message="Craft delisted.", listing_id=listing_id)
+
+
+# ── Checkpoint Hero Shots ─────────────────────────────────────────────────────
+
+# Human-readable titles per checkpoint kind for the Discord post.
+_CHECKPOINT_TITLES = {
+    "rendezvous": "🤝 Rendezvous",
+    "flyby": "🛰️ Flyby",
+    "asteroid": "☄️ Asteroid encounter",
+    "comet": "☄️ Comet encounter",
+}
+
+
+@app.post("/api/v1/checkpoint-photo", response_model=SubmissionResult)
+async def checkpoint_photo(
+    photo: UploadFile = File(...),
+    kind: str = Form("checkpoint"),
+    vessel_name: str = Form(""),
+    body: str = Form(""),
+    target_name: str = Form(""),
+    caption: str = Form(""),
+    user: dict = Depends(get_current_user),
+):
+    """Receive a milestone hero shot from the KSP mod and post it to the
+    checkpoint-photos Discord channel.
+
+    The image is sent straight to Discord as an attachment (no Firebase Storage)
+    since these are ephemeral community posts, not durable submission records.
+    """
+    if not settings.CHECKPOINT_PHOTOS_CHANNEL_ID:
+        return SubmissionResult(success=False, message="Checkpoint photos are not enabled on this server.")
+
+    if _bot_instance is None:
+        return SubmissionResult(success=False, message="Bot is not ready.")
+
+    channel = _bot_instance.get_channel(settings.CHECKPOINT_PHOTOS_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await _bot_instance.fetch_channel(settings.CHECKPOINT_PHOTOS_CHANNEL_ID)
+        except Exception as exc:
+            log.error("Checkpoint channel %s unavailable: %s",
+                      settings.CHECKPOINT_PHOTOS_CHANNEL_ID, exc)
+            return SubmissionResult(success=False, message="The checkpoint photo channel is unavailable.")
+
+    data = await photo.read()
+    if not data:
+        return SubmissionResult(success=False, message="Empty image.")
+
+    import discord
+
+    uid = int(user["user_id"])
+    username = user.get("username") or "Kerbonaut"
+    title = _CHECKPOINT_TITLES.get((kind or "").lower(), "📸 Mission milestone")
+
+    lines = []
+    if vessel_name:
+        lines.append(f"**Vessel:** {vessel_name}")
+    if body:
+        lines.append(f"**Location:** {body}")
+    if target_name:
+        lines.append(f"**Subject:** {target_name}")
+    if caption:
+        lines.append(caption)
+
+    embed = discord.Embed(
+        title=title,
+        description="\n".join(lines) if lines else None,
+        color=0x2ECC71,
+        timestamp=datetime.now(timezone.utc),
+    )
+
+    # Attribute the shot to the uploader, with their avatar when resolvable.
+    author_icon = None
+    discord_user = _bot_instance.get_user(uid)
+    if discord_user is None:
+        try:
+            discord_user = await _bot_instance.fetch_user(uid)
+        except Exception:
+            discord_user = None
+    if discord_user is not None:
+        author_icon = discord_user.display_avatar.url
+    embed.set_author(name=username, icon_url=author_icon)
+
+    filename = "checkpoint.png"
+    embed.set_image(url=f"attachment://{filename}")
+
+    try:
+        file = discord.File(io.BytesIO(data), filename=filename)
+        await channel.send(embed=embed, file=file)
+    except Exception as exc:
+        log.error("Failed to post checkpoint photo for user %s: %s", uid, exc)
+        return SubmissionResult(success=False, message="Failed to post the photo.")
+
+    log.info("KSP: %s posted a %s checkpoint photo (vessel '%s')", username, kind, vessel_name)
+    return SubmissionResult(success=True, message="Photo shared!")
 
 
 # ── Health ───────────────────────────────────────────────────────────────────
@@ -1480,6 +2135,63 @@ def set_bot_instance(bot):
 
 def _get_bot_user_id() -> int:
     return _bot_user_id
+
+
+async def _deliver_craft_to_corp(gid: int, builder_id: int, contract_id: str):
+    """Post a completed bot-contract craft to the builder's corporation channel.
+
+    Bot-contract deliverables go to the player's corp (as a downloadable .craft
+    blueprint), not into anyone's save — so the corp shares the work and there's
+    no live-vessel re-import. No-op if the player has no corp or the contract has
+    no craft file (e.g. a flight-only mission).
+    """
+    if _bot_instance is None:
+        return
+    try:
+        import discord
+        from cogs.corps import find_user_corp
+
+        c = cdb.get_contract(gid, contract_id)
+        if not c:
+            return
+        craft_files = [f for f in c.get("submitted_files", []) if f.get("filename", "").endswith(".craft")]
+        if not craft_files:
+            return
+
+        corp = find_user_corp(gid, builder_id)
+        if not corp or not corp.get("channel_id"):
+            log.info("Corp delivery skipped for %s: builder %d has no corp channel", contract_id, builder_id)
+            return
+
+        guild = _bot_instance.get_guild(gid)
+        if guild is None:
+            return
+        channel = guild.get_channel(int(corp["channel_id"]))
+        if channel is None:
+            return
+
+        cf = craft_files[0]
+        try:
+            data = await cdb.download_url(cf["url"])
+        except Exception as exc:
+            log.error("Corp delivery: could not download craft for %s: %s", contract_id, exc)
+            return
+
+        craft_name = (c.get("vessel_data") or {}).get("vessel_name") or cf["filename"][:-6]
+        embed = discord.Embed(
+            title="🏢 New craft delivered to the corporation",
+            description=f"**{c.get('contractor_name', 'A member')}** completed a contract and added "
+                        f"**{craft_name}** to {corp.get('name', 'the corp')}.",
+            color=discord.Color.green(),
+        )
+        embed.add_field(name="Mission", value=(c.get("mission") or "—")[:200], inline=False)
+        embed.set_footer(text="Download the .craft, or hit Load to KSP to auto-install it.")
+        from cogs.contractcraft import CorpCraftView
+        craft_file = discord.File(io.BytesIO(data), filename=cf["filename"])
+        await channel.send(embed=embed, file=craft_file, view=CorpCraftView(contract_id, gid))
+        log.info("Corp delivery: posted craft %s to channel %s", contract_id, corp["channel_id"])
+    except Exception as exc:
+        log.error("Corp delivery failed for %s: %s", contract_id, exc)
 
 
 async def _discord_notify_issuer(

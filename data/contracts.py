@@ -21,6 +21,11 @@ DISPUTED = "disputed"
 MOD_REVIEW = "mod_review"
 CANCELLED = "cancelled"
 
+# Mission-type values (stored in the contract's "mission_type" field)
+CRAFT_BUILD = "craft_build"
+ACTIVE_VESSEL = "active_vessel"
+RESCUE = "rescue"
+
 ContractData = dict[str, Any]
 
 
@@ -33,6 +38,12 @@ def create_contract(
     contractor_id: int, contractor_name: str,
     mission: str, payment: int, fine: int, due_date: str,
     modlist: str | None = None,
+    *,
+    mission_type: str | None = None,
+    rescue_target: dict | None = None,
+    rescue_vessel_node_url: str | None = None,
+    rescue_kerbals: list | None = None,
+    rescue_pid: str | None = None,
 ) -> ContractData:
     cid = uuid.uuid4().hex[:12]
     now = datetime.utcnow().isoformat()
@@ -56,6 +67,19 @@ def create_contract(
         "issuer_review_msg_id": None,
         "modlist": modlist,
     }
+    # Rescue-mission fields. The issuer's snapshotted vessel (the wreck the
+    # rescuer recovers) is removed from the issuer's save at creation time and
+    # restored if the contract never completes. rescue_kerbals are the tagged
+    # names ("{issuer}'s {kerbal}") the rescuer must recover.
+    if mission_type:
+        doc["mission_type"] = mission_type
+    if mission_type == RESCUE:
+        doc["rescue_target"] = rescue_target
+        doc["rescue_vessel_node_url"] = rescue_vessel_node_url
+        doc["rescue_kerbals"] = rescue_kerbals or []
+        doc["rescue_pid"] = rescue_pid
+        doc["issuer_vessel_removed"] = True
+        doc["delivered_vessel_node_url"] = None
     _col(guild_id).document(cid).set(doc)
     log.info("Contract %s created: %s -> %s (%d coins)", cid, issuer_name, contractor_name, payment)
     return doc

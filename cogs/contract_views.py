@@ -11,6 +11,7 @@ from i18n import t, tp
 import settings
 from data.store import store
 from data import contracts as cdb
+from data import imports as imp
 
 log = logging.getLogger(__name__)
 
@@ -24,7 +25,9 @@ def _cid(prefix: str, contract_id: str, guild_id: int) -> str:
 
 
 def _embed(c, guild_id):
-    e = discord.Embed(title=f"📜 {t(guild_id, 'ct.title')}", color=discord.Color.gold())
+    is_flag = c.get("mission_type") == cdb.FLAG_DESIGN
+    title = f"🚩 {t(guild_id, 'ct.title')}" if is_flag else f"📜 {t(guild_id, 'ct.title')}"
+    e = discord.Embed(title=title, color=discord.Color.gold())
     sym = settings.CURRENCY_SYMBOL
     e.add_field(name=t(guild_id, "ct.mission"), value=c["mission"], inline=False)
     e.add_field(name=t(guild_id, "ct.issuer"), value=c["issuer_name"], inline=True)
@@ -40,7 +43,12 @@ def _embed(c, guild_id):
         if len(mod_text) > 1000:
             mod_text = mod_text[:1000] + "..."
         e.add_field(name="Required Mods", value=f"```\n{mod_text}\n```", inline=False)
-        
+
+    # Flag-design contracts ride the watermarked preview along on every embed.
+    # The clean full-res image stays gated until the contract completes.
+    if is_flag and c.get("flag_preview_url"):
+        e.set_image(url=c["flag_preview_url"])
+
     return e
 
 
@@ -200,6 +208,11 @@ class ReviewAcceptButton(DynamicItem[Button], template=r"ct_rv_acc:" + _ID_PATTE
         if c.get("mission_type") == cdb.RESCUE:
             await store.add_rescue(self.gid, int(c["contractor_id"]))
         c["status"] = cdb.COMPLETED
+        # Flag-design: deliver the full-res flag to the issuer's in-game picker.
+        if c.get("mission_type") == cdb.FLAG_DESIGN and c.get("flag_fullres_url"):
+            imp.enqueue(self.gid, int(c["issuer_id"]), source="flag", ref_id=self.cid,
+                        craft_name=c["mission"], flag_url=c["flag_fullres_url"],
+                        craft_filename=c.get("flag_filename") or "flag.png")
         e = _embed(c, self.gid)
         e.color = discord.Color.green()
         # Reveal craft files (screenshots were already visible)
@@ -212,6 +225,12 @@ class ReviewAcceptButton(DynamicItem[Button], template=r"ct_rv_acc:" + _ID_PATTE
         if screenshots:
             flist = "\n".join(f"🖼️ [{s['filename']}]({s['url']})" for s in screenshots)
             e.add_field(name="🖼️ Screenshots", value=flist, inline=False)
+        # Flag-design: reveal the clean full-res flag now that it's paid for.
+        if c.get("mission_type") == cdb.FLAG_DESIGN and c.get("flag_fullres_url"):
+            e.set_image(url=c["flag_fullres_url"])
+            e.add_field(name="🚩 Flag (full-res)",
+                        value=f"[Download]({c['flag_fullres_url']}) — also queued to your "
+                              "in-game flag picker.", inline=False)
         await interaction.edit_original_response(embed=e, view=None)
         try:
             contractor = await interaction.client.fetch_user(int(c["contractor_id"]))
@@ -688,6 +707,11 @@ class FileSelectView(View):
             child.disabled = True
         await interaction.edit_original_response(view=self)
 
+        # ── Flag-design contract → gate full-res, show watermarked preview ──
+        if c.get("mission_type") == cdb.FLAG_DESIGN:
+            await self._submit_flag(interaction, c, selected_files)
+            return
+
         stored = []
         for f in selected_files:
             try:
@@ -744,6 +768,61 @@ class FileSelectView(View):
             except Exception:
                 pass
         await interaction.followup.send("✅ Submitted!", ephemeral=True)
+
+    async def _submit_flag(self, interaction: discord.Interaction, c: dict, selected_files: list[dict]):
+        """Flag-design submission: keep the clean image gated, surface only a
+        watermarked preview, and DM the issuer for review. Flag contracts are
+        always human-issued, so there's no AI auto-review path."""
+        from datetime import datetime
+        import flag_preview
+
+        img = next((f for f in selected_files if f["content_type"].startswith("image/")), None)
+        if not img:
+            await interaction.followup.send("❌ No image found to submit as the flag.", ephemeral=True)
+            return
+
+        try:
+            raw = await cdb.download_url(img["url"])
+        except Exception as exc:
+            log.error("Flag download failed: %s", exc)
+            await interaction.followup.send("❌ Could not read your uploaded flag. Try again.", ephemeral=True)
+            return
+
+        # Full-res stays gated; only the watermarked preview is shown until accept.
+        fullres_url = await cdb.upload_to_storage(self.cid, img["filename"], raw,
+                                                  img.get("content_type", "image/png"))
+        preview_url = await cdb.upload_to_storage(
+            self.cid, "flag_preview.png", flag_preview.make_watermarked(raw), "image/png")
+
+        cdb.update_contract(self.gid, self.cid, status=cdb.SUBMITTED,
+                            submitted_files=[], flag_filename=img["filename"],
+                            flag_fullres_url=fullres_url, flag_preview_url=preview_url,
+                            submitted_at=datetime.utcnow().isoformat())
+        c = cdb.get_contract(self.gid, self.cid)
+
+        try:
+            issuer = await interaction.client.fetch_user(int(c["issuer_id"]))
+            e = _embed(c, self.gid)
+            e.title = f"📬 {t(self.gid, 'ct.review_title')}"
+            e.color = discord.Color.orange()
+            e.add_field(
+                name="🚩 Flag",
+                value="Preview is watermarked — the full-res flag is delivered to your "
+                      "in-game flag picker on acceptance.",
+                inline=False)
+            msg = await issuer.send(embed=e, view=ContractReviewView(self.cid, self.gid))
+            cdb.update_contract(self.gid, self.cid, issuer_review_msg_id=str(msg.id))
+        except Exception as exc:
+            log.error("Could not DM issuer for flag review: %s", exc)
+
+        # Update the designer's contract panel.
+        if c.get("dm_message_id"):
+            try:
+                orig = await interaction.channel.fetch_message(int(c["dm_message_id"]))
+                await orig.edit(embed=_embed(c, self.gid), view=None)
+            except Exception:
+                pass
+        await interaction.followup.send("✅ Flag submitted for review!", ephemeral=True)
 
     async def _ai_review(self, interaction: discord.Interaction, c: dict, stored: list[dict]):
         """Use Gemini AI to review screenshots against the mission description."""

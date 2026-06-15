@@ -22,6 +22,14 @@ from config import cfg
 # Parse --sync flag before the bot starts
 _SYNC_COMMANDS = "--sync" in sys.argv
 
+# Ensure our own (non-discord, non-uvicorn) module logs reach stdout at INFO.
+# No-op if the root logger is already configured elsewhere.
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
 log = logging.getLogger(__name__)
 
 # ── Mimic System ─────────────────────────────────────────────────────────────

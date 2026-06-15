@@ -621,6 +621,7 @@ async def get_active_contracts(user: dict = Depends(get_current_user)):
                 rescue_target=rescue_target,
                 rescue_kerbals=rescue_kerbals,
                 is_modded_target=is_modded_target,
+                flag_preview_url=c.get("flag_preview_url"),
             ))
 
     # Sort newest first
@@ -652,6 +653,8 @@ async def get_incoming_contracts(user: dict = Depends(get_current_user)):
                 status=c["status"],
                 created_at=c.get("created_at"),
                 is_bot_issued=False,
+                mission_type=c.get("mission_type", "active_vessel"),
+                flag_preview_url=c.get("flag_preview_url"),
             ))
 
     return ContractListResponse(contracts=contracts)
@@ -759,6 +762,18 @@ async def review_submission(contract_id: str, req: ContractReviewRequest,
                 gid, contractor_id, "rescue_craft_removed",
                 "🚀 Rescue Craft Transferred",
                 "Your rescue craft and the rescued kerbals were delivered to the issuer.",
+                {"contract_id": contract_id},
+            )
+        # Flag-design: deliver the full-res flag to the issuer's in-game picker.
+        if c.get("mission_type") == cdb.FLAG_DESIGN and c.get("flag_fullres_url"):
+            imp.enqueue(gid, int(c["issuer_id"]), source="flag", ref_id=contract_id,
+                        craft_name=c["mission"], flag_url=c["flag_fullres_url"],
+                        craft_filename=c.get("flag_filename") or "flag.png")
+            _create_notification(
+                gid, int(c["issuer_id"]), "flag_delivered",
+                "🚩 Flag Delivered",
+                "Your custom flag is queued — open KSP at the Space Center to install it "
+                "into your flag picker.",
                 {"contract_id": contract_id},
             )
         log.info("KSP: %s approved submission for contract %s", user["username"], contract_id)
@@ -1069,7 +1084,7 @@ async def create_contract_from_ksp(req: ContractCreateRequest, user: dict = Depe
     # Type: "auto" keeps the AI classification; an explicit craft_build /
     # active_vessel forces the type and skips the AI call.
     ctype = (req.contract_type or "auto").lower()
-    if ctype in ("craft_build", "active_vessel"):
+    if ctype in ("craft_build", "active_vessel", "flag_design"):
         cdb.update_contract(gid, c["contract_id"], mission_type=ctype)
     else:
         cls = await _classify_single_contract(gid, c["contract_id"], req.mission)
@@ -1492,6 +1507,21 @@ async def submit_contract(
     if loadmeta:
         update_fields["loadmeta"] = loadmeta
 
+    # Orbital telemetry diagram — rendered once from the captured vessel state and
+    # persisted to Storage so it can be surfaced both in the Discord review embed
+    # and the in-game review window. Only present when the client sent vessel data
+    # (active-vessel / rescue submissions); other submission types skip it.
+    if parsed_vessel_data:
+        try:
+            from orbit_render import render_orbit
+            orbit_png = render_orbit(parsed_vessel_data)
+            if orbit_png:
+                update_fields["telemetry_image_url"] = await cdb.upload_to_storage(
+                    contract_id, "orbit_telemetry.png", orbit_png, "image/png"
+                )
+        except Exception as exc:
+            log.warning("Failed to render/store orbit telemetry for %s: %s", contract_id, exc)
+
     # Upload vessel node (full vessel state for transfer) to Storage
     if vn_data is not None:
         try:
@@ -1839,6 +1869,16 @@ async def get_submission_preview(contract_id: str, user: dict = Depends(get_curr
     if uid not in (str(c.get("issuer_id")), str(c.get("contractor_id"))):
         raise HTTPException(status_code=403, detail="This submission is private to the contract parties.")
 
+    # Flag-design: watermarked preview while pending review; the clean full-res
+    # flag is only exposed once the contract is completed (i.e. paid for).
+    if c.get("mission_type") == cdb.FLAG_DESIGN:
+        if c.get("status") == cdb.COMPLETED and c.get("flag_fullres_url"):
+            url, fname = c["flag_fullres_url"], (c.get("flag_filename") or "flag.png")
+        else:
+            url, fname = c.get("flag_preview_url"), "flag_preview.png"
+        images = [{"filename": fname, "url": url}] if url else []
+        return {"images": images, "vessel_name": "", "telemetry_url": ""}
+
     images = [
         {"filename": f.get("filename"), "url": f.get("url")}
         for f in c.get("submitted_files", [])
@@ -1846,7 +1886,10 @@ async def get_submission_preview(contract_id: str, user: dict = Depends(get_curr
     ]
 
     vessel_name = (c.get("vessel_data") or {}).get("vessel_name") or ""
-    return {"images": images, "vessel_name": vessel_name}
+    # The orbital telemetry diagram is stored separately (not in submitted_files)
+    # so the mod can show it in its own window rather than mixed with blueprints.
+    telemetry_url = c.get("telemetry_image_url") or ""
+    return {"images": images, "vessel_name": vessel_name, "telemetry_url": telemetry_url}
 
 
 @app.get("/api/v1/craft/imports/pending")
@@ -1861,7 +1904,7 @@ async def craft_imports_pending(user: dict = Depends(get_current_user)):
 
     imports = []
     for e in imp.list_pending(gid, uid):
-        # dedup_key lets the mod skip a craft it already imported into this save.
+        # dedup_key lets the mod skip an entry it already processed into this save.
         dedup = e["ref_id"] if e.get("source") == "contract" else f"{e.get('source')}:{e['ref_id']}"
         imports.append({**e, "dedup_key": dedup})
 
@@ -2050,6 +2093,9 @@ async def checkpoint_photo(
     The image is sent straight to Discord as an attachment (no Firebase Storage)
     since these are ephemeral community posts, not durable submission records.
     """
+    if not settings.CHECKPOINT_PHOTOS_ENABLED:
+        return SubmissionResult(success=False, message="Checkpoint photos are disabled on this server.")
+
     if not settings.CHECKPOINT_PHOTOS_CHANNEL_ID:
         return SubmissionResult(success=False, message="Checkpoint photos are not enabled on this server.")
 

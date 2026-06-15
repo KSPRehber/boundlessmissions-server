@@ -25,6 +25,7 @@ CANCELLED = "cancelled"
 CRAFT_BUILD = "craft_build"
 ACTIVE_VESSEL = "active_vessel"
 RESCUE = "rescue"
+FLAG_DESIGN = "flag_design"
 
 ContractData = dict[str, Any]
 

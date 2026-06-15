@@ -45,6 +45,10 @@ S.update({
     "ct.no_funds":       {"en": "❌ Insufficient balance."},
     "ct.offer_dm":       {"en": "📜 You received a new contract offer!"},
     "ct.created":        {"en": "✅ Contract created and sent to {name}."},
+    # Flag-design contracts
+    "ct.flag_mission":   {"en": "🚩 Flag design: {title}"},
+    "ct.flag_offer_dm":  {"en": "🚩 You received a new flag-design request!"},
+    "ct.flag_created":   {"en": "✅ Flag-design contract created and sent to {name}."},
     "ct.err_self":       {"en": "❌ You can't contract yourself."},
     "ct.err_funds":      {"en": "❌ Insufficient balance ({need} {sym} required)."},
     "ct.err_limit":      {"en": "❌ Active contract limit reached ({max})."},
@@ -141,6 +145,78 @@ class Contracts(commands.Cog, name="Contracts"):
 
         await interaction.followup.send(
             tp(gid, uid, "ct.created", name=user.display_name), ephemeral=True)
+
+    @app_commands.command(name="flagcontract", description="Request a custom flag design from another user")
+    @app_commands.describe(
+        user="User you want to design the flag",
+        title="What the flag should depict / be called",
+        money="Payment amount in KCoins",
+        date_due="Due date (YYYY-MM-DD)",
+        fine="Fine amount if the contract is breached",
+    )
+    async def flagcontract(
+        self, interaction: discord.Interaction,
+        user: discord.Member, title: str,
+        money: int, date_due: str, fine: int,
+    ):
+        gid = interaction.guild_id
+        uid = interaction.user.id
+        sym = settings.CURRENCY_SYMBOL
+
+        if user.id == uid and not settings.CONTRACT_ALLOW_SELF:
+            await interaction.response.send_message(tp(gid, uid, "ct.err_self"), ephemeral=True)
+            return
+
+        # Validate date (must be in the future)
+        try:
+            from datetime import datetime, date
+            dt = datetime.strptime(date_due, "%Y-%m-%d").date()
+            if dt <= date.today():
+                await interaction.response.send_message(tp(gid, uid, "ct.err_date"), ephemeral=True)
+                return
+        except ValueError:
+            await interaction.response.send_message(tp(gid, uid, "ct.err_date"), ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        # Check balance (escrow) and active-contract limit
+        bal = store.get_user(gid, uid)["balance"]
+        if bal < money:
+            await interaction.followup.send(
+                tp(gid, uid, "ct.err_funds", need=money, sym=sym), ephemeral=True)
+            return
+
+        if cdb.count_active(gid, uid) >= settings.MAX_ACTIVE_CONTRACTS_PER_USER:
+            await interaction.followup.send(
+                tp(gid, uid, "ct.err_limit", max=settings.MAX_ACTIVE_CONTRACTS_PER_USER), ephemeral=True)
+            return
+
+        # Escrow: lock the payment
+        await store.add_balance(gid, uid, -money)
+
+        c = cdb.create_contract(
+            gid, uid, interaction.user.display_name,
+            user.id, user.display_name,
+            t(gid, "ct.flag_mission", title=title), money, fine, date_due,
+            mission_type=cdb.FLAG_DESIGN,
+        )
+
+        # DM the designer with the offer
+        try:
+            e = _embed(c, gid)
+            e.description = t(gid, "ct.flag_offer_dm")
+            view = ContractOfferView(c["contract_id"], gid)
+            dm_msg = await user.send(embed=e, view=view)
+            cdb.update_contract(gid, c["contract_id"], dm_message_id=str(dm_msg.id))
+        except discord.Forbidden:
+            await store.add_balance(gid, uid, money)
+            cdb.update_contract(gid, c["contract_id"], status=cdb.CANCELLED)
+            await interaction.followup.send(tp(gid, uid, "ct.err_dm"), ephemeral=True)
+            return
+
+        await interaction.followup.send(
+            tp(gid, uid, "ct.flag_created", name=user.display_name), ephemeral=True)
 
     @app_commands.command(name="contractreset", description="[MOD] Cancel all active contracts for a user")
     @app_commands.describe(user="The user whose contracts should be cancelled")

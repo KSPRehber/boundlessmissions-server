@@ -105,6 +105,8 @@ class ContractSummary(BaseModel):
     mission_type: str = "active_vessel"
     required_situation: Optional[str] = None
     required_body: Optional[str] = None
+    # Flag-design contracts: watermarked preview shown before acceptance.
+    flag_preview_url: Optional[str] = None
     # Rescue-mission fields (only set when mission_type == "rescue")
     rescue_target: Optional[RescueTarget] = None
     rescue_kerbals: list[str] = []  # renamed names the rescuer must recover

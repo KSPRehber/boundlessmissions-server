@@ -116,6 +116,10 @@ WEEKLY_MISSIONS_MODS_IGNORE_LOCK = False
 
 # ── Checkpoint Photos ────────────────────────────────────────────────────────
 
+# Master switch for the auto-screenshot ("hero shot") feature. When False the
+# server rejects all checkpoint photo uploads regardless of the channel below.
+CHECKPOINT_PHOTOS_ENABLED = False
+
 # Channel where milestone "hero shots" captured in-game (rendezvous, flyby,
 # asteroid/comet) are posted. Set to None to disable — uploads from the KSP mod
 # will then be rejected.

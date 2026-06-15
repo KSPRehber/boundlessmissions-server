@@ -34,15 +34,17 @@ def enqueue(
     craft_filename: str | None = None,
     loadmeta: str | None = None,
     owner_name: str | None = None,
+    flag_url: str | None = None,
 ) -> ImportEntry:
     """Queue a craft for the player's KSP client to auto-import.
 
-    `source` is "contract", "market", or "rescue_delivery"; `ref_id` is the
-    contract_id or listing_id. "contract"/"market" deliver a .craft blueprint
+    `source` is "contract", "market", "rescue_delivery", or "flag"; `ref_id` is
+    the contract_id or listing_id. "contract"/"market" deliver a .craft blueprint
     (installed to the Ships folder); "rescue_delivery" carries a vessel_node_url
-    and is imported as a LIVE vessel (the rescued craft, spawned in-save). If an
-    identical craft is already queued (same source + ref_id) the existing entry
-    is returned instead of creating a duplicate.
+    and is imported as a LIVE vessel (the rescued craft, spawned in-save); "flag"
+    carries a flag_url (PNG) installed into the KSP Flags dir — never a
+    craft/vessel. If an identical entry is already queued (same source + ref_id)
+    the existing entry is returned instead of creating a duplicate.
     """
     for doc in _col(guild_id, user_id).stream():
         d = doc.to_dict()
@@ -60,6 +62,7 @@ def enqueue(
         "craft_filename": craft_filename,
         "loadmeta": loadmeta,
         "owner_name": owner_name,
+        "flag_url": flag_url,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     _col(guild_id, user_id).document(iid).set(entry)

@@ -196,6 +196,9 @@ class ReviewAcceptButton(DynamicItem[Button], template=r"ct_rv_acc:" + _ID_PATTE
         from datetime import datetime
         cdb.update_contract(self.gid, self.cid, status=cdb.COMPLETED, completed_at=datetime.utcnow().isoformat())
         await store.add_balance(self.gid, int(c["contractor_id"]), c["payment"])
+        # Credit the rescuer with a completed rescue for the leaderboard/stats.
+        if c.get("mission_type") == cdb.RESCUE:
+            await store.add_rescue(self.gid, int(c["contractor_id"]))
         c["status"] = cdb.COMPLETED
         e = _embed(c, self.gid)
         e.color = discord.Color.green()

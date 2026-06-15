@@ -52,6 +52,12 @@ S.update({
     "ct.err_date":       {"en": "❌ Invalid date format. Use YYYY-MM-DD."},
     "ct.moretime_request":{"en": "Time Extension Request"},
     "ct.moretime_desc":  {"en": "**{name}** is requesting a deadline extension.\nCurrent: **{old}** → New: **{new}**"},
+    # Rescue stats / leaderboard
+    "rescue.stat.title":  {"en": "🛟 {name}'s Rescues"},
+    "rescue.stat.desc":   {"en": "Completed rescue missions: **{count}**"},
+    "rescue.lb.title":    {"en": "🛟 Rescue Leaderboard"},
+    "rescue.lb.empty":    {"en": "No rescues completed yet — be the first to bring someone home!"},
+    "rescue.lb.line":     {"en": "{prefix} **{name}** — `{count}` rescue(s)"},
 })
 
 
@@ -176,6 +182,46 @@ class Contracts(commands.Cog, name="Contracts"):
         )
         log.info("%s reset contracts for %s: %d cancelled, %d refunded, %d selections cleared",
                  interaction.user, user, cancelled, refunded, selections_cleared)
+
+    # ── /rescues ────────────────────────────────────────────────────────────
+    @app_commands.command(name="rescues", description="Show how many rescue missions a user has completed")
+    @app_commands.describe(user="User to look up (defaults to yourself)")
+    async def rescues(self, interaction: discord.Interaction, user: discord.Member | None = None):
+        gid = interaction.guild_id
+        target = user or interaction.user
+        count = store.get_user(gid, target.id).get("rescues", 0)
+        embed = discord.Embed(
+            title=tp(gid, interaction.user.id, "rescue.stat.title", name=target.display_name),
+            description=tp(gid, interaction.user.id, "rescue.stat.desc", count=count),
+            color=discord.Color.blue(),
+        )
+        embed.set_thumbnail(url=target.display_avatar.url)
+        await interaction.response.send_message(embed=embed, ephemeral=user is None)
+
+    # ── /rescueboard ────────────────────────────────────────────────────────
+    @app_commands.command(name="rescueboard", description="View the rescue-mission leaderboard")
+    async def rescueboard(self, interaction: discord.Interaction):
+        gid = interaction.guild_id
+        lb = [(uid, d) for uid, d in store.leaderboard(gid, key="rescues", limit=9999)
+              if d.get("rescues", 0) > 0][:settings.LEADERBOARD_PAGE_SIZE]
+        if not lb:
+            await interaction.response.send_message(t(gid, "rescue.lb.empty"), ephemeral=True)
+            return
+
+        medals = ["🥇", "🥈", "🥉"]
+        lines = []
+        for i, (uid, data) in enumerate(lb):
+            prefix = medals[i] if i < 3 else f"`{i + 1}.`"
+            member = interaction.guild.get_member(int(uid))
+            name = member.display_name if member else f"User {uid}"
+            lines.append(t(gid, "rescue.lb.line", prefix=prefix, name=name, count=data.get("rescues", 0)))
+
+        embed = discord.Embed(
+            title=t(gid, "rescue.lb.title"),
+            description="\n".join(lines),
+            color=discord.Color.blue(),
+        )
+        await interaction.response.send_message(embed=embed)
 
 
 async def setup(bot: commands.Bot):

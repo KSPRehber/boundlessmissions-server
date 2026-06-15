@@ -1325,6 +1325,11 @@ async def _deliver_rescue_craft(gid: int, contract_id: str, c: dict):
     craft_name = (c.get("vessel_data") or {}).get("vessel_name") or "Rescue Craft"
     imp.enqueue(gid, issuer_id, "rescue_delivery", contract_id, craft_name,
                 vessel_node_url=url, owner_name=c.get("contractor_name", ""))
+    # Credit the rescuer with a completed rescue for the leaderboard/stats.
+    try:
+        await store.add_rescue(gid, int(c["contractor_id"]))
+    except Exception as exc:
+        log.warning("Could not record rescue stat for contract %s: %s", contract_id, exc)
     _create_notification(
         gid, issuer_id, "rescue_delivered", "🛟 Kerbals Returned!",
         "Your rescued kerbals are home — the rescue craft will appear in your save.",

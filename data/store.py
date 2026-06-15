@@ -62,6 +62,7 @@ def _default_user() -> UserData:
         "last_xp_time": 0.0,
         "joined_at": "",
         "unlocked_levels": [],
+        "rescues": 0,
     }
 
 
@@ -238,6 +239,14 @@ class UserStore:
             user["balance"] = max(0, user["balance"] + amount)
             self._mark_dirty(guild_id, user_id)
             return user["balance"]
+
+    async def add_rescue(self, guild_id: int, user_id: int, amount: int = 1) -> int:
+        """Increment a user's completed-rescue counter. Returns the new total."""
+        async with self._lock:
+            user = self.get_user(guild_id, user_id)
+            user["rescues"] = max(0, user.get("rescues", 0) + amount)
+            self._mark_dirty(guild_id, user_id)
+            return user["rescues"]
 
     async def add_unlocked_level(self, guild_id: int, user_id: int, level: int) -> bool:
         """Add a level to unlocked_levels if not already present. Returns True if newly added."""

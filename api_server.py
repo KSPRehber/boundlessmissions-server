@@ -12,7 +12,7 @@ import io
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Optional, List
 
 from fastapi import (
     FastAPI, Depends, HTTPException, Header, UploadFile, File, Form,
@@ -1388,6 +1388,9 @@ async def submit_contract(
     screenshot1: Optional[UploadFile] = File(None),
     screenshot2: Optional[UploadFile] = File(None),
     screenshot3: Optional[UploadFile] = File(None),
+    # Multi-vessel submissions send one render per craft under this repeated field
+    # (uncapped). The numbered fields above are kept for older clients.
+    screenshots: List[UploadFile] = File(default=[]),
     modlist: Optional[str] = Form(None),
     used_modlist: Optional[str] = Form(None),
     user: dict = Depends(get_current_user),
@@ -1464,19 +1467,21 @@ async def submit_contract(
         except Exception as exc:
             log.error("Craft upload failed: %s", exc)
 
-    # Screenshots
-    for ss in [screenshot1, screenshot2, screenshot3]:
-        if ss:
-            data = await ss.read()
-            try:
-                url = await cdb.upload_to_storage(
-                    contract_id, ss.filename, data,
-                    ss.content_type or "image/png"
-                )
-                stored_files.append({"filename": ss.filename, "url": url,
-                                     "content_type": ss.content_type or "image/png"})
-            except Exception as exc:
-                log.error("Screenshot upload failed: %s", exc)
+    # Screenshots — legacy numbered fields plus the uncapped repeated field, so a
+    # multi-craft submission stores a render for every selected vessel.
+    all_screenshots = [s for s in (screenshot1, screenshot2, screenshot3) if s]
+    all_screenshots += [s for s in (screenshots or []) if s]
+    for ss in all_screenshots:
+        data = await ss.read()
+        try:
+            url = await cdb.upload_to_storage(
+                contract_id, ss.filename, data,
+                ss.content_type or "image/png"
+            )
+            stored_files.append({"filename": ss.filename, "url": url,
+                                 "content_type": ss.content_type or "image/png"})
+        except Exception as exc:
+            log.error("Screenshot upload failed: %s", exc)
 
     if not stored_files:
         return SubmissionResult(success=False, message="No files uploaded successfully.")
@@ -1514,11 +1519,37 @@ async def submit_contract(
     if parsed_vessel_data:
         try:
             from orbit_render import render_orbit
-            orbit_png = render_orbit(parsed_vessel_data)
-            if orbit_png:
-                update_fields["telemetry_image_url"] = await cdb.upload_to_storage(
-                    contract_id, "orbit_telemetry.png", orbit_png, "image/png"
-                )
+
+            # One orbit diagram per submitted craft: the active (contract) vessel
+            # first, then any extras sent in a multi-vessel submission.
+            snaps = []
+            active_snap = parsed_vessel_data.get("active_vessel") or parsed_vessel_data
+            if isinstance(active_snap, dict):
+                snaps.append(active_snap)
+            for sv in (parsed_vessel_data.get("sent_vessels") or []):
+                if isinstance(sv, dict):
+                    snaps.append(sv)
+
+            telemetry_urls = []
+            for idx, snap in enumerate(snaps):
+                try:
+                    orbit_png = render_orbit(snap)
+                except Exception as exc:
+                    log.warning("orbit render failed for vessel %d on %s: %s", idx, contract_id, exc)
+                    continue
+                if not orbit_png:
+                    continue
+
+                fname = "orbit_telemetry.png" if idx == 0 else f"orbit_telemetry_{idx}.png"
+                url = await cdb.upload_to_storage(contract_id, fname, orbit_png, "image/png")
+                telemetry_urls.append(url)
+
+            # Telemetry diagrams stay OUT of the blueprint image list — they're surfaced
+            # in the dedicated in-game telemetry window (one per craft) and the Discord
+            # embed. telemetry_image_url keeps the active craft's diagram for back-compat.
+            if telemetry_urls:
+                update_fields["telemetry_image_url"] = telemetry_urls[0]
+                update_fields["telemetry_image_urls"] = telemetry_urls
         except Exception as exc:
             log.warning("Failed to render/store orbit telemetry for %s: %s", contract_id, exc)
 
@@ -1886,10 +1917,19 @@ async def get_submission_preview(contract_id: str, user: dict = Depends(get_curr
     ]
 
     vessel_name = (c.get("vessel_data") or {}).get("vessel_name") or ""
-    # The orbital telemetry diagram is stored separately (not in submitted_files)
-    # so the mod can show it in its own window rather than mixed with blueprints.
-    telemetry_url = c.get("telemetry_image_url") or ""
-    return {"images": images, "vessel_name": vessel_name, "telemetry_url": telemetry_url}
+    # The orbital telemetry diagrams are stored separately (not in submitted_files) so
+    # the mod shows them in their own window rather than mixed with blueprints. A
+    # multi-craft submission has one per craft; telemetry_url stays for old clients.
+    telemetry_urls = c.get("telemetry_image_urls") or (
+        [c["telemetry_image_url"]] if c.get("telemetry_image_url") else []
+    )
+    telemetry_url = telemetry_urls[0] if telemetry_urls else ""
+    return {
+        "images": images,
+        "vessel_name": vessel_name,
+        "telemetry_url": telemetry_url,
+        "telemetry_urls": telemetry_urls,
+    }
 
 
 @app.get("/api/v1/craft/imports/pending")
@@ -1919,6 +1959,97 @@ async def craft_import_done(import_id: str, user: dict = Depends(get_current_use
     uid = int(user["user_id"])
     deleted = imp.delete(gid, uid, import_id)
     return {"success": deleted}
+
+
+@app.post("/api/v1/craft/send")
+async def craft_send_to_friend(
+    file: UploadFile = File(...),
+    recipient_id: str = Form(...),
+    kind: str = Form("craft"),
+    craft_name: str = Form("Craft"),
+    user: dict = Depends(get_current_user),
+):
+    """Quicksend a craft/vessel from the KSP mod's Tools tab to another player.
+
+    kind="vessel" delivers a LIVE vessel (the recipient's client spawns it in their
+    save); kind="craft" delivers a .craft blueprint into their Ships folder. Both
+    ride the per-user craft-import queue the mod already polls, so the recipient
+    receives it automatically the next time they're at the Space Center. The payload
+    arrives gzip-compressed (like submissions/listings); we store it decompressed.
+    """
+    import gzip
+    from cogs.corps import _get_corp
+
+    gid = int(user["guild_id"])
+    uid = int(user["user_id"])
+
+    try:
+        rid = int(recipient_id)
+    except (TypeError, ValueError):
+        return {"success": False, "message": "Invalid recipient."}
+
+    if rid == uid:
+        return {"success": False, "message": "You can't send a craft to yourself."}
+
+    # Resolve the recipient — they must be a known player (have a corp, as the
+    # in-game friend picker lists) or a current member of the guild.
+    corp = _get_corp(gid, rid)
+    recipient_name = corp.get("owner_name") if corp else None
+    if recipient_name is None and _bot_instance:
+        guild = _bot_instance.get_guild(gid)
+        member = guild.get_member(rid) if guild else None
+        if member:
+            recipient_name = member.display_name
+    if recipient_name is None:
+        return {"success": False, "message": "That player isn't in this server."}
+
+    kind = (kind or "craft").lower()
+    if kind not in ("craft", "vessel"):
+        return {"success": False, "message": "Unknown send type."}
+
+    raw = await file.read()
+    try:
+        payload = gzip.decompress(raw)
+    except (OSError, EOFError):
+        payload = raw  # fall back if it wasn't compressed
+
+    iid = uuid.uuid4().hex[:12]
+    if kind == "vessel":
+        filename = "vessel.cfg"
+    else:
+        filename = file.filename or f"{craft_name}.craft"
+        if not filename.lower().endswith(".craft"):
+            filename += ".craft"
+
+    try:
+        url = await asyncio.to_thread(imp.upload_gift, iid, filename, payload)
+    except Exception as exc:
+        log.error("Quicksend upload failed: %s", exc)
+        return {"success": False, "message": "Failed to upload the craft."}
+
+    if kind == "vessel":
+        imp.enqueue(
+            gid, rid, source="gift_vessel", ref_id=iid, craft_name=craft_name,
+            vessel_node_url=url, owner_name=user["username"],
+        )
+        kind_label = "a live vessel"
+    else:
+        imp.enqueue(
+            gid, rid, source="gift_craft", ref_id=iid, craft_name=craft_name,
+            craft_url=url, craft_filename=filename, owner_name=user["username"],
+        )
+        kind_label = "a craft"
+
+    _create_notification(
+        gid, rid, "craft_gift",
+        "🎁 Craft Received",
+        f"{user['username']} sent you {kind_label}: {craft_name}. "
+        f"Visit the Space Center in KSP to receive it.",
+        {"craft_name": craft_name},
+    )
+
+    log.info("KSP: %s quicksent %s '%s' to %d", user["username"], kind, craft_name, rid)
+    return {"success": True, "message": f"Sent to {recipient_name}!"}
 
 
 # ── Marketplace ────────────────────────────────────────────────────────────────
@@ -2297,26 +2428,56 @@ async def _discord_notify_issuer(
 
         embed.set_footer(text="Use the buttons below to accept or refuse this submission.")
 
-        # Orbit telemetry diagram (rendered from the vessel data captured at
-        # submission). Sent as a second embed so it sits below the screenshot.
+        # A multi-craft submission ships several renders and one orbit diagram per
+        # craft. Discord shows at most one image per embed, so add an embed for each
+        # extra render (the first is already on the main embed) and one per orbit
+        # diagram. Total embeds are capped at Discord's limit of 10.
         embeds = [embed]
-        orbit_file = None
+        orbit_files: list = []
+
+        for idx, rf in enumerate(screenshots):
+            if idx == 0 or len(embeds) >= 10:
+                continue   # first render is on the main embed
+            re = discord.Embed(title=f"🚀 Craft Render {idx + 1}", color=discord.Color.blue())
+            re.set_image(url=rf["url"])
+            embeds.append(re)
+
         if vessel_data:
             try:
                 from orbit_render import render_orbit
-                orbit_png = render_orbit(vessel_data)
-                if orbit_png:
-                    orbit_file = discord.File(io.BytesIO(orbit_png), filename="orbit.png")
-                    body = vessel_data.get("body") or "—"
+
+                # Active (contract) craft first, then any extras sent with it.
+                snaps = []
+                active_snap = vessel_data.get("active_vessel") or vessel_data
+                if isinstance(active_snap, dict):
+                    snaps.append(active_snap)
+                for sv in (vessel_data.get("sent_vessels") or []):
+                    if isinstance(sv, dict):
+                        snaps.append(sv)
+
+                for idx, snap in enumerate(snaps):
+                    if len(embeds) >= 10:
+                        break
+                    try:
+                        orbit_png = render_orbit(snap)
+                    except Exception as exc:
+                        log.warning("orbit render failed for vessel %d on %s: %s", idx, contract_id, exc)
+                        continue
+                    if not orbit_png:
+                        continue
+                    fname = f"orbit_{idx}.png"
+                    orbit_files.append(discord.File(io.BytesIO(orbit_png), filename=fname))
+                    vname = snap.get("vessel_name") or snap.get("vesselName") or "Vessel"
+                    body = snap.get("body") or "—"
                     orbit_embed = discord.Embed(
-                        title="🛰️ Orbital Telemetry",
-                        description=f"Submitted vessel state around **{body}**.",
+                        title=f"🛰️ {vname} — Orbital Telemetry",
+                        description=f"State around **{body}**.",
                         color=discord.Color.teal(),
                     )
-                    orbit_embed.set_image(url="attachment://orbit.png")
+                    orbit_embed.set_image(url=f"attachment://{fname}")
                     embeds.append(orbit_embed)
             except Exception as exc:
-                log.warning("Failed to render orbit diagram for %s: %s", contract_id, exc)
+                log.warning("Failed to render orbit diagrams for %s: %s", contract_id, exc)
 
         # Attach review buttons (✅ Accept / ❌ Refuse) — uses the same
         # persistent view that the Discord-native contract flow uses
@@ -2325,8 +2486,8 @@ async def _discord_notify_issuer(
         # Mention the issuer
         issuer_mention = f"<@{issuer_id}>"
         send_kwargs: dict = {"content": issuer_mention, "embeds": embeds, "view": view}
-        if orbit_file is not None:
-            send_kwargs["file"] = orbit_file
+        if orbit_files:
+            send_kwargs["files"] = orbit_files
         await channel.send(**send_kwargs)
         log.info("Discord: Notified issuer %d in channel %s about submission", issuer_id, corp["channel_id"])
 

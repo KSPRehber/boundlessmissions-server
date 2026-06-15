@@ -14,11 +14,28 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from data.store import _db
+from data.store import _db, _storage_bucket
 
 log = logging.getLogger(__name__)
 
 ImportEntry = dict[str, Any]
+
+
+def upload_gift(import_id: str, filename: str, data: bytes) -> str:
+    """Upload a quicksent craft/vessel payload to Storage. Returns its public URL.
+
+    Used by the friend-quicksend endpoint: the (already decompressed) bytes are
+    stored under a per-gift path so the recipient's KSP client can download and
+    import them via the normal craft-import queue.
+    """
+    if _storage_bucket is None:
+        raise RuntimeError("Firebase Storage not configured")
+    path = f"gifts/{import_id}/{filename}"
+    blob = _storage_bucket.blob(path)
+    blob.upload_from_string(data, content_type="text/plain")
+    blob.make_public()
+    log.info("Uploaded gift %s to Storage", path)
+    return blob.public_url
 
 
 def _col(guild_id: int, user_id: int):

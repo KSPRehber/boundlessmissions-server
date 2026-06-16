@@ -596,11 +596,16 @@ async def get_active_contracts(user: dict = Depends(get_current_user)):
             rescue_target = None
             rescue_kerbals = []
             is_modded_target = False
+            rescue_vessel_node_url = None
             if c.get("mission_type") == cdb.RESCUE:
                 rt = c.get("rescue_target") or {}
                 rescue_target = RescueTarget(**rt) if rt else None
                 rescue_kerbals = c.get("rescue_kerbals", [])
                 is_modded_target = bool(rt.get("is_modded"))
+                # Only the rescuer (contractor) gets the wreck node, so their client
+                # can spawn/respawn the stranded vessel on demand after accepting.
+                if c.get("contractor_id") == uid:
+                    rescue_vessel_node_url = c.get("rescue_vessel_node_url")
 
             contracts.append(ContractSummary(
                 contract_id=c["contract_id"],
@@ -621,6 +626,7 @@ async def get_active_contracts(user: dict = Depends(get_current_user)):
                 rescue_target=rescue_target,
                 rescue_kerbals=rescue_kerbals,
                 is_modded_target=is_modded_target,
+                rescue_vessel_node_url=rescue_vessel_node_url,
                 flag_preview_url=c.get("flag_preview_url"),
             ))
 

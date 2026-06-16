@@ -111,6 +111,9 @@ class ContractSummary(BaseModel):
     rescue_target: Optional[RescueTarget] = None
     rescue_kerbals: list[str] = []  # renamed names the rescuer must recover
     is_modded_target: bool = False
+    # Wreck snapshot URL — only set for the rescuer (contractor) on an accepted
+    # rescue, so their client can spawn/respawn the stranded vessel on demand.
+    rescue_vessel_node_url: Optional[str] = None
 
 class ContractListResponse(BaseModel):
     contracts: list[ContractSummary]

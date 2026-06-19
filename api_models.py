@@ -105,6 +105,10 @@ class ContractSummary(BaseModel):
     mission_type: str = "active_vessel"
     required_situation: Optional[str] = None
     required_body: Optional[str] = None
+    # Part-restriction ("mission limit") constraints extracted from the mission
+    # text. Canonical schema lives in data/mission_constraints.py; the KSP client
+    # enforces it in the editor and at submit. None == no restrictions.
+    constraints: Optional[dict] = None
     # Flag-design contracts: watermarked preview shown before acceptance.
     flag_preview_url: Optional[str] = None
     # Rescue-mission fields (only set when mission_type == "rescue")
@@ -117,6 +121,20 @@ class ContractSummary(BaseModel):
 
 class ContractListResponse(BaseModel):
     contracts: list[ContractSummary]
+
+
+class PartCatalogUpload(BaseModel):
+    """The KSP client's full installed part list, used to resolve loosely-typed
+    part mentions in mission limits to real parts. `hash` lets the client skip
+    re-uploading an unchanged catalog."""
+    hash: str
+    parts: list[dict] = []  # each: {"name": <internal>, "title": <display>}
+
+
+class PartCatalogResponse(BaseModel):
+    success: bool
+    stored: bool = False  # False == server already had this hash, upload skipped
+    parts: int = 0
 
 class ContractAcceptResponse(BaseModel):
     success: bool

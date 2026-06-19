@@ -31,6 +31,7 @@ from api_models import (
     UserProfile,
     WeeklyMissionsResponse, Mission, MissionSelectRequest, MissionSelectResponse,
     ContractSummary, ContractListResponse, ContractAcceptResponse,
+    PartCatalogUpload, PartCatalogResponse,
     CorpInfo, CorpListResponse, ContractCreateRequest, ContractReviewRequest,
     ContractDisputeRequest, RescueTarget,
     SubmissionResult, FlightSubmission, VesselSnapshot,
@@ -39,6 +40,8 @@ from api_models import (
 )
 from data.store import store, _db, _storage_bucket
 from data import contracts as cdb
+from data import mission_constraints as mc
+from data import part_resolver as pr
 from data import marketplace as mkt
 from data import imports as imp
 
@@ -389,6 +392,134 @@ def _classify_text_heuristic(mission_text: str) -> dict:
     }
 
 
+def _merge_constraints(a: dict, b: dict) -> dict:
+    """Union two normalised constraints dicts (the stricter of the two wins)."""
+    out = mc.empty()
+    for key in mc.LIST_KEYS:
+        seen, merged = set(), []
+        for v in (a.get(key) or []) + (b.get(key) or []):
+            if v.lower() not in seen:
+                seen.add(v.lower())
+                merged.append(v)
+        out[key] = merged
+    note = a.get("notes") or b.get("notes")
+    if note:
+        out["notes"] = note
+    # The union can pair a forbidden token from one source with a required token
+    # from the other — drop those contradictions (forbidden wins).
+    mc._resolve_conflicts(out)
+    return out
+
+
+# ── KSP part catalog + part-name resolution ──────────────────────────────────
+#
+# Resolving a mission's loose part mention ("the Thud engine", a typo'd "thudd")
+# to a real installed part needs the player's actual part list. The KSP client
+# uploads that catalog (hash-gated); we cache it in memory and persist it to
+# Firestore so it survives a bot restart. Resolutions (and the AI tie-breaks they
+# sometimes need) are cached per (catalog-hash, mention) so a fetch costs nothing
+# after the first.
+
+_PART_CATALOGS: dict[str, dict] = {}        # "gid:uid" -> {"hash":..., "parts":[...]}
+_RESOLVE_CACHE: dict[tuple, str | None] = {}  # (catalog_hash, loose_lower) -> name|None
+
+
+def _catalog_key(gid: int, uid: int) -> str:
+    return f"{gid}:{uid}"
+
+
+def _catalog_doc(gid: int, uid: int):
+    return _db.collection("guilds").document(str(gid)).collection("part_catalogs").document(str(uid))
+
+
+def _get_user_catalog(gid: int, uid: int) -> dict | None:
+    """The requesting user's uploaded catalog, loading from Firestore on a cold cache."""
+    key = _catalog_key(gid, uid)
+    cat = _PART_CATALOGS.get(key)
+    if cat is not None:
+        return cat
+    try:
+        snap = _catalog_doc(gid, uid).get()
+        if snap.exists:
+            cat = snap.to_dict()
+            _PART_CATALOGS[key] = cat
+            return cat
+    except Exception as exc:
+        log.warning("Failed to load part catalog for %s: %s", key, exc)
+    return None
+
+
+def _ai_resolve_part(mission_text: str):
+    """Build an ai_resolver(loose, candidates)->name|None bound to this mission's
+    text, or None when no AI is configured."""
+    try:
+        from cogs.screenshots import _client as gemini_client, _MODEL
+    except Exception:
+        gemini_client = None
+    if not gemini_client:
+        return None
+
+    from google.genai import types
+    import json
+
+    def _resolver(loose: str, candidates: list[dict]) -> str | None:
+        if not candidates:
+            return None
+        listing = "\n".join(f"- {c.get('name')} | {c.get('title')}" for c in candidates[:12])
+        prompt = (
+            "A KSP mission has a part restriction mentioning a part by an informal "
+            "or possibly mistyped name. Pick which installed part it refers to.\n\n"
+            f"Mission: \"{mission_text}\"\n"
+            f"Mentioned part: \"{loose}\"\n\n"
+            "Installed candidates (internal_name | display_title):\n"
+            f"{listing}\n\n"
+            "Reply with ONLY the exact internal_name of the best match, or NONE if "
+            "none clearly fits."
+        )
+        try:
+            resp = gemini_client.models.generate_content(
+                model=_MODEL,
+                contents=[types.Content(role="user", parts=[types.Part.from_text(text=prompt)])],
+                config=types.GenerateContentConfig(temperature=0.0, max_output_tokens=64),
+            )
+            ans = (resp.text or "").strip().strip("`").splitlines()[0].strip()
+            if not ans or ans.upper() == "NONE":
+                return None
+            return ans
+        except Exception as exc:
+            log.warning("Gemini part resolution failed for %r: %s", loose, exc)
+            return None
+
+    return _resolver
+
+
+def _resolve_constraints(constraints: dict | None, gid: int, uid: int,
+                         mission_text: str) -> dict | None:
+    """Add resolved internal part names to a constraints dict using the user's
+    catalog (deterministic fuzzy + AI tie-break, both cached). Returns the
+    constraints unchanged when there's nothing to resolve or no catalog."""
+    if mc.is_empty(constraints):
+        return constraints
+    if not (constraints.get("forbidden_parts") or constraints.get("required_parts")):
+        return constraints
+    cat = _get_user_catalog(gid, uid)
+    if not cat or not cat.get("parts"):
+        return constraints  # no catalog yet → loose matching only
+
+    chash = cat.get("hash") or pr.catalog_hash(cat["parts"])
+    ai = _ai_resolve_part(mission_text)
+
+    def _cached_resolver(loose: str) -> str | None:
+        ck = (chash, loose.lower())
+        if ck in _RESOLVE_CACHE:
+            return _RESOLVE_CACHE[ck]
+        name = pr.resolve_part(loose, cat["parts"], ai)
+        _RESOLVE_CACHE[ck] = name
+        return name
+
+    return mc.resolve_parts(constraints, _cached_resolver)
+
+
 async def _classify_single_contract(gid: int, contract_id: str, mission_text: str) -> dict:
     """
     Classify a single contract's mission text. Uses AI if available,
@@ -411,22 +542,41 @@ async def _classify_single_contract(gid: int, contract_id: str, mission_text: st
             "1. mission_type: 'craft_build' (design/build a vessel in VAB/SPH) "
             "or 'active_vessel' (fly vessel to specific place/situation)\n"
             "2. required_situation: ORBITING, LANDED, SPLASHED, FLYING, SUB_ORBITAL, ESCAPING, or null\n"
-            "3. required_body: celestial body name or null\n\n"
-            "Rules:\n"
-            "- Missions about designing, building, constructing vessels = 'craft_build'\n"
-            "- Turkish 'tasarım/tasarla' = design = 'craft_build'\n"
-            "- Turkish 'inşa/yap/kur' = build = 'craft_build'\n"
-            "- Turkish 'uçak' = airplane, 'roket' = rocket (design context = craft_build)\n"
-            "- Missions about orbiting, landing, reaching a place = 'active_vessel'\n\n"
+            "3. required_body: celestial body name or null\n"
+            "4. constraints: part-usage restrictions stated in the text (a 'mission limit'). "
+            "Leave every list empty if the text states no restriction. Use these keys, each a list of strings:\n"
+            "   - forbidden_parts / required_parts: specific part names, e.g. \"Thud\", \"Mainsail\"\n"
+            "   - forbidden_propellants / required_propellants: fuel/resource names, "
+            "e.g. \"LqdHe3\", \"LiquidFuel\", \"XenonGas\", \"MonoPropellant\", \"SolidFuel\"\n"
+            "   - forbidden_engine_categories / required_engine_categories: one or more of "
+            "[nuclear, ion, solid, chemical, electric, monoprop, rcs]\n"
+            "   - forbidden_part_categories / required_part_categories: one or more of "
+            "[heatshield, parachute, solarpanel, wheel, ladder, reactionwheel, rtg]\n\n"
+            "Constraint rules:\n"
+            "- 'must use / only / powered by X' => required_*. "
+            "'can't use / doesn't use / does not use / no / without / X-less' => forbidden_*.\n"
+            "- Negation flips intent: 'doesn't use deuterium-powered engines' => "
+            "forbidden_propellants ['LqdDeuterium'] (NOT required). Never put the same item "
+            "in both a forbidden and a required list.\n"
+            "- 'nuclear/atomic/NTR/NERV engine' => engine category 'nuclear'. 'ion' => 'ion'. "
+            "'SRB/solid booster' => 'solid'.\n"
+            "- 'heatshield-less / no heat shield' => forbidden_part_categories ['heatshield'].\n"
+            "- 'Lqd He3 / helium-3 powered' => required_propellants ['LqdHe3'].\n"
+            "- Map a named engine to a part (forbidden_parts/required_parts), a fuel to a propellant, "
+            "and an engine *kind* to an engine category.\n\n"
             "Return ONLY valid JSON:\n"
-            '{"mission_type": "...", "required_situation": "...", "required_body": "..."}'
+            '{"mission_type": "...", "required_situation": "...", "required_body": "...", '
+            '"constraints": {"forbidden_parts": [], "required_parts": [], '
+            '"forbidden_propellants": [], "required_propellants": [], '
+            '"forbidden_engine_categories": [], "required_engine_categories": [], '
+            '"forbidden_part_categories": [], "required_part_categories": []}}'
         )
 
         try:
             response = gemini_client.models.generate_content(
                 model=_MODEL,
                 contents=[types.Content(role="user", parts=[types.Part.from_text(text=prompt)])],
-                config=types.GenerateContentConfig(temperature=0.1, max_output_tokens=256),
+                config=types.GenerateContentConfig(temperature=0.1, max_output_tokens=512),
             )
             raw = response.text.strip()
             if raw.startswith("```"):
@@ -434,12 +584,19 @@ async def _classify_single_contract(gid: int, contract_id: str, mission_text: st
             if raw.endswith("```"):
                 raw = raw[:-3]
             result = json.loads(raw.strip())
-            log.info("AI classified contract %s: %s", contract_id, result.get("mission_type"))
+            # Normalise the AI's constraints into the canonical schema; merge in any
+            # the heuristic catches that the model missed (union — never weaker).
+            ai_constraints = mc.normalize(result.get("constraints"))
+            result["constraints"] = _merge_constraints(ai_constraints, mc.extract_heuristic(mission_text))
+            log.info("AI classified contract %s: %s%s", contract_id, result.get("mission_type"),
+                     "" if mc.is_empty(result["constraints"]) else f" + limits ({mc.summary_line(result['constraints'])})")
         except Exception as exc:
             log.error("AI single-contract classification failed: %s", exc)
             result = _classify_text_heuristic(mission_text)
+            result["constraints"] = mc.extract_heuristic(mission_text)
     else:
         result = _classify_text_heuristic(mission_text)
+        result["constraints"] = mc.extract_heuristic(mission_text)
 
     # Cache result back to the contract document
     try:
@@ -447,6 +604,7 @@ async def _classify_single_contract(gid: int, contract_id: str, mission_text: st
             mission_type=result.get("mission_type", "active_vessel"),
             required_situation=result.get("required_situation"),
             required_body=result.get("required_body"),
+            constraints=result.get("constraints"),
         )
     except Exception as exc:
         log.error("Failed to cache classification for %s: %s", contract_id, exc)
@@ -539,12 +697,15 @@ async def select_mission(req: MissionSelectRequest, user: dict = Depends(get_cur
         fine=mission["fine"],
         due_date=due,
     )
-    # Store classification on the contract so KSP can enforce rules
+    # Store classification on the contract so KSP can enforce rules. Part-limit
+    # constraints are derived from the mission text (heuristic — no extra AI call).
+    weekly_constraints = mission.get("constraints") or mc.extract_heuristic(mission.get("desc_en", ""))
     cdb.update_contract(gid, c["contract_id"],
         status=cdb.ACTIVE,
         mission_type=mission.get("mission_type", "active_vessel"),
         required_situation=mission.get("required_situation"),
         required_body=mission.get("required_body"),
+        constraints=weekly_constraints,
     )
 
     # Save selection
@@ -567,6 +728,38 @@ async def select_mission(req: MissionSelectRequest, user: dict = Depends(get_cur
 
 # ── Contracts ────────────────────────────────────────────────────────────────
 
+@app.post("/api/v1/parts/catalog", response_model=PartCatalogResponse)
+async def upload_part_catalog(req: PartCatalogUpload, user: dict = Depends(get_current_user)):
+    """Receive the KSP client's installed part list so the bot can resolve loosely
+    typed part mentions in mission limits. Hash-gated: an unchanged catalog is a
+    no-op. Stored in memory and persisted to Firestore to survive restarts."""
+    gid = int(user["guild_id"])
+    uid = int(user["user_id"])
+    key = _catalog_key(gid, uid)
+
+    existing = _get_user_catalog(gid, uid)
+    if existing and existing.get("hash") == req.hash and existing.get("parts"):
+        return PartCatalogResponse(success=True, stored=False, parts=len(existing["parts"]))
+
+    # Keep only the two fields we use, capped to a sane size.
+    parts = [
+        {"name": str(p.get("name", "")), "title": str(p.get("title", ""))}
+        for p in (req.parts or []) if p.get("name") or p.get("title")
+    ][:8000]
+    cat = {"hash": req.hash, "parts": parts}
+    _PART_CATALOGS[key] = cat
+    # Invalidate cached resolutions for any previous catalog of this user.
+    for ck in [k for k in _RESOLVE_CACHE if k[0] != req.hash]:
+        _RESOLVE_CACHE.pop(ck, None)
+    try:
+        _catalog_doc(gid, uid).set(cat)
+    except Exception as exc:
+        log.warning("Could not persist part catalog for %s (memory only): %s", key, exc)
+
+    log.info("Stored part catalog for %s: %d parts (hash %s)", key, len(parts), req.hash[:8])
+    return PartCatalogResponse(success=True, stored=True, parts=len(parts))
+
+
 @app.get("/api/v1/contracts/active", response_model=ContractListResponse)
 async def get_active_contracts(user: dict = Depends(get_current_user)):
     """Get all active contracts for the current user."""
@@ -585,6 +778,7 @@ async def get_active_contracts(user: dict = Depends(get_current_user)):
             mission_type = c.get("mission_type")
             req_sit = c.get("required_situation")
             req_body = c.get("required_body")
+            constraints = c.get("constraints")
 
             # Rescue contracts carry an explicit type — never AI-classify them.
             if not mission_type and c.get("mission_type") != cdb.RESCUE:
@@ -592,6 +786,19 @@ async def get_active_contracts(user: dict = Depends(get_current_user)):
                 mission_type = cls.get("mission_type", "active_vessel")
                 req_sit = cls.get("required_situation")
                 req_body = cls.get("required_body")
+                constraints = cls.get("constraints")
+            elif mc.is_empty(constraints) and c.get("mission_type") != cdb.RESCUE:
+                # Already-classified contract with no (or empty) stored limits —
+                # derive them cheaply (no AI) so older contracts and ones cached
+                # before a heuristic fix still get editor/submit enforcement.
+                constraints = mc.extract_heuristic(c.get("mission", ""))
+            # Resolve loose part mentions against this user's installed catalog
+            # so the client filters/checks the exact part, not a fragile substring.
+            if not mc.is_empty(constraints):
+                constraints = _resolve_constraints(constraints, gid, uid, c.get("mission", ""))
+            # Don't ship an all-empty constraints object to the client.
+            if mc.is_empty(constraints):
+                constraints = None
 
             rescue_target = None
             rescue_kerbals = []
@@ -623,6 +830,7 @@ async def get_active_contracts(user: dict = Depends(get_current_user)):
                 mission_type=mission_type,
                 required_situation=req_sit,
                 required_body=req_body,
+                constraints=constraints,
                 rescue_target=rescue_target,
                 rescue_kerbals=rescue_kerbals,
                 is_modded_target=is_modded_target,
@@ -1466,6 +1674,9 @@ async def submit_contract(
     screenshots: List[UploadFile] = File(default=[]),
     modlist: Optional[str] = Form(None),
     used_modlist: Optional[str] = Form(None),
+    # Per-part summary of the submitted craft (JSON array) used to verify the
+    # contract's part-limit constraints. See data/mission_constraints.py.
+    used_parts: Optional[str] = Form(None),
     user: dict = Depends(get_current_user),
 ):
     """
@@ -1522,6 +1733,30 @@ async def submit_contract(
                 return SubmissionResult(
                     success=False,
                     message=f"Craft uses parts outside this contract's allowed mods: {', '.join(illegal)}.",
+                )
+
+    # Server-side part-limit ("mission limit") check — authoritative re-check of
+    # the constraints the editor/submit gate already enforce client-side. Skipped
+    # when the contract has no constraints or the client reported no part summary.
+    constraints = c.get("constraints")
+    if not mc.is_empty(constraints) and used_parts:
+        import json
+        # Resolve loose part mentions against the submitter's catalog so the
+        # authoritative check matches the exact part, with loose fallback.
+        constraints = _resolve_constraints(constraints, gid, uid, c.get("mission", ""))
+        try:
+            parsed_parts = json.loads(used_parts)
+        except Exception as exc:
+            log.warning("Bad used_parts payload for contract %s: %s", contract_id, exc)
+            parsed_parts = None
+        if isinstance(parsed_parts, list):
+            violations = mc.verify_used_parts(constraints, parsed_parts)
+            if violations:
+                log.info("Submission rejected for contract %s: constraint violations %s",
+                         contract_id, violations)
+                return SubmissionResult(
+                    success=False,
+                    message="Craft breaks this contract's mission limits:\n- " + "\n- ".join(violations),
                 )
 
     # Upload files to Firebase Storage

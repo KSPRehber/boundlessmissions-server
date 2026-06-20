@@ -22,8 +22,17 @@ Canonical constraints dict (every key optional; omitted/empty == no restriction)
       "required_engine_categories":   [str],
       "forbidden_part_categories":    [str],  # e.g. "heatshield", "parachute"
       "required_part_categories":     [str],
+      "max_parts":                    int,    # part-count ceiling (optional)
+      "min_parts":                    int,    # part-count floor (optional)
+      "max_dv":                       float,  # vacuum Δv ceiling, m/s (optional)
+      "min_dv":                       float,  # vacuum Δv floor, m/s (optional)
       "notes":                        str,    # human-readable summary (optional)
     }
+
+Δv (delta-v) is a whole-craft metric, so unlike the part rules it can't be
+enforced by hiding parts in the editor. It's checked only at submit time: the
+KSP client reports the craft's stock-calculated vacuum Δv and the bot verifies
+it against max_dv/min_dv (the value is client-reported, like used_parts).
 """
 from __future__ import annotations
 
@@ -113,6 +122,13 @@ _REQUIRE_CUES = (
     "should use", "needs to use", "powered by", "powered", "only", "must have",
     "kullanmalı", "kullanmak zorunda", "sadece", "zorunlu", "gerek",
 )
+# Weaker require cues that need whole-word boundaries (so "with" doesn't match
+# "within"). Matched against a space-padded clause. "a craft with a Vector
+# engine" / "that has SRBs" reads as a requirement.
+_REQUIRE_BOUNDARY_CUES = (
+    " with ", " has ", " have ", " having ", " using ", " featuring ",
+    " equipped ", " ile ", " olan ", " sahip ",
+)
 
 
 # ── Normalisation ────────────────────────────────────────────────────────────
@@ -126,7 +142,10 @@ def is_empty(constraints: dict | None) -> bool:
     """True when there is nothing to enforce."""
     if not constraints:
         return True
-    return not any(constraints.get(k) for k in LIST_KEYS)
+    if any(constraints.get(k) for k in LIST_KEYS):
+        return False
+    return not (constraints.get("max_parts") or constraints.get("min_parts")
+                or constraints.get("max_dv") or constraints.get("min_dv"))
 
 
 def _as_str_list(val) -> list[str]:
@@ -166,6 +185,28 @@ def normalize(raw: dict | None) -> dict:
     for key in ("forbidden_part_categories", "required_part_categories"):
         out[key] = _dedupe(_map_tokens(raw.get(key), _PART_CATEGORY_ALIASES, keep_unknown=True,
                                        lower=True))
+
+    for key in ("max_parts", "min_parts"):
+        val = raw.get(key)
+        if isinstance(val, bool):
+            continue
+        try:
+            iv = int(val)
+        except (TypeError, ValueError):
+            continue
+        if iv > 0:
+            out[key] = iv
+
+    for key in ("max_dv", "min_dv"):
+        val = raw.get(key)
+        if isinstance(val, bool):
+            continue
+        try:
+            fv = float(val)
+        except (TypeError, ValueError):
+            continue
+        if fv > 0:
+            out[key] = fv
 
     notes = raw.get("notes")
     if isinstance(notes, str) and notes.strip():
@@ -276,7 +317,129 @@ def extract_heuristic(text: str) -> dict:
     # Named parts, e.g. "can't use the Thud engine" / "use only the Mainsail".
     _extract_named_parts(text, out)
 
+    # Part-count limits, e.g. "max 10 parts" / "at least 5 parts".
+    _extract_part_count(text, out)
+
+    # Delta-v limits, e.g. "at least 3000 m/s of delta-v" / "no more than 5 km/s dv".
+    _extract_delta_v(text, out)
+
     return normalize(out)
+
+
+def _extract_part_count(text: str, out: dict) -> None:
+    """Detect min/max part-count limits. Handles inclusive ('at most N', 'up to N')
+    and strict ('fewer than N' => N-1, 'more than N' => N+1) bounds, plus
+    'N+ parts', 'N parts or more/fewer', and a few Turkish forms. The most
+    restrictive bound wins when several appear."""
+    import re
+    low = text.lower()
+    maxes: list[int] = []
+    mins: list[int] = []
+    P = r"(?:parts?|parça\w*)"  # English "part(s)" or Turkish "parça/parçası"
+
+    def n(m, delta=0):
+        return int(m.group(1)) + delta
+
+    # exactly N
+    for m in re.finditer(rf"(?:exactly|precisely|tam)\s*(\d+)\s*{P}", low):
+        maxes.append(n(m)); mins.append(n(m))
+    # range: "between N and M parts" / "N to M parts"
+    for m in re.finditer(rf"(?:between\s*)?(\d+)\s*(?:and|to|-|ile)\s*(\d+)\s*{P}", low):
+        mins.append(int(m.group(1))); maxes.append(int(m.group(2)))
+    # inclusive max
+    for m in re.finditer(rf"(?:max(?:imum)?|no more than|at most|up to|no greater than|"
+                         rf"en fazla|en çok)\s*(?:of\s*)?(\d+)\s*{P}", low):
+        maxes.append(n(m))
+    for m in re.finditer(rf"(\d+)\s*{P}\s*or\s*(?:fewer|less)", low):
+        maxes.append(n(m))
+    # strict max ("fewer/less/under N" => N-1)
+    for m in re.finditer(rf"(?:fewer than|less than|under|below|altında)\s*(\d+)\s*{P}", low):
+        maxes.append(max(1, n(m, -1)))
+    # inclusive min
+    for m in re.finditer(rf"(?:min(?:imum)?|at least|no fewer than|no less than|"
+                         rf"en az)\s*(?:of\s*)?(\d+)\s*{P}", low):
+        mins.append(n(m))
+    for m in re.finditer(rf"(\d+)\s*{P}\s*or\s*more", low):
+        mins.append(n(m))
+    for m in re.finditer(rf"(\d+)\+\s*{P}", low):
+        mins.append(n(m))
+    # strict min ("more than/over N" => N+1). The "no " lookbehind keeps
+    # "no more than N" (an inclusive max) from being read as a minimum.
+    for m in re.finditer(rf"(?<!no )(?:more than|over|greater than|above|üzerinde)\s*(\d+)\s*{P}", low):
+        mins.append(n(m, 1))
+
+    # Reverse phrasing where the part-count noun precedes the bound and no
+    # trailing "parts" follows the number, e.g. "part count above 10",
+    # "part count of at least 10", "parça sayısı 10 üzerinde".
+    PC = r"(?:parts?\s*count|parça\s*say\w*)"
+    CONN = r"(?:\s*(?:of|is|:|=)\s*|\s+)"  # optional "of"/"is"/":"/"=" connector
+    for m in re.finditer(rf"{PC}{CONN}(?:more than|over|greater than|above|üzerinde)\s*(\d+)", low):
+        mins.append(n(m, 1))
+    for m in re.finditer(rf"{PC}{CONN}(?:at least|min(?:imum)?|no fewer than|no less than|en az)\s*(\d+)", low):
+        mins.append(n(m))
+    for m in re.finditer(rf"{PC}{CONN}(?:fewer than|less than|under|below|altında)\s*(\d+)", low):
+        maxes.append(max(1, n(m, -1)))
+    for m in re.finditer(rf"{PC}{CONN}(?:at most|max(?:imum)?|no more than|up to|no greater than|en fazla|en çok)\s*(\d+)", low):
+        maxes.append(n(m))
+
+    if maxes:
+        out["max_parts"] = min(maxes)
+    if mins:
+        out["min_parts"] = max(mins)
+
+
+def _extract_delta_v(text: str, out: dict) -> None:
+    """Detect min/max vacuum delta-v (Δv) limits, normalised to m/s. Understands
+    'at least 3000 m/s of delta-v', 'no more than 5 km/s dv', 'under 4000 m/s Δv',
+    the reverse order ('delta-v of at least 3000'), and ranges ('3000-5000 m/s
+    dv'). km/s values are converted to m/s. The most restrictive bound wins when
+    several appear. A Δv token must be present, so plain numbers in flavour text
+    don't trip it."""
+    import re
+    low = text.lower()
+    maxes: list[float] = []
+    mins: list[float] = []
+
+    NUM = r"(\d[\d,]*(?:\.\d+)?)"
+    UNIT = r"\s*(km/s|km/sec|kps|m/s|m/sec|mps)?"
+    # Δ lower-cases to δ; also accept "delta-v", "deltav", standalone "dv".
+    DV = r"(?:[δ]\s*-?\s*v|delta[\s\-]*v|deltav|\bdv\b)"
+    MAXQ = (r"(?:at most|maximum|max\.?|no more than|up to|no greater than|"
+            r"under|below|less than|fewer than|lower than|en fazla|en çok)")
+    MINQ = r"(?:at least|minimum|min\.?|no less than|no fewer than|en az)"
+    OF = r"\s*(?:of\s*)?"
+
+    def val(m, gi=1):
+        x = float(m.group(gi).replace(",", ""))
+        unit = m.group(gi + 1) or ""
+        return x * 1000.0 if ("km" in unit or "kps" in unit) else x
+
+    # Inclusive max — both word orders.
+    for m in re.finditer(rf"{MAXQ}\s*{NUM}{UNIT}{OF}{DV}", low):
+        maxes.append(val(m))
+    for m in re.finditer(rf"{DV}{OF}{MAXQ}\s*{NUM}{UNIT}", low):
+        maxes.append(val(m))
+    # Inclusive min — both word orders.
+    for m in re.finditer(rf"{MINQ}\s*{NUM}{UNIT}{OF}{DV}", low):
+        mins.append(val(m))
+    for m in re.finditer(rf"{DV}{OF}{MINQ}\s*{NUM}{UNIT}", low):
+        mins.append(val(m))
+    # Strict min ("more than/over N"). Δv is continuous, so N (not N+1) is used.
+    # The "no " lookbehind keeps "no more than" (an inclusive max) out of here.
+    SMIN = r"(?<!no )(?:more than|greater than|over|above)"
+    for m in re.finditer(rf"{SMIN}\s*{NUM}{UNIT}{OF}{DV}", low):
+        mins.append(val(m))
+    for m in re.finditer(rf"{DV}{OF}{SMIN}\s*{NUM}{UNIT}", low):
+        mins.append(val(m))
+    # Range: "between 3000 and 5000 m/s delta-v" / "3000 to 5000 m/s dv".
+    for m in re.finditer(rf"(?:between\s*)?{NUM}{UNIT}\s*(?:and|to|-|–|ile)\s*{NUM}{UNIT}{OF}{DV}", low):
+        mins.append(val(m, 1))
+        maxes.append(val(m, 3))
+
+    if maxes:
+        out["max_dv"] = min(maxes)
+    if mins:
+        out["min_dv"] = max(mins)
 
 
 # Tokens that look like a part name but are really a category/generic word —
@@ -363,7 +526,8 @@ def _clause_polarity(clause: str) -> bool | None:
     padded = f" {clause} "  # so boundary cues (" no ", " not ") match at edges
     if any(cue in padded for cue in _NEG_CUES) or any(cue in clause for cue in _FORBID_CUES):
         return True
-    if any(cue in clause for cue in _REQUIRE_CUES):
+    if any(cue in clause for cue in _REQUIRE_CUES) \
+            or any(cue in padded for cue in _REQUIRE_BOUNDARY_CUES):
         return False
     return None
 
@@ -422,7 +586,8 @@ def _part_match_sets(constraints: dict, kind: str) -> tuple[list[str], list[str]
 
 # ── Verification (server-side authoritative check) ───────────────────────────
 
-def verify_used_parts(constraints: dict | None, used_parts: list[dict]) -> list[str]:
+def verify_used_parts(constraints: dict | None, used_parts: list[dict],
+                      delta_v: float | None = None) -> list[str]:
     """
     Compare the craft's actually-used parts against the constraints and return a
     list of human-readable violation messages (empty == passes).
@@ -435,15 +600,27 @@ def verify_used_parts(constraints: dict | None, used_parts: list[dict]) -> list[
           "engine_categories":  ["chemical"],
           "part_categories":    ["engine"],
         }
+
+    `delta_v` is the craft's stock-calculated vacuum Δv (m/s) as reported by the
+    client; the bot can't recompute it, so a min/max-Δv limit is only checked
+    when the client supplies a value (None => skip, don't wrongly fail).
     """
-    if is_empty(constraints) or not used_parts:
-        return [] if is_empty(constraints) else _missing_required(constraints, used_parts or [])
+    if is_empty(constraints):
+        return []
+    used_parts = used_parts or []
+
+    # Whole-craft scalar limits (part count + Δv).
+    scalar_violations = _check_part_count(constraints, len(used_parts))
+    scalar_violations += _check_delta_v(constraints, delta_v)
+
+    if not used_parts:
+        return scalar_violations + _missing_required(constraints, [])
 
     props = _flatten(used_parts, "propellants")
     eng = _flatten(used_parts, "engine_categories")
     cats = _flatten(used_parts, "part_categories")
 
-    violations: list[str] = []
+    violations: list[str] = list(scalar_violations)
 
     # ── Forbidden parts: match resolved internal names exactly, and any
     #    unresolved mentions by case-insensitive title substring (loose fallback).
@@ -460,7 +637,7 @@ def verify_used_parts(constraints: dict | None, used_parts: list[dict]) -> list[
 
     for bad in constraints.get("forbidden_propellants", []):
         if bad.lower() in props:
-            violations.append(f"Craft uses a forbidden propellant: {bad}.")
+            violations.append(f"Craft has an engine powered by forbidden fuel: {bad}.")
 
     for bad in constraints.get("forbidden_engine_categories", []):
         if bad.lower() in eng:
@@ -491,13 +668,42 @@ def _missing_required(constraints: dict, used_parts: list[dict]) -> list[str]:
             out.append(f"Required part not found: '{need}'.")
     for need in constraints.get("required_propellants", []):
         if need.lower() not in props:
-            out.append(f"Required propellant not used: {need}.")
+            out.append(f"Required: an engine powered by {need}.")
     for need in constraints.get("required_engine_categories", []):
         if need.lower() not in eng:
             out.append(f"Required engine type not found: {need}.")
     for need in constraints.get("required_part_categories", []):
         if need.lower() not in cats:
             out.append(f"Required part category missing: {need}.")
+    return out
+
+
+def _check_part_count(constraints: dict, count: int) -> list[str]:
+    out: list[str] = []
+    mx = constraints.get("max_parts")
+    mn = constraints.get("min_parts")
+    if mx and count > mx:
+        out.append(f"Too many parts: {count} (max {mx}).")
+    if mn and count < mn:
+        out.append(f"Too few parts: {count} (min {mn}).")
+    return out
+
+
+# A small slack so a craft that rounds to the limit isn't unfairly rejected
+# (the client's Δv and the constraint can differ by sub-percent rounding).
+_DV_TOLERANCE = 0.005
+
+
+def _check_delta_v(constraints: dict, delta_v: float | None) -> list[str]:
+    out: list[str] = []
+    if delta_v is None:
+        return out  # client didn't report Δv — can't check, so don't fail
+    mx = constraints.get("max_dv")
+    mn = constraints.get("min_dv")
+    if mx and delta_v > mx * (1 + _DV_TOLERANCE):
+        out.append(f"Too much delta-v: {delta_v:.0f} m/s (max {mx:.0f}).")
+    if mn and delta_v < mn * (1 - _DV_TOLERANCE):
+        out.append(f"Not enough delta-v: {delta_v:.0f} m/s (min {mn:.0f}).")
     return out
 
 
@@ -521,4 +727,12 @@ def summary_line(constraints: dict | None) -> str | None:
         vals = constraints.get(key)
         if vals:
             bits.append(f"{key.replace('_', ' ')}: {', '.join(vals)}")
+    if constraints.get("max_parts"):
+        bits.append(f"max {constraints['max_parts']} parts")
+    if constraints.get("min_parts"):
+        bits.append(f"min {constraints['min_parts']} parts")
+    if constraints.get("max_dv"):
+        bits.append(f"max {constraints['max_dv']:.0f} m/s Δv")
+    if constraints.get("min_dv"):
+        bits.append(f"min {constraints['min_dv']:.0f} m/s Δv")
     return "; ".join(bits) or None

@@ -392,25 +392,6 @@ def _classify_text_heuristic(mission_text: str) -> dict:
     }
 
 
-def _merge_constraints(a: dict, b: dict) -> dict:
-    """Union two normalised constraints dicts (the stricter of the two wins)."""
-    out = mc.empty()
-    for key in mc.LIST_KEYS:
-        seen, merged = set(), []
-        for v in (a.get(key) or []) + (b.get(key) or []):
-            if v.lower() not in seen:
-                seen.add(v.lower())
-                merged.append(v)
-        out[key] = merged
-    note = a.get("notes") or b.get("notes")
-    if note:
-        out["notes"] = note
-    # The union can pair a forbidden token from one source with a required token
-    # from the other — drop those contradictions (forbidden wins).
-    mc._resolve_conflicts(out)
-    return out
-
-
 # ── KSP part catalog + part-name resolution ──────────────────────────────────
 #
 # Resolving a mission's loose part mention ("the Thud engine", a typo'd "thudd")
@@ -551,7 +532,13 @@ async def _classify_single_contract(gid: int, contract_id: str, mission_text: st
             "   - forbidden_engine_categories / required_engine_categories: one or more of "
             "[nuclear, ion, solid, chemical, electric, monoprop, rcs]\n"
             "   - forbidden_part_categories / required_part_categories: one or more of "
-            "[heatshield, parachute, solarpanel, wheel, ladder, reactionwheel, rtg]\n\n"
+            "[heatshield, parachute, solarpanel, wheel, ladder, reactionwheel, rtg]\n"
+            "   - max_parts / min_parts: integer part-count limits, or null. "
+            "'at most/up to N parts' => max_parts N; 'fewer than N' => max_parts N-1; "
+            "'at least N' => min_parts N; 'more than N' => min_parts N+1.\n"
+            "   - max_dv / min_dv: vacuum delta-v (Δv) limits in m/s, or null. "
+            "Convert km/s to m/s (3.5 km/s => 3500). 'at least 3000 m/s of delta-v' => "
+            "min_dv 3000; 'no more than 5000 m/s dv' => max_dv 5000.\n\n"
             "Constraint rules:\n"
             "- 'must use / only / powered by X' => required_*. "
             "'can't use / doesn't use / does not use / no / without / X-less' => forbidden_*.\n"
@@ -562,14 +549,19 @@ async def _classify_single_contract(gid: int, contract_id: str, mission_text: st
             "'SRB/solid booster' => 'solid'.\n"
             "- 'heatshield-less / no heat shield' => forbidden_part_categories ['heatshield'].\n"
             "- 'Lqd He3 / helium-3 powered' => required_propellants ['LqdHe3'].\n"
-            "- Map a named engine to a part (forbidden_parts/required_parts), a fuel to a propellant, "
-            "and an engine *kind* to an engine category.\n\n"
+            "- When the text names a specific part (e.g. 'Vector', 'Mainsail', 'Thud'), copy that "
+            "name VERBATIM into required_parts/forbidden_parts — never translate it to a real-world "
+            "or 'equivalent' name (do NOT turn 'Vector' into 'SSME', or 'Mainsail' into 'RS-68'), and "
+            "do NOT also add an engine category for that named part. Only set an engine category when "
+            "the text names a general *kind* of engine (e.g. 'nuclear engine', 'any ion thruster'). "
+            "Map a fuel to a propellant.\n\n"
             "Return ONLY valid JSON:\n"
             '{"mission_type": "...", "required_situation": "...", "required_body": "...", '
             '"constraints": {"forbidden_parts": [], "required_parts": [], '
             '"forbidden_propellants": [], "required_propellants": [], '
             '"forbidden_engine_categories": [], "required_engine_categories": [], '
-            '"forbidden_part_categories": [], "required_part_categories": []}}'
+            '"forbidden_part_categories": [], "required_part_categories": [], '
+            '"max_parts": null, "min_parts": null, "max_dv": null, "min_dv": null}}'
         )
 
         try:
@@ -584,10 +576,10 @@ async def _classify_single_contract(gid: int, contract_id: str, mission_text: st
             if raw.endswith("```"):
                 raw = raw[:-3]
             result = json.loads(raw.strip())
-            # Normalise the AI's constraints into the canonical schema; merge in any
-            # the heuristic catches that the model missed (union — never weaker).
-            ai_constraints = mc.normalize(result.get("constraints"))
-            result["constraints"] = _merge_constraints(ai_constraints, mc.extract_heuristic(mission_text))
+            # AI is authoritative for constraints: trust its decision, including an
+            # all-empty result ("no limits"). The heuristic only steps in when the
+            # AI is unavailable or errors (the fallback branches below).
+            result["constraints"] = mc.normalize(result.get("constraints"))
             log.info("AI classified contract %s: %s%s", contract_id, result.get("mission_type"),
                      "" if mc.is_empty(result["constraints"]) else f" + limits ({mc.summary_line(result['constraints'])})")
         except Exception as exc:
@@ -787,10 +779,12 @@ async def get_active_contracts(user: dict = Depends(get_current_user)):
                 req_sit = cls.get("required_situation")
                 req_body = cls.get("required_body")
                 constraints = cls.get("constraints")
-            elif mc.is_empty(constraints) and c.get("mission_type") != cdb.RESCUE:
-                # Already-classified contract with no (or empty) stored limits —
-                # derive them cheaply (no AI) so older contracts and ones cached
-                # before a heuristic fix still get editor/submit enforcement.
+            elif "constraints" not in c and c.get("mission_type") != cdb.RESCUE:
+                # Legacy contract from before constraint extraction existed (no
+                # constraints field at all) — derive cheaply so it still gets
+                # editor/submit enforcement. A contract the AI already classified
+                # keeps its stored decision, including a deliberate "no limits"
+                # (empty dict) — we must not re-derive over the AI's call here.
                 constraints = mc.extract_heuristic(c.get("mission", ""))
             # Resolve loose part mentions against this user's installed catalog
             # so the client filters/checks the exact part, not a fragile substring.
@@ -1362,13 +1356,19 @@ async def create_contract_from_ksp(req: ContractCreateRequest, user: dict = Depe
         modlist=req.modlist,
     )
 
-    # Type: "auto" keeps the AI classification; an explicit craft_build /
-    # active_vessel forces the type and skips the AI call.
+    # Always let the AI read the mission text and decide the constraints (and
+    # situation/body), even when the caller pins the contract type — otherwise
+    # craft-build contracts, which are exactly the ones that carry part limits,
+    # would never get AI-extracted limits. An explicit craft_build/active_vessel
+    # then overrides only the *type* the AI guessed. flag_design isn't a vessel,
+    # so it skips extraction entirely.
     ctype = (req.contract_type or "auto").lower()
-    if ctype in ("craft_build", "active_vessel", "flag_design"):
+    if ctype == "flag_design":
         cdb.update_contract(gid, c["contract_id"], mission_type=ctype)
     else:
-        cls = await _classify_single_contract(gid, c["contract_id"], req.mission)
+        await _classify_single_contract(gid, c["contract_id"], req.mission)
+        if ctype in ("craft_build", "active_vessel"):
+            cdb.update_contract(gid, c["contract_id"], mission_type=ctype)
 
     # DM the contractor via Discord
     if _bot_instance:
@@ -1677,6 +1677,9 @@ async def submit_contract(
     # Per-part summary of the submitted craft (JSON array) used to verify the
     # contract's part-limit constraints. See data/mission_constraints.py.
     used_parts: Optional[str] = Form(None),
+    # Craft's stock-calculated vacuum Δv (m/s) — the bot can't recompute it, so a
+    # min/max-Δv mission limit is verified against this client-reported value.
+    delta_v_vac: Optional[str] = Form(None),
     user: dict = Depends(get_current_user),
 ):
     """
@@ -1739,18 +1742,23 @@ async def submit_contract(
     # the constraints the editor/submit gate already enforce client-side. Skipped
     # when the contract has no constraints or the client reported no part summary.
     constraints = c.get("constraints")
-    if not mc.is_empty(constraints) and used_parts:
+    if not mc.is_empty(constraints) and (used_parts or delta_v_vac):
         import json
         # Resolve loose part mentions against the submitter's catalog so the
         # authoritative check matches the exact part, with loose fallback.
         constraints = _resolve_constraints(constraints, gid, uid, c.get("mission", ""))
         try:
-            parsed_parts = json.loads(used_parts)
+            parsed_parts = json.loads(used_parts) if used_parts else []
         except Exception as exc:
             log.warning("Bad used_parts payload for contract %s: %s", contract_id, exc)
             parsed_parts = None
+        # Client-reported vacuum Δv (None if absent/unparseable => Δv limit skipped).
+        try:
+            dv = float(delta_v_vac) if delta_v_vac not in (None, "") else None
+        except (TypeError, ValueError):
+            dv = None
         if isinstance(parsed_parts, list):
-            violations = mc.verify_used_parts(constraints, parsed_parts)
+            violations = mc.verify_used_parts(constraints, parsed_parts, delta_v=dv)
             if violations:
                 log.info("Submission rejected for contract %s: constraint violations %s",
                          contract_id, violations)

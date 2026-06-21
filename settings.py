@@ -11,6 +11,16 @@
 # If set to None, users must have Discord's built-in Kick Members or Admin permissions.
 MOD_ROLE_ID: int | None = 1492234876273823916
 
+# ── Tickets ──────────────────────────────────────────────────────────────────
+
+# Private support/report tickets. The panel channel holds a persistent "Open a
+# Ticket" button; each ticket becomes a private channel under the category below,
+# visible only to the filer + mods (MOD_ROLE_ID). Device-sharing reports and
+# contract "sue" escalations also open as tickets here. Set either to None to
+# disable the ticket system (flows then fall back to CONTRACT_MOD_CHANNEL_ID).
+TICKET_CATEGORY_ID: int | None = 1518238099505680516
+TICKET_PANEL_CHANNEL_ID: int | None = 1518238266686443660
+
 # ── XP System ────────────────────────────────────────────────────────────────
 
 # XP awarded per qualifying message

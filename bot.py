@@ -135,6 +135,7 @@ class GeneKermanBot(commands.Bot):
             "cogs.ksp_bridge",
             "cogs.marketplace",
             "cogs.contractcraft",
+            "cogs.tickets",
         ]
 
         if cfg.ENABLE_MOD_COMMANDS:

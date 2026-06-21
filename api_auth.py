@@ -368,9 +368,37 @@ def resolve_device_challenge(challenge_id: str, acting_user_id: str,
     return data
 
 
+def request_device_ping(challenge_id: str, acting_user_id: str) -> bool:
+    """Owner presses '🔔 Ping this PC' in the DM. Flag the pending challenge so the
+    blocked client surfaces an on-screen alert on its next poll — letting the owner
+    confirm the machine is in front of them before reporting. Owner-checked."""
+    doc = _device_chal_col().document(challenge_id)
+    snap = doc.get()
+    if not snap.exists:
+        return False
+    data = snap.to_dict()
+    if str(data.get("user_id")) != str(acting_user_id):
+        return False
+    if data.get("status") != "pending" or time.time() > data.get("expires_at", 0):
+        return False
+    doc.update({"ping_pending": True, "ping_requested_at": time.time()})
+    log.info("Device challenge %s ping requested by user %s", challenge_id, acting_user_id)
+    return True
+
+
+def set_device_ticket_channel(challenge_id: str, channel_id: int | str) -> None:
+    """Remember which ticket channel a device report opened, so the diagnostics
+    follow-up (MAC + KSP.log) lands in the same ticket rather than a shared channel."""
+    try:
+        _device_chal_col().document(challenge_id).update(
+            {"ticket_channel_id": str(channel_id)})
+    except Exception as exc:
+        log.warning("Could not set ticket channel for challenge %s: %s", challenge_id, exc)
+
+
 def poll_device_challenge(challenge_id: str) -> dict:
     """For the blocked KSP client. Returns:
-       {"state":"pending"} | {"state":"approved"} (consumes) |
+       {"state":"pending", "ping"?} | {"state":"approved"} (consumes) |
        {"state":"denied", "report_id"?} | {"state":"expired"}."""
     doc = _device_chal_col().document(challenge_id)
     snap = doc.get()
@@ -381,7 +409,12 @@ def poll_device_challenge(challenge_id: str) -> dict:
     if status == "pending":
         if time.time() > data.get("expires_at", 0):
             return {"state": "expired"}
-        return {"state": "pending"}
+        out = {"state": "pending"}
+        if data.get("ping_pending"):
+            # Consume the ping so it fires once per button press.
+            doc.update({"ping_pending": False})
+            out["ping"] = True
+        return out
     if status == "approved":
         doc.delete()  # device is trusted now; the challenge is spent
         return {"state": "approved"}

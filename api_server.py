@@ -386,6 +386,9 @@ async def _dm_device_approval(user_id: int, challenge_id: str,
                 f"**When:** {when}\n**From IP:** `{client_ip or 'unknown'}`\n\n"
                 "**Did you just switch PCs, reinstall, or clear the mod's files?**\n"
                 "→ Press **✅ Yes, it's me** to trust this device.\n\n"
+                "**Not sure which PC this is?**\n"
+                "→ Press **🔔 Ping this PC** — the blocked PC will flash an "
+                "*“Is this you?”* alert on its screen, so you can check before reporting.\n\n"
                 "If this wasn't you, someone may be using your account. Press "
                 "**🚫 No — report** to alert the moderators.\n\n"
                 "⚠️ Try **✅ Yes, it's me** first if you changed anything yourself — "
@@ -406,12 +409,14 @@ async def _post_device_report(target: dict, mac: str, log_bytes: bytes | None):
     the diagnostics the offending client uploaded."""
     if not _bot_instance:
         return
-    ch_id = settings.CONTRACT_MOD_CHANNEL_ID
+    # Prefer the ticket the base report opened, so all the diagnostics land there;
+    # fall back to the shared mod channel only if no ticket was created.
+    ch_id = target.get("ticket_channel_id") or settings.CONTRACT_MOD_CHANNEL_ID
     if not ch_id:
         return
     try:
         import discord
-        ch = _bot_instance.get_channel(ch_id) or await _bot_instance.fetch_channel(ch_id)
+        ch = _bot_instance.get_channel(int(ch_id)) or await _bot_instance.fetch_channel(int(ch_id))
         e = discord.Embed(
             title="📎 Device report — client diagnostics",
             description=(
@@ -441,7 +446,8 @@ async def auth_device_poll(req: PollRequest, request: Request,
     the block itself doesn't deadlock the poll)."""
     _rate_limit(f"devpoll:{_client_ip(request)}", max_hits=120, window=60.0)
     state = poll_device_challenge(req.challenge_id)
-    return DeviceStatusResponse(status=state["state"], report_id=state.get("report_id"))
+    return DeviceStatusResponse(status=state["state"], report_id=state.get("report_id"),
+                                ping=bool(state.get("ping")))
 
 
 @app.post("/api/v1/device/report/{report_id}")

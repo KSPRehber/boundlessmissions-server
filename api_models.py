@@ -33,6 +33,9 @@ class DeviceStatusResponse(BaseModel):
     #         diagnostics, report_id is set so the client uploads MAC + KSP.log.
     status: str = "pending"
     report_id: Optional[str] = None
+    # True (once) when the owner pressed "🔔 Ping this PC" in their Discord DM, so
+    # the blocked client should flash an on-screen "is this you?" alert.
+    ping: bool = False
 
 class AuthError(BaseModel):
     detail: str

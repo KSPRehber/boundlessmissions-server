@@ -16,7 +16,7 @@ from discord.ui import View, Button, DynamicItem
 import settings
 from api_auth import (
     generate_link_code, resolve_approval, resolve_device_challenge,
-    purge_ksp_user_data,
+    purge_ksp_user_data, request_device_ping, set_device_ticket_channel,
 )
 from data.store import store, _db
 from i18n import S, tp
@@ -101,27 +101,54 @@ class LinkApprovalView(View):
 # report" rejects it and opens a moderation ticket. Same DynamicItem pattern as
 # the login buttons so they survive a bot restart.
 
-async def _post_device_base_ticket(client: discord.Client, data: dict):
-    """Open the moderation ticket the moment a user reports an unrecognized device.
+async def _post_device_base_ticket(client: discord.Client, data: dict, challenge_id: str):
+    """Open a private ticket the moment a user reports an unrecognized device.
     Diagnostics (MAC + KSP.log) arrive as a follow-up once the offending client
-    next checks in (see api_server.device_report)."""
+    next checks in (see api_server.device_report) — posted into this same ticket.
+
+    Falls back to CONTRACT_MOD_CHANNEL_ID if the ticket system is unconfigured."""
+    desc = (
+        f"**User:** {data.get('username')} (`{data.get('user_id')}`)\n"
+        f"**Unrecognized device:** `{data.get('device_id')}`\n"
+        f"**IP:** `{data.get('client_ip') or 'unknown'}`\n\n"
+        "The user reports this device isn't theirs. Awaiting the client's "
+        "diagnostics (MAC address + KSP.log)…"
+    )
+    try:
+        from cogs.tickets import create_ticket
+        guild = None
+        gid = data.get("guild_id")
+        if gid:
+            guild = client.get_guild(int(gid))
+        if guild is None and settings.TICKET_CATEGORY_ID:
+            for g in client.guilds:
+                if g.get_channel(settings.TICKET_CATEGORY_ID):
+                    guild = g
+                    break
+        if guild is not None and settings.TICKET_CATEGORY_ID:
+            channel = await create_ticket(
+                client, guild,
+                opener_id=int(data["user_id"]),
+                kind="user",
+                title="Account-sharing report",
+                description=desc,
+                color=discord.Color.red(),
+            )
+            if channel is not None:
+                await asyncio.to_thread(set_device_ticket_channel, challenge_id, channel.id)
+                return
+    except Exception as exc:
+        log.warning("Could not open device-report ticket, falling back: %s", exc)
+
+    # Fallback: shared mod channel.
     ch_id = settings.CONTRACT_MOD_CHANNEL_ID
     if not ch_id:
-        log.warning("Device report raised but CONTRACT_MOD_CHANNEL_ID is unset")
+        log.warning("Device report raised but no ticket category / mod channel set")
         return
     try:
         ch = client.get_channel(ch_id) or await client.fetch_channel(ch_id)
-        e = discord.Embed(
-            title="🚨 Account-sharing report",
-            description=(
-                f"**User:** {data.get('username')} (`{data.get('user_id')}`)\n"
-                f"**Unrecognized device:** `{data.get('device_id')}`\n"
-                f"**IP:** `{data.get('client_ip') or 'unknown'}`\n\n"
-                "The user reports this device isn't theirs. Awaiting the client's "
-                "diagnostics (MAC address + KSP.log)…"
-            ),
-            color=discord.Color.red(),
-        )
+        e = discord.Embed(title="🚨 Account-sharing report", description=desc,
+                          color=discord.Color.red())
         await ch.send(embed=e)
     except Exception as exc:
         log.warning("Could not post device-report base ticket: %s", exc)
@@ -144,7 +171,7 @@ async def _finish_device(interaction: discord.Interaction, challenge_id: str, ap
     await interaction.response.edit_message(embed=e, view=None)
     # Open the ticket after responding so the 3s interaction window is never at risk.
     if data is not None and not approve:
-        await _post_device_base_ticket(interaction.client, data)
+        await _post_device_base_ticket(interaction.client, data, challenge_id)
 
 
 class KSPDeviceOkButton(DynamicItem[Button], template=r"ksp_dev_ok:(?P<chid>[^:]+)"):
@@ -175,11 +202,38 @@ class KSPDeviceReportButton(DynamicItem[Button], template=r"ksp_dev_no:(?P<chid>
         await _finish_device(interaction, self.chid, approve=False)
 
 
+class KSPDevicePingButton(DynamicItem[Button], template=r"ksp_dev_ping:(?P<chid>[^:]+)"):
+    """🔔 Pings the blocked PC so the owner can confirm it's in front of them
+    before reporting. Keeps the approve/report buttons usable (ephemeral reply)."""
+    def __init__(self, challenge_id: str):
+        super().__init__(Button(label="🔔 Ping this PC", style=discord.ButtonStyle.grey,
+                                custom_id=f"ksp_dev_ping:{challenge_id}"))
+        self.chid = challenge_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(match["chid"])
+
+    async def callback(self, interaction: discord.Interaction):
+        ok = await asyncio.to_thread(
+            request_device_ping, self.chid, str(interaction.user.id))
+        if ok:
+            msg = ("🔔 **Ping sent.** Look at the PC that's trying to log in — within a "
+                   "few seconds it should flash an *“Is this you?”* alert on its screen.\n\n"
+                   "• If you see that alert on a PC in front of you, it's **you** — press "
+                   "**✅ Yes, it's me**.\n"
+                   "• If no PC you can see lights up, it isn't you — press **🚫 No — report**.")
+        else:
+            msg = "⌛ This device request has expired or was already handled, so the ping couldn't be sent."
+        await interaction.response.send_message(msg, ephemeral=True)
+
+
 class DeviceApprovalView(View):
-    """The Yes-it's-me / No-report button pair attached to the new-device DM."""
+    """The Yes-it's-me / Ping / No-report buttons attached to the new-device DM."""
     def __init__(self, challenge_id: str):
         super().__init__(timeout=None)
         self.add_item(KSPDeviceOkButton(challenge_id))
+        self.add_item(KSPDevicePingButton(challenge_id))
         self.add_item(KSPDeviceReportButton(challenge_id))
 
 
@@ -328,4 +382,4 @@ async def setup(bot: commands.Bot):
     # Register the login + device-approval buttons so DM'd prompts keep working
     # after a bot restart (custom_id carries the challenge_id).
     bot.add_dynamic_items(KSPLoginButton, KSPDenyButton,
-                          KSPDeviceOkButton, KSPDeviceReportButton)
+                          KSPDeviceOkButton, KSPDevicePingButton, KSPDeviceReportButton)

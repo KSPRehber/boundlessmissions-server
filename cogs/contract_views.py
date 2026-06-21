@@ -405,13 +405,8 @@ class SueButton(DynamicItem[Button], template=r"ct_sue:" + _ID_PATTERN):
         c = cdb.get_contract(self.gid, self.cid)
         if not c:
             return
-        mod_ch_id = settings.CONTRACT_MOD_CHANNEL_ID
-        if not mod_ch_id:
-            await interaction.followup.send("❌ Not configured.", ephemeral=True)
-            return
-        cdb.update_contract(self.gid, self.cid, status=cdb.MOD_REVIEW)
         bot = interaction.client
-        ch = bot.get_channel(mod_ch_id) or await bot.fetch_channel(mod_ch_id)
+        cdb.update_contract(self.gid, self.cid, status=cdb.MOD_REVIEW)
         c["status"] = cdb.MOD_REVIEW
         e = _embed(c, self.gid)
         e.title = f"⚖️ {t(self.gid, 'ct.mod_review')}"
@@ -419,7 +414,41 @@ class SueButton(DynamicItem[Button], template=r"ct_sue:" + _ID_PATTERN):
         files = c.get("submitted_files", [])
         if files:
             e.add_field(name="📁", value="\n".join(f"📎 [{f['filename']}]({f['url']})" for f in files), inline=False)
-        await ch.send(embed=e, view=ModReviewView(self.cid, self.gid))
+
+        # Prefer a private ticket (both parties + mods); fall back to the shared
+        # mod channel if the ticket system isn't configured.
+        ticket_channel = None
+        if settings.TICKET_CATEGORY_ID:
+            try:
+                from cogs.tickets import create_ticket
+                guild = interaction.guild or bot.get_guild(self.gid)
+                if guild is not None:
+                    other_id = (int(c["issuer_id"])
+                                if str(interaction.user.id) == str(c.get("contractor_id"))
+                                else int(c["contractor_id"]))
+                    ticket_channel = await create_ticket(
+                        bot, guild,
+                        opener_id=interaction.user.id,
+                        kind="other",
+                        title="Contract dispute (escalated)",
+                        description=(f"{interaction.user.mention} escalated contract "
+                                     f"`{self.cid}` for moderator review."),
+                        color=discord.Color.purple(),
+                        extra_user_ids=[other_id],
+                        extra_embeds=[e],
+                        extra_view=ModReviewView(self.cid, self.gid),
+                    )
+            except Exception as exc:
+                log.warning("Could not open sue ticket for %s: %s", self.cid, exc)
+
+        if ticket_channel is None:
+            mod_ch_id = settings.CONTRACT_MOD_CHANNEL_ID
+            if not mod_ch_id:
+                await interaction.followup.send("❌ Not configured.", ephemeral=True)
+                return
+            ch = bot.get_channel(mod_ch_id) or await bot.fetch_channel(mod_ch_id)
+            await ch.send(embed=e, view=ModReviewView(self.cid, self.gid))
+
         await interaction.edit_original_response(content=t(self.gid, "ct.sued"), view=None)
 
 

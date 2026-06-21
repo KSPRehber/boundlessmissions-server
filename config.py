@@ -74,6 +74,14 @@ class Config:
     # Default on (secure); set KSP_DEVICE_BINDING_ENABLED=false in .env to disable.
     KSP_DEVICE_BINDING_ENABLED: bool = _optional("KSP_DEVICE_BINDING_ENABLED", "true").lower() not in ("false", "0", "no", "off")
 
+    # Mod version gate. When on, the KSP client reports its DLL's SHA256 and the
+    # server compares it against the published latest hash (see /admin publishversion
+    # and config/mod_version in Firestore); an outdated client is blocked in-game
+    # until the player updates. Default on; set KSP_VERSION_CHECK_ENABLED=false in
+    # .env to disable the gate (clients are then never told to update). When no
+    # version has been published yet, the gate never blocks regardless of this flag.
+    KSP_VERSION_CHECK_ENABLED: bool = _optional("KSP_VERSION_CHECK_ENABLED", "true").lower() not in ("false", "0", "no", "off")
+
     # IPs of trusted reverse proxies (comma-separated, e.g. "127.0.0.1"). When a
     # request's direct peer is one of these, the real client IP is read from
     # X-Forwarded-For for rate limiting. Leave empty when clients connect the API

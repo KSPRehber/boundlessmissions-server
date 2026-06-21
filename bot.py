@@ -105,6 +105,18 @@ class GeneKermanBot(commands.Bot):
         self.mimic_map: dict[int, discord.Member] = {}
         self.extlog_enabled = False
 
+    async def close(self) -> None:
+        """Flush buffered user data before shutting down so a /shutdown or console
+        stop can't drop the last few minutes of unsaved XP/balance writes. Covers
+        every shutdown path since they all funnel through close()."""
+        try:
+            from data.store import store
+            await store.save_if_dirty()
+            log.info("Flushed user data on shutdown.")
+        except Exception as exc:
+            log.error("Failed to flush user data on shutdown: %s", exc)
+        await super().close()
+
     # ── Lifecycle ─────────────────────────────────────────────────────────────
     async def setup_hook(self) -> None:
         """Called once before the bot connects – load cogs, optionally sync commands."""

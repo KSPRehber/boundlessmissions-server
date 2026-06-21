@@ -415,6 +415,45 @@ def mark_report_done(challenge_doc_id: str) -> None:
         log.warning("Could not mark report done for %s: %s", challenge_doc_id, exc)
 
 
+# ── Data erasure (user "delete my data") ─────────────────────────────────────
+
+def purge_ksp_user_data(user_id: str) -> None:
+    """Erase all KSP auth/security records tied to a user: session + device
+    bindings, and any outstanding link codes and login/device challenges. Also
+    clears the in-process caches so nothing lingers. Best-effort and idempotent."""
+    uid = str(user_id)
+
+    # Don't just delete the session doc: that resets token_version to 0, which
+    # would leave existing tokens valid (and let a stray request re-bind the
+    # device). Instead overwrite it with a minimal, non-identifying tombstone that
+    # BUMPS the version — invalidating every issued token (each device drops to
+    # unlinked on its next request) — while dropping username/guild/devices.
+    try:
+        snap = _sessions_col().document(uid).get()
+        cur = int(snap.to_dict().get("token_version", 0) or 0) if snap.exists else 0
+        new_version = cur + 1
+        _sessions_col().document(uid).set({   # no merge → strips all other fields
+            "token_version": new_version,
+            "active": False,
+            "deleted_at": datetime.now(timezone.utc).isoformat(),
+        })
+        _token_versions[uid] = (new_version, time.time())
+    except Exception as exc:
+        log.warning("purge: could not reset session for %s: %s", uid, exc)
+
+    # Any docs across the auth collections that carry this user_id.
+    for col in (_link_codes_col(), _twofa_col(), _device_chal_col()):
+        try:
+            for doc in col.where("user_id", "==", uid).stream():
+                doc.reference.delete()
+        except Exception as exc:
+            log.warning("purge: cleanup in %s failed for %s: %s", col.id, uid, exc)
+
+    # Drop cached trust so a subsequent request can't read stale allowed-devices.
+    _allowed_devices.pop(uid, None)
+    log.warning("Purged KSP auth/security data for user %s", uid)
+
+
 # ── Session Tokens ───────────────────────────────────────────────────────────
 
 def _sign_token(payload: dict, secret: str) -> str:

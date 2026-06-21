@@ -3,12 +3,14 @@ cogs/admin.py – Administrative commands (bot owner / server admins only).
 """
 
 import asyncio
+import hashlib
 import logging
 import discord
 from discord import app_commands
 from discord.ext import commands
 from config import cfg
 from api_auth import generate_link_code
+from data import mod_version as mver
 
 log = logging.getLogger(__name__)
 
@@ -171,6 +173,100 @@ class Admin(commands.Cog, name="Admin"):
             await interaction.response.send_message(
                 "❌ You are not mimicking anyone.", ephemeral=True
             )
+
+    # ── /publishversion ───────────────────────────────────────────────────────
+    @app_commands.command(
+        name="publishversion",
+        description="Register a KSP mod DLL version + hash for the update gate (Admin only)",
+    )
+    @app_commands.describe(
+        version="Version label, e.g. 1.2.0",
+        download_url="Where players download this version",
+        dll="Upload GeneKerman.dll to auto-compute its SHA256 (preferred)",
+        sha256="Paste the DLL's SHA256 instead of uploading (optional)",
+        set_latest="Make this the required latest version (default: yes)",
+    )
+    @is_admin()
+    async def publishversion(
+        self,
+        interaction: discord.Interaction,
+        version: str,
+        download_url: str,
+        dll: discord.Attachment | None = None,
+        sha256: str | None = None,
+        set_latest: bool = True,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+
+        digest = (sha256 or "").strip().lower()
+        if dll is not None:
+            data = await dll.read()
+            digest = hashlib.sha256(data).hexdigest()
+
+        if not digest:
+            await interaction.followup.send(
+                "❌ Provide either a `dll` upload or a `sha256` hash.", ephemeral=True
+            )
+            return
+        if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+            await interaction.followup.send(
+                "❌ That doesn't look like a SHA256 hash (expected 64 hex chars).", ephemeral=True
+            )
+            return
+
+        rec = await asyncio.to_thread(
+            mver.publish_version, version, digest, download_url, set_latest, str(interaction.user)
+        )
+
+        embed = discord.Embed(
+            title="✅ Mod version published",
+            description=(
+                f"**Version:** `{version}`\n"
+                f"**SHA256:** `{digest}`\n"
+                f"**Download:** {download_url}\n"
+                f"**Latest now:** `{rec.get('latest_version')}`"
+            ),
+            color=discord.Color.green(),
+        )
+        if not cfg.KSP_VERSION_CHECK_ENABLED:
+            embed.set_footer(text="⚠️ The version gate is disabled (KSP_VERSION_CHECK_ENABLED=false) — clients won't be blocked.")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        log.info("%s published mod version %s (%s, latest=%s)",
+                 interaction.user, version, digest[:12], rec.get("latest_version"))
+
+    # ── /versioninfo ──────────────────────────────────────────────────────────
+    @app_commands.command(
+        name="versioninfo",
+        description="Show the currently published latest KSP mod version (Admin only)",
+    )
+    @is_admin()
+    async def versioninfo(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        data = await asyncio.to_thread(mver.get_config)
+        if not data or not data.get("latest_hash"):
+            await interaction.followup.send(
+                "ℹ️ No mod version has been published yet — the update gate is inactive.",
+                ephemeral=True,
+            )
+            return
+        versions = data.get("versions") or {}
+        history = "\n".join(
+            f"• `{v}` — `{(info.get('hash') or '')[:12]}…`"
+            for v, info in versions.items()
+        ) or "—"
+        embed = discord.Embed(
+            title="📦 KSP mod version registry",
+            color=discord.Color.blurple(),
+            description=(
+                f"**Latest:** `{data.get('latest_version')}`\n"
+                f"**Hash:** `{data.get('latest_hash')}`\n"
+                f"**Download:** {data.get('download_url')}\n"
+                f"**Gate:** {'on' if cfg.KSP_VERSION_CHECK_ENABLED else 'off (disabled in .env)'}\n"
+                f"**Updated:** {data.get('updated_at', '—')} by {data.get('updated_by', '—')}\n\n"
+                f"**Published versions:**\n{history}"
+            ),
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     # ── Error handler ─────────────────────────────────────────────────────────
     async def cog_app_command_error(

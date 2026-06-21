@@ -49,6 +49,11 @@ STARTING_BALANCE = 0
 CURRENCY_NAME = "KCoins"
 CURRENCY_SYMBOL = "<:KCoin:1510200111253291258>"
 
+# Public URLs for the Terms of Service / Privacy Policy, shown by /privacy.
+# Leave blank to show only the in-message summary.
+TERMS_URL = ""
+PRIVACY_URL = ""
+
 # KCoins awarded per level-up
 LEVEL_UP_REWARD = 200
 

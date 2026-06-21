@@ -196,6 +196,21 @@ class UserStore:
         """Get all user records for a guild."""
         return self._guild(guild_id)
 
+    async def delete_user(self, guild_id: int, user_id: int) -> bool:
+        """Erase a user's profile record from memory and Firestore. Used by the
+        user-initiated 'delete my data' flow. Returns True if a record existed."""
+        gkey, ukey = str(guild_id), str(user_id)
+        async with self._lock:
+            existed = self._data.get(gkey, {}).pop(ukey, None) is not None
+            self._dirty_users.discard((gkey, ukey))  # don't let a pending write resurrect it
+        try:
+            _db.collection("guilds").document(gkey).collection("users").document(ukey).delete()
+        except Exception as exc:
+            log.error("Failed to delete user %s/%s from Firestore: %s", gkey, ukey, exc)
+            raise
+        log.warning("Deleted user record %s/%s (existed=%s)", gkey, ukey, existed)
+        return existed
+
     # ── XP operations ────────────────────────────────────────────────────────
 
     async def add_xp(

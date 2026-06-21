@@ -41,9 +41,11 @@ from api_models import (
     SubmissionResult, FlightSubmission, VesselSnapshot,
     Notification, NotificationsResponse,
     MarketplaceListResult, MarketplaceListing, MarketplaceListingsResponse,
+    VersionCheckResponse,
 )
 from data.store import store, _db, _storage_bucket
 from data import contracts as cdb
+from data import mod_version as mver
 from data import mission_constraints as mc
 from data import part_resolver as pr
 from data import marketplace as mkt
@@ -474,6 +476,23 @@ async def auth_logout_all(user: dict = Depends(get_current_user)):
     new_version = logout_all_devices(user["user_id"])
     log.info("KSP: %s logged out of all devices", user["username"])
     return {"success": True, "token_version": new_version}
+
+
+# ── Version gate ─────────────────────────────────────────────────────────────
+
+@app.get("/api/v1/version/check", response_model=VersionCheckResponse)
+async def version_check(hash: str = "", version: str = ""):
+    """Report whether the calling KSP client's DLL is the published latest.
+
+    Unauthenticated on purpose: the client must be able to learn it's outdated
+    before (and independent of) linking, and the response carries only public
+    version info. `hash` is the SHA256 of the client's GeneKerman.dll; `version`
+    is its self-reported version label (display only).
+    """
+    if not cfg.KSP_VERSION_CHECK_ENABLED:
+        # Gate disabled — never tell a client to update.
+        return VersionCheckResponse(enabled=False, up_to_date=True, your_version=version or None)
+    return VersionCheckResponse(**mver.check(hash, version))
 
 
 # ── User Profile ─────────────────────────────────────────────────────────────

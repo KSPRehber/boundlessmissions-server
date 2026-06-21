@@ -14,7 +14,11 @@ from discord.ext import commands
 from discord.ui import View, Button, DynamicItem
 
 import settings
-from api_auth import generate_link_code, resolve_approval, resolve_device_challenge
+from api_auth import (
+    generate_link_code, resolve_approval, resolve_device_challenge,
+    purge_ksp_user_data,
+)
+from data.store import store, _db
 from i18n import S, tp
 
 log = logging.getLogger(__name__)
@@ -179,6 +183,70 @@ class DeviceApprovalView(View):
         self.add_item(KSPDeviceReportButton(challenge_id))
 
 
+# ── Data deletion (user "delete my data") ─────────────────────────────────────
+
+def _delete_part_catalog(gid: int, uid: int):
+    try:
+        _db.collection("guilds").document(str(gid)).collection(
+            "part_catalogs").document(str(uid)).delete()
+    except Exception as exc:
+        log.warning("Could not delete part catalog for %s/%s: %s", gid, uid, exc)
+
+
+class DeleteDataModal(discord.ui.Modal):
+    """Confirmation gate: the user must type their exact Discord username before
+    any data is erased, so deletion can never happen on a single misclick."""
+
+    def __init__(self, gid: int, uid: int, expected_names: list[str], primary_name: str):
+        super().__init__(title="⚠️ Delete My Data")
+        self.gid = gid
+        self.uid = uid
+        self._expected = {n.strip().lower() for n in expected_names if n}
+        self.confirm = discord.ui.TextInput(
+            label="Type your username to confirm",
+            placeholder=f"Type exactly: {primary_name}",
+            required=True,
+            max_length=64,
+        )
+        self.add_item(self.confirm)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        typed = str(self.confirm.value).strip().lstrip("@").lower()
+        if typed not in self._expected:
+            await interaction.response.send_message(
+                "❌ That didn't match your username — **nothing was deleted**. "
+                "Run the command again and type your username exactly.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            await store.delete_user(self.gid, self.uid)
+            await asyncio.to_thread(purge_ksp_user_data, str(self.uid))
+            await asyncio.to_thread(_delete_part_catalog, self.gid, self.uid)
+        except Exception as exc:
+            log.error("delete-my-data failed for %s/%s: %s", self.gid, self.uid, exc)
+            await interaction.followup.send(
+                "⚠️ Something went wrong while deleting your data. Please contact a "
+                "moderator so it can be done manually.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.followup.send(
+            "✅ **Your data has been deleted.**\n"
+            "Removed: your profile (XP, balance, levels, language preference), your "
+            "KSP session & device bindings, and your installed-parts catalog. Every "
+            "linked device has been logged out.\n\n"
+            "Records that involve other members (contracts, corporation membership, "
+            "marketplace listings) are kept for those members — ask a moderator if "
+            "you need those removed too.",
+            ephemeral=True,
+        )
+        log.warning("User %s self-deleted their data in guild %s", self.uid, self.gid)
+
+
 class KSPBridge(commands.Cog, name="KSPBridge"):
     """Discord ↔ KSP mod integration commands."""
 
@@ -210,6 +278,49 @@ class KSPBridge(commands.Cog, name="KSPBridge"):
 
         await interaction.followup.send(embed=embed, ephemeral=True)
         log.info("%s generated KSP link code", interaction.user)
+
+    @app_commands.command(name="privacy",
+                          description="How Gene Kerman uses your data, and how to delete it")
+    async def privacy(self, interaction: discord.Interaction):
+        """Show a privacy/terms summary and links."""
+        e = discord.Embed(
+            title="🔒 Privacy & Terms",
+            color=discord.Color.blurple(),
+            description=(
+                "**What Gene Kerman stores about you:**\n"
+                "• Your Discord ID and gameplay progress (XP, balance, levels, "
+                "contracts, corp, marketplace).\n"
+                "• KSP linking & security: a session token (on your device) and a "
+                "**random device id** bound to your account.\n"
+                "• Content you submit: screenshots, craft, telemetry, mod/part lists.\n\n"
+                "**AI:** screenshots and mission text may be processed by Google's "
+                "Gemini to provide features.\n"
+                "**Moderation report:** only if *you* file one, it collects that "
+                "device's IP, MAC, and KSP.log for moderators.\n\n"
+                "**Your controls:**\n"
+                "• Delete everything → **`deletemydata`**\n"
+                "• Log out every device → in-game logout"
+            ),
+        )
+        if settings.PRIVACY_URL:
+            e.add_field(name="Privacy Policy", value=settings.PRIVACY_URL, inline=False)
+        if settings.TERMS_URL:
+            e.add_field(name="Terms of Service", value=settings.TERMS_URL, inline=False)
+        await interaction.response.send_message(embed=e, ephemeral=True)
+
+    @app_commands.command(name="deletemydata",
+                          description="Permanently delete all your Gene Kerman data")
+    async def deletemydata(self, interaction: discord.Interaction):
+        """Open a confirmation modal, then erase the user's data."""
+        if interaction.guild_id is None:
+            await interaction.response.send_message(
+                "Please run this in the server, not in DMs.", ephemeral=True)
+            return
+        u = interaction.user
+        # Accept any of the user's visible names (handle / global name / nick).
+        names = [u.name, getattr(u, "global_name", None), u.display_name]
+        modal = DeleteDataModal(interaction.guild_id, u.id, names, u.name)
+        await interaction.response.send_modal(modal)
 
 
 async def setup(bot: commands.Bot):

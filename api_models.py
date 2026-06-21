@@ -38,6 +38,21 @@ class AuthError(BaseModel):
     detail: str
 
 
+# ── Version gate ─────────────────────────────────────────────────────────────
+
+class VersionCheckResponse(BaseModel):
+    # enabled:    False when the server's version gate is turned off (client must
+    #             never block, regardless of up_to_date).
+    # up_to_date: True when the client's DLL hash matches the published latest, or
+    #             when no version has been published yet (fail-open).
+    enabled: bool = True
+    up_to_date: bool = True
+    latest_version: Optional[str] = None
+    download_url: Optional[str] = None
+    your_version: Optional[str] = None
+    message: Optional[str] = None
+
+
 # ── User Profile ─────────────────────────────────────────────────────────────
 
 class UserProfile(BaseModel):

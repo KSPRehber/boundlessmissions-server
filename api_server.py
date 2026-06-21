@@ -108,6 +108,16 @@ class NotificationHub:
         for ws in dead:
             conns.discard(ws)
 
+    async def broadcast(self, payload: dict):
+        """Send a raw frame to every live connection (not per-user). Used for
+        fleet-wide pokes like a published-version notice."""
+        for conns in list(self._conns.values()):
+            for ws in list(conns):
+                try:
+                    await ws.send_json(payload)
+                except Exception:
+                    conns.discard(ws)
+
 
 _hub = NotificationHub()
 _loop: asyncio.AbstractEventLoop | None = None
@@ -129,6 +139,19 @@ def _push_notification(gid: int, uid: int, payload: dict):
         asyncio.run_coroutine_threadsafe(_hub.push(gid, uid, payload), _loop)
     except Exception as exc:
         log.warning("WS: failed to schedule push for user %d: %s", uid, exc)
+
+
+def broadcast_version_update():
+    """Poke every connected KSP client to re-run its version check. Called after a
+    new mod version is published so already-running clients gate live instead of
+    only on their next restart. Safe no-op if the API server isn't up yet."""
+    if _loop is None:
+        return
+    try:
+        asyncio.run_coroutine_threadsafe(_hub.broadcast({"type": "version"}), _loop)
+        log.info("WS: broadcast version-update poke to live clients")
+    except Exception as exc:
+        log.warning("WS: failed to broadcast version update: %s", exc)
 
 
 # ── Auth Dependency ──────────────────────────────────────────────────────────

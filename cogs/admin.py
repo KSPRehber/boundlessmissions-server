@@ -218,6 +218,16 @@ class Admin(commands.Cog, name="Admin"):
             mver.publish_version, version, digest, download_url, set_latest, str(interaction.user)
         )
 
+        # If this became the latest, poke every live client to re-check now so
+        # already-running clients gate without waiting for a restart.
+        broadcast = rec.get("latest_version") == version.strip()
+        if broadcast:
+            try:
+                import api_server
+                api_server.broadcast_version_update()
+            except Exception as exc:
+                log.warning("Could not broadcast version update: %s", exc)
+
         embed = discord.Embed(
             title="✅ Mod version published",
             description=(
@@ -225,6 +235,7 @@ class Admin(commands.Cog, name="Admin"):
                 f"**SHA256:** `{digest}`\n"
                 f"**Download:** {download_url}\n"
                 f"**Latest now:** `{rec.get('latest_version')}`"
+                + ("\n📡 Live clients poked to re-check." if broadcast else "")
             ),
             color=discord.Color.green(),
         )

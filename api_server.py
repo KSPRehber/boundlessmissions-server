@@ -26,10 +26,10 @@ import settings
 from config import cfg
 from api_auth import (
     validate_link_code, create_session_token, verify_session_token,
-    logout_all_devices, create_2fa_challenge, verify_2fa_challenge,
+    logout_all_devices, create_approval_challenge, resolve_approval, poll_approval,
 )
 from api_models import (
-    LinkRequest, LinkResponse, TwoFARequest,
+    LinkRequest, LinkResponse, PollRequest,
     UserProfile,
     WeeklyMissionsResponse, Mission, MissionSelectRequest, MissionSelectResponse,
     ContractSummary, ContractListResponse, ContractAcceptResponse,
@@ -231,70 +231,82 @@ def _issue_link_token(result: dict) -> LinkResponse:
     )
 
 
-async def _dm_2fa_code(user_id: int, otp: str) -> bool:
-    """DM the 2FA code to the Discord user. Returns False if it couldn't be sent."""
+async def _dm_login_approval(user_id: int, challenge_id: str, client_ip: str) -> bool:
+    """DM the user a login-approval prompt with Log-in / Not-me buttons.
+    Returns False if it couldn't be sent."""
     if not _bot_instance:
         return False
     try:
         import discord
+        from cogs.ksp_bridge import LinkApprovalView
         u = await _bot_instance.fetch_user(user_id)
+        when = datetime.now(TZ).strftime("%Y-%m-%d %H:%M")
+        where = client_ip or "unknown"
         e = discord.Embed(
-            title="🔐 KSP Login Verification",
+            title="🔐 Approve KSP Login",
             description=(
-                f"Your KSP linking code:\n\n# `{otp}`\n\n"
-                "Enter it in KSP to finish linking. Expires in 3 minutes.\n"
-                "If you didn't try to link KSP, ignore this — someone may have "
-                "your link code."
+                "A KSP client just entered your link code and wants to sign in as you.\n\n"
+                f"**When:** {when}\n**From IP:** `{where}`\n\n"
+                "If this is you, press **✅ Log in**. If you didn't try to link KSP, "
+                "press **🚫 Not me** — someone may have your link code.\n"
+                "This request expires in 3 minutes."
             ),
             color=discord.Color.orange(),
         )
-        await u.send(embed=e)
+        await u.send(embed=e, view=LinkApprovalView(challenge_id))
         return True
     except Exception as exc:
-        log.warning("Could not DM 2FA code to user %s: %s", user_id, exc)
+        log.warning("Could not DM login approval to user %s: %s", user_id, exc)
         return False
 
 
 @app.post("/api/v1/auth/link", response_model=LinkResponse)
 async def auth_link(req: LinkRequest, request: Request):
-    """Exchange a 6-digit link code for a session token (or a 2FA challenge)."""
+    """Exchange a 6-digit link code for a session token (or a login-approval challenge)."""
     _guard_link_attempt(request)
 
     result = validate_link_code(req.code)
     if result is None:
         raise HTTPException(status_code=400, detail="Invalid or expired link code")
 
-    # 2FA off → link immediately.
+    # Approval off → link immediately.
     if not cfg.KSP_2FA_ENABLED:
         return _issue_link_token(result)
 
-    # 2FA on → DM a one-time code and wait for /auth/link/2fa. The link code is
-    # already consumed, so a failed DM means this attempt can't proceed.
-    challenge_id, otp = create_2fa_challenge(
-        result["guild_id"], result["user_id"], result["username"])
-    sent = await _dm_2fa_code(int(result["user_id"]), otp)
+    # Approval on → DM the user a Log-in button and wait for them to poll. The link
+    # code is already consumed, so a failed DM means this attempt can't proceed.
+    client_ip = _client_ip(request)
+    challenge_id = create_approval_challenge(
+        result["guild_id"], result["user_id"], result["username"], client_ip)
+    sent = await _dm_login_approval(int(result["user_id"]), challenge_id, client_ip)
     if not sent:
         raise HTTPException(
             status_code=502,
-            detail="Couldn't DM your verification code. Enable DMs from server "
+            detail="Couldn't DM your login approval. Enable DMs from server "
                    "members in Discord, then request a new link code.",
         )
 
-    log.info("KSP: 2FA challenge issued for %s", result["username"])
-    return LinkResponse(status="2fa_required", challenge_id=challenge_id)
+    log.info("KSP: login-approval challenge issued for %s", result["username"])
+    return LinkResponse(status="approval_required", challenge_id=challenge_id)
 
 
-@app.post("/api/v1/auth/link/2fa", response_model=LinkResponse)
-async def auth_link_2fa(req: TwoFARequest, request: Request):
-    """Complete linking by submitting the code DM'd to the user."""
-    _guard_link_attempt(request)
+@app.post("/api/v1/auth/link/poll", response_model=LinkResponse)
+async def auth_link_poll(req: PollRequest, request: Request):
+    """Poll a login-approval challenge. Returns the token once the user has pressed
+    Log-in in Discord; tells the client to keep waiting until then."""
+    # Polling is frequent and the challenge_id is unguessable (144-bit), so the
+    # brute-force link guard doesn't apply — just a generous anti-abuse cap.
+    _rate_limit(f"poll:{_client_ip(request)}", max_hits=120, window=60.0)
 
-    result = verify_2fa_challenge(req.challenge_id, req.code)
-    if result is None:
-        raise HTTPException(status_code=400, detail="Invalid or expired verification code")
-
-    log.info("KSP: 2FA verified, linking %s", result["username"])
-    return _issue_link_token(result)
+    state = poll_approval(req.challenge_id)
+    if state["state"] == "pending":
+        return LinkResponse(status="pending")
+    if state["state"] == "approved":
+        log.info("KSP: login approved, linking %s", state["username"])
+        return _issue_link_token(state)
+    if state["state"] == "denied":
+        raise HTTPException(status_code=403, detail="Login request was denied.")
+    raise HTTPException(status_code=400, detail="Login request expired. Request a new link code.")
 
 
 @app.get("/api/v1/auth/verify", response_model=UserProfile)

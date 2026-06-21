@@ -62,10 +62,10 @@ class Config:
     API_PORT: int = int(_optional("API_PORT", "5022"))
     API_SECRET_KEY: str = _optional("API_SECRET_KEY", "")
 
-    # Discord DM 2FA for KSP account linking. When on, a valid link code only
-    # earns a one-time code DM'd to the user, which must be entered to finish
-    # linking. Default on (secure); set KSP_2FA_ENABLED=false in .env to skip it
-    # while testing.
+    # Discord DM login approval for KSP account linking. When on, a valid link
+    # code only earns a "push approval" prompt DM'd to the user, who must press a
+    # Log-in button in Discord before a token is issued. Default on (secure); set
+    # KSP_2FA_ENABLED=false in .env to skip it while testing.
     KSP_2FA_ENABLED: bool = _optional("KSP_2FA_ENABLED", "true").lower() not in ("false", "0", "no", "off")
 
     # IPs of trusted reverse proxies (comma-separated, e.g. "127.0.0.1"). When a

@@ -26,10 +26,9 @@ log = logging.getLogger(__name__)
 # Token lifetime: 30 days
 TOKEN_LIFETIME = 30 * 24 * 3600
 
-# Link code / 2FA challenge lifetime: 3 minutes
+# Link code / login-approval challenge lifetime: 3 minutes
 LINK_CODE_LIFETIME = 180
-TWOFA_LIFETIME = 180
-TWOFA_MAX_ATTEMPTS = 5
+APPROVAL_LIFETIME = 180
 
 
 def _link_codes_col():
@@ -136,67 +135,96 @@ def validate_link_code(code: str) -> dict | None:
     }
 
 
-# ── Discord DM 2FA ───────────────────────────────────────────────────────────
+# ── Discord DM login approval ────────────────────────────────────────────────
 #
-# Second factor for linking: a valid link code earns a one-time numeric code
-# that's DM'd to the Discord user, who must enter it back in KSP to finish. The
-# OTP is stored only as a salted hash, is single-use, attempt-capped, and expires
-# in 3 minutes. Gated by cfg.KSP_2FA_ENABLED so it can be turned off for testing.
+# Second step of linking ("push approval"): a valid link code creates a pending
+# challenge and the bot DMs the Discord user an "✅ Log in" / "🚫 Not me" button.
+# The KSP client polls until the user approves (token issued) or denies. This is
+# a genuine second check — completing the link requires an interaction inside the
+# user's own Discord, which a stolen link code alone can't satisfy and which (unlike
+# a numeric code) can't be read out to an attacker over social engineering.
+#
+# Nothing secret travels through Discord: the button only flips the challenge
+# state, and the session token is handed solely to the polling client that holds
+# the (144-bit, single-use, 3-minute) challenge_id. Gated by cfg.KSP_2FA_ENABLED.
 
-def _hash_otp(challenge_id: str, otp: str) -> str:
-    return hashlib.sha256(f"{challenge_id}:{otp}".encode()).hexdigest()
-
-
-def create_2fa_challenge(guild_id: str, user_id: str, username: str) -> tuple[str, str]:
-    """Create a pending 2FA challenge. Returns (challenge_id, otp); the caller
-    DMs the otp to the user and never stores it in the clear."""
+def create_approval_challenge(guild_id: str, user_id: str, username: str,
+                              client_ip: str = "") -> str:
+    """Create a pending login-approval challenge. Returns the challenge_id."""
     challenge_id = secrets.token_urlsafe(18)
-    otp = _digit_code(6)
     _twofa_col().document(challenge_id).set({
         "guild_id": str(guild_id),
         "user_id": str(user_id),
         "username": username,
-        "otp_hash": _hash_otp(challenge_id, otp),
-        "attempts": 0,
+        "status": "pending",
+        "client_ip": client_ip,
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "expires_at": time.time() + TWOFA_LIFETIME,
+        "expires_at": time.time() + APPROVAL_LIFETIME,
     })
-    log.info("Created 2FA challenge for user %s", user_id)
-    return challenge_id, otp
+    log.info("Created login-approval challenge for user %s", user_id)
+    return challenge_id
 
 
-def verify_2fa_challenge(challenge_id: str, otp: str) -> dict | None:
-    """Validate a 2FA OTP. Returns {guild_id, user_id, username} on success
-    (consuming the challenge), or None on wrong/expired/exhausted code."""
+def resolve_approval(challenge_id: str, acting_user_id: str, approve: bool) -> bool:
+    """Apply the Discord button's decision to a pending challenge.
+
+    The acting Discord user MUST own the challenge — a click from anyone else (or
+    on an expired/already-decided challenge) is ignored. Returns True if the new
+    state ('approved'/'denied') was written, False otherwise. The challenge isn't
+    consumed here; the polling KSP client consumes it via poll_approval.
+    """
     doc = _twofa_col().document(challenge_id)
     snap = doc.get()
     if not snap.exists:
-        return None
+        return False
+
+    data = snap.to_dict()
+    if str(data.get("user_id")) != str(acting_user_id):
+        log.warning("Approval %s: acting user %s is not owner %s — ignored",
+                    challenge_id, acting_user_id, data.get("user_id"))
+        return False
+    if data.get("status") != "pending" or time.time() > data.get("expires_at", 0):
+        return False
+
+    doc.update({"status": "approved" if approve else "denied"})
+    log.info("Login-approval challenge %s %s by user %s",
+             challenge_id, "approved" if approve else "denied", acting_user_id)
+    return True
+
+
+def poll_approval(challenge_id: str) -> dict:
+    """Poll a challenge on behalf of the waiting KSP client.
+
+    Returns one of:
+      {"state": "pending"}
+      {"state": "approved", "guild_id", "user_id", "username"}  (consumes it)
+      {"state": "denied"}    (consumes it)
+      {"state": "expired"}   (unknown / timed-out)
+    """
+    doc = _twofa_col().document(challenge_id)
+    snap = doc.get()
+    if not snap.exists:
+        return {"state": "expired"}
 
     data = snap.to_dict()
     if time.time() > data.get("expires_at", 0):
         doc.delete()
-        return None
-    if data.get("attempts", 0) >= TWOFA_MAX_ATTEMPTS:
-        doc.delete()  # too many tries — burn it
-        return None
+        return {"state": "expired"}
 
-    if not hmac.compare_digest(data.get("otp_hash", ""), _hash_otp(challenge_id, otp)):
-        # Wrong code — count the attempt; delete once the cap is hit.
-        attempts = data.get("attempts", 0) + 1
-        if attempts >= TWOFA_MAX_ATTEMPTS:
-            doc.delete()
-        else:
-            doc.update({"attempts": attempts})
-        return None
+    status = data.get("status", "pending")
+    if status == "pending":
+        return {"state": "pending"}
 
-    doc.delete()  # one-time use
-    log.info("Validated 2FA challenge for user %s", data["user_id"])
-    return {
-        "guild_id": data["guild_id"],
-        "user_id": data["user_id"],
-        "username": data["username"],
-    }
+    # Terminal state — consume the challenge (one-time use) and report it.
+    doc.delete()
+    if status == "approved":
+        return {
+            "state": "approved",
+            "guild_id": data["guild_id"],
+            "user_id": data["user_id"],
+            "username": data["username"],
+        }
+    return {"state": "denied"}
 
 
 # ── Session Tokens ───────────────────────────────────────────────────────────

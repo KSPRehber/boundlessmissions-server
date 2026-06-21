@@ -11,13 +11,15 @@ from typing import Optional
 class LinkRequest(BaseModel):
     code: str = Field(..., min_length=6, max_length=6, description="6-digit link code from Discord")
 
-class TwoFARequest(BaseModel):
+class PollRequest(BaseModel):
     challenge_id: str = Field(..., description="Challenge id returned by the link step")
-    code: str = Field(..., min_length=6, max_length=6, description="6-digit code from the Discord DM")
 
 class LinkResponse(BaseModel):
-    # status: "ok" → linked, token populated. "2fa_required" → enter the DM'd
-    # code via /auth/link/2fa using challenge_id; token stays empty for now.
+    # status:
+    #   "ok"                → linked, token populated.
+    #   "approval_required" → poll /auth/link/poll with challenge_id; the user must
+    #                         press the Log-in button in their Discord DM.
+    #   "pending"           → still waiting on the user's approval; keep polling.
     status: str = "ok"
     token: str = ""
     username: str = ""

@@ -11,8 +11,9 @@ import logging
 import discord
 from discord import app_commands
 from discord.ext import commands
+from discord.ui import View, Button, DynamicItem
 
-from api_auth import generate_link_code
+from api_auth import generate_link_code, resolve_approval
 from i18n import S, tp
 
 log = logging.getLogger(__name__)
@@ -25,6 +26,67 @@ S.update({
     "ksp.linked.title":    {"en": "✅ KSP Linked"},
     "ksp.linked.desc":     {"en": "Your KSP account has been linked successfully!"},
 })
+
+
+# ── KSP login-approval buttons ────────────────────────────────────────────────
+#
+# DM'd to the user when a KSP client enters their link code. Pressing "Log in"
+# approves the waiting client; "Not me" denies it. Both use DynamicItem so they
+# keep working across a bot restart; the challenge_id is carried in the custom_id
+# (token_urlsafe → no ':' to clash with the separator). resolve_approval verifies
+# the clicker actually owns the challenge before applying the decision.
+
+async def _finish_approval(interaction: discord.Interaction, challenge_id: str, approve: bool):
+    ok = await asyncio.to_thread(
+        resolve_approval, challenge_id, str(interaction.user.id), approve)
+    if not ok:
+        msg = "⌛ This login request has expired or was already handled."
+        color = discord.Color.greyple()
+    elif approve:
+        msg = "✅ Login approved — switch back to KSP, it should link automatically."
+        color = discord.Color.green()
+    else:
+        msg = "🚫 Login denied. If that wasn't you, your link code is now useless — generate a fresh one only when *you* want to link."
+        color = discord.Color.red()
+    e = discord.Embed(description=msg, color=color)
+    # Replace the prompt so the buttons can't be pressed again.
+    await interaction.response.edit_message(embed=e, view=None)
+
+
+class KSPLoginButton(DynamicItem[Button], template=r"ksp_login:(?P<chid>[^:]+)"):
+    def __init__(self, challenge_id: str):
+        super().__init__(Button(label="✅ Log in", style=discord.ButtonStyle.green,
+                                custom_id=f"ksp_login:{challenge_id}"))
+        self.chid = challenge_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(match["chid"])
+
+    async def callback(self, interaction: discord.Interaction):
+        await _finish_approval(interaction, self.chid, approve=True)
+
+
+class KSPDenyButton(DynamicItem[Button], template=r"ksp_deny:(?P<chid>[^:]+)"):
+    def __init__(self, challenge_id: str):
+        super().__init__(Button(label="🚫 Not me", style=discord.ButtonStyle.red,
+                                custom_id=f"ksp_deny:{challenge_id}"))
+        self.chid = challenge_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(match["chid"])
+
+    async def callback(self, interaction: discord.Interaction):
+        await _finish_approval(interaction, self.chid, approve=False)
+
+
+class LinkApprovalView(View):
+    """The Log-in / Not-me button pair attached to the approval DM."""
+    def __init__(self, challenge_id: str):
+        super().__init__(timeout=None)
+        self.add_item(KSPLoginButton(challenge_id))
+        self.add_item(KSPDenyButton(challenge_id))
 
 
 class KSPBridge(commands.Cog, name="KSPBridge"):
@@ -62,3 +124,6 @@ class KSPBridge(commands.Cog, name="KSPBridge"):
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(KSPBridge(bot))
+    # Register the login-approval buttons so DM'd prompts keep working after a
+    # bot restart (custom_id carries the challenge_id).
+    bot.add_dynamic_items(KSPLoginButton, KSPDenyButton)

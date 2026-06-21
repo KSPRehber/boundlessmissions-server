@@ -199,9 +199,10 @@ class Admin(commands.Cog, name="Admin"):
         await interaction.response.defer(ephemeral=True)
 
         digest = (sha256 or "").strip().lower()
+        dll_bytes = None
         if dll is not None:
-            data = await dll.read()
-            digest = hashlib.sha256(data).hexdigest()
+            dll_bytes = await dll.read()
+            digest = hashlib.sha256(dll_bytes).hexdigest()
 
         if not digest:
             await interaction.followup.send(
@@ -215,7 +216,8 @@ class Admin(commands.Cog, name="Admin"):
             return
 
         rec = await asyncio.to_thread(
-            mver.publish_version, version, digest, download_url, set_latest, str(interaction.user)
+            mver.publish_version, version, digest, download_url, set_latest,
+            str(interaction.user), dll_bytes
         )
 
         # If this became the latest, poke every live client to re-check now so
@@ -236,6 +238,9 @@ class Admin(commands.Cog, name="Admin"):
                 f"**Download:** {download_url}\n"
                 f"**Latest now:** `{rec.get('latest_version')}`"
                 + ("\n📡 Live clients poked to re-check." if broadcast else "")
+                + ("\n🛡️ Attestation enabled (pristine DLL stored)."
+                   if rec.get("versions", {}).get(version.strip(), {}).get("has_dll") else
+                   "\n⚠️ Attestation OFF for this version — upload the `dll` (not just a hash) to enable challenge-response anti-tamper.")
             ),
             color=discord.Color.green(),
         )

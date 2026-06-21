@@ -41,6 +41,25 @@ class AuthError(BaseModel):
     detail: str
 
 
+# ── Attestation (challenge-response anti-tamper) ──────────────────────────────
+
+class AttestChallenge(BaseModel):
+    # enabled=False when no pristine DLL is stored server-side → client skips.
+    # Otherwise the client must return SHA256(nonce_utf8 + dll_bytes[offset:offset+length]).
+    enabled: bool = False
+    attest_id: Optional[str] = None
+    nonce: Optional[str] = None
+    offset: int = 0
+    length: int = 0
+
+class AttestRespondRequest(BaseModel):
+    attest_id: str
+    digest: str
+
+class AttestResult(BaseModel):
+    ok: bool = False
+
+
 # ── Version gate ─────────────────────────────────────────────────────────────
 
 class VersionCheckResponse(BaseModel):
@@ -51,6 +70,10 @@ class VersionCheckResponse(BaseModel):
     enabled: bool = True
     up_to_date: bool = True
     latest_version: Optional[str] = None
+    # SHA256 of the published-latest GeneKerman.dll. Always returned (null only when
+    # no version has been published yet) so a client can confirm exactly which build
+    # the server expects.
+    latest_hash: Optional[str] = None
     download_url: Optional[str] = None
     your_version: Optional[str] = None
     message: Optional[str] = None

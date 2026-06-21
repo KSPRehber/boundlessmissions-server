@@ -8,8 +8,10 @@ No API keys, Firebase creds, or secrets are exposed to clients.
 """
 
 import asyncio
+import hashlib
 import io
 import logging
+import secrets
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -42,10 +44,12 @@ from api_models import (
     Notification, NotificationsResponse,
     MarketplaceListResult, MarketplaceListing, MarketplaceListingsResponse,
     VersionCheckResponse,
+    AttestChallenge, AttestRespondRequest, AttestResult,
 )
 from data.store import store, _db, _storage_bucket
 from data import contracts as cdb
 from data import mod_version as mver
+from data import suspicion as susp
 from data import mission_constraints as mc
 from data import part_resolver as pr
 from data import marketplace as mkt
@@ -239,16 +243,44 @@ async def get_user_token_only(authorization: str = Header(...)) -> dict:
     return user
 
 
+def enforce_mod_version(x_mod_hash: str) -> None:
+    """Hard-block outdated / modified clients on gated endpoints by comparing the
+    client's reported DLL hash (X-Mod-Hash) against the published latest.
+
+    Fail-open to match /version/check: a no-op when the gate is disabled or nothing
+    has been published yet. Otherwise a mismatch raises 426 `update_required`, which
+    the client turns into its blocking "update required" window.
+    """
+    if not cfg.KSP_VERSION_CHECK_ENABLED:
+        return
+    cfg_doc = mver.get_config()
+    latest_hash = (cfg_doc.get("latest_hash") or "").lower()
+    if not latest_hash:
+        return
+    if (x_mod_hash or "").strip().lower() != latest_hash:
+        raise HTTPException(status_code=426, detail={
+            "code": "update_required",
+            "latest_version": cfg_doc.get("latest_version"),
+            "latest_hash": latest_hash,
+            "download_url": cfg_doc.get("download_url"),
+            "message": "Your Gene Kerman mod is out of date. Update to keep playing.",
+        })
+
+
 async def get_current_user(request: Request,
                            authorization: str = Header(...),
-                           x_device_id: str = Header(default="", alias="X-Device-Id")) -> dict:
-    """Validate the session token, then enforce device binding (hard block).
+                           x_device_id: str = Header(default="", alias="X-Device-Id"),
+                           x_mod_hash: str = Header(default="", alias="X-Mod-Hash")) -> dict:
+    """Validate the session token, enforce the version gate, then device binding.
 
-    An unrecognized device id is refused with 403 `device_unverified` and a
-    challenge_id; the user is DMed an approve/reject prompt and the client polls
-    /auth/device/poll until trusted.
+    An outdated/modified DLL is refused with 426 `update_required`. An unrecognized
+    device id is refused with 403 `device_unverified` and a challenge_id; the user is
+    DMed an approve/reject prompt and the client polls /auth/device/poll until trusted.
     """
     user = await get_user_token_only(authorization)
+
+    # Version gate first: an old client should be told to update before anything else.
+    enforce_mod_version(x_mod_hash)
 
     if cfg.KSP_DEVICE_BINDING_ENABLED and check_device(user["user_id"], x_device_id) != "ok":
         client_ip = _client_ip(request)
@@ -317,9 +349,13 @@ async def _dm_login_approval(user_id: int, challenge_id: str, client_ip: str) ->
 
 @app.post("/api/v1/auth/link", response_model=LinkResponse)
 async def auth_link(req: LinkRequest, request: Request,
-                    x_device_id: str = Header(default="", alias="X-Device-Id")):
+                    x_device_id: str = Header(default="", alias="X-Device-Id"),
+                    x_mod_hash: str = Header(default="", alias="X-Mod-Hash")):
     """Exchange a 6-digit link code for a session token (or a login-approval challenge)."""
     _guard_link_attempt(request)
+
+    # Block outdated/modified clients up front so they can't even start a session.
+    enforce_mod_version(x_mod_hash)
 
     result = validate_link_code(req.code)
     if result is None:
@@ -519,9 +555,132 @@ async def version_check(hash: str = "", version: str = ""):
     is its self-reported version label (display only).
     """
     if not cfg.KSP_VERSION_CHECK_ENABLED:
-        # Gate disabled — never tell a client to update.
-        return VersionCheckResponse(enabled=False, up_to_date=True, your_version=version or None)
+        # Gate disabled — never tell a client to update, but still advertise the
+        # published DLL hash so the client can always confirm the expected build.
+        cfg_doc = mver.get_config()
+        return VersionCheckResponse(
+            enabled=False, up_to_date=True,
+            latest_version=cfg_doc.get("latest_version"),
+            latest_hash=(cfg_doc.get("latest_hash") or None),
+            your_version=version or None)
     return VersionCheckResponse(**mver.check(hash, version))
+
+
+# ── Anti-cheat: suspicion flagging → moderator ticket ─────────────────────────
+#
+# The client is untrusted; reward endpoints validate what they can server-side and
+# call flag_suspicion() when something still looks forged. Each distinct signal
+# opens at most one mods-only ticket per user per cooldown so mods aren't spammed.
+
+# reason → (ticket title, cooldown seconds, min count before a ticket is opened)
+_SUSPICION_RULES = {
+    "dll_tamper":           ("🛡️ Possible modified mod (failed attestation)", 6 * 3600, 1),
+    "illegal_mods":         ("⚠️ Repeated disallowed-mod submissions",        24 * 3600, 3),
+    "impossible_telemetry": ("⚠️ Implausible flight telemetry",               12 * 3600, 1),
+}
+
+
+async def flag_suspicion(gid: int, uid: int, username: str, reason: str,
+                         details: str, severity: str = "high") -> None:
+    """Record an anti-cheat suspicion and, when it clears its threshold/cooldown,
+    open a mods-only ticket about the user. Awaitable from handlers; never raises."""
+    try:
+        import discord
+        count = await asyncio.to_thread(
+            susp.record, gid, uid, username, reason, severity, details)
+        title, cooldown, min_count = _SUSPICION_RULES.get(
+            reason, (f"⚠️ Suspicious activity: {reason}", 12 * 3600, 1))
+        if count < min_count:
+            return
+        if not await asyncio.to_thread(susp.claim_ticket, gid, uid, reason, cooldown):
+            return
+        if not _bot_instance:
+            return
+        guild = _bot_instance.get_guild(gid)
+        if guild is None:
+            return
+        from cogs.tickets import create_ticket
+        desc = (f"**User:** {username} (`{uid}`)\n"
+                f"**Signal:** `{reason}` · severity **{severity}**\n"
+                f"**Times seen (all-time):** {count}\n\n{details}")
+        await create_ticket(
+            _bot_instance, guild,
+            opener_id=None,            # mods-only — the suspect must NOT see this
+            subject_user_id=uid,
+            kind="user",
+            title=title,
+            description=desc,
+            color=discord.Color.dark_red(),
+        )
+        log.warning("Anti-cheat: opened ticket for user %s (%s, count=%d)", uid, reason, count)
+    except Exception as exc:
+        log.warning("flag_suspicion failed (%s/%s): %s", uid, reason, exc)
+
+
+# ── Attestation (challenge-response anti-tamper) ──────────────────────────────
+#
+# A static self-reported DLL hash (X-Mod-Hash) is trivially spoofed by hardcoding
+# the expected value. Attestation instead asks for SHA256(server-nonce + a random
+# window of the DLL): the answer changes every time, so it can't be precomputed —
+# a tamperer must keep the entire pristine DLL on disk to pass. Not unbreakable
+# (acknowledged), but it defeats casual patches and a failure is a strong tamper
+# signal that we route to moderators. Fail-open when no pristine DLL is stored.
+
+_attest_challenges: dict[str, dict] = {}   # attest_id -> {user_id, expected, expires}
+_ATTEST_TTL = 60.0
+
+
+def _prune_attest() -> None:
+    now = time.time()
+    for k in [k for k, v in _attest_challenges.items() if v["expires"] < now]:
+        _attest_challenges.pop(k, None)
+
+
+@app.get("/api/v1/attest/challenge", response_model=AttestChallenge)
+async def attest_challenge(user: dict = Depends(get_user_token_only)):
+    """Issue a one-time nonce + byte-window for the client to hash against its DLL."""
+    info = await asyncio.to_thread(mver.get_latest_dll_bytes)
+    if not info:
+        return AttestChallenge(enabled=False)   # nothing stored → can't verify, skip
+    h, data = info
+    n = len(data)
+    length = min(n, 16384)
+    offset = secrets.randbelow(n - length + 1) if n > length else 0
+    nonce = secrets.token_hex(16)
+    attest_id = secrets.token_urlsafe(18)
+    expected = hashlib.sha256(nonce.encode() + data[offset:offset + length]).hexdigest()
+    _prune_attest()
+    _attest_challenges[attest_id] = {
+        "user_id": str(user["user_id"]),
+        "expected": expected,
+        "expires": time.time() + _ATTEST_TTL,
+    }
+    return AttestChallenge(enabled=True, attest_id=attest_id, nonce=nonce,
+                           offset=offset, length=length)
+
+
+@app.post("/api/v1/attest/respond", response_model=AttestResult)
+async def attest_respond(req: AttestRespondRequest, request: Request,
+                         user: dict = Depends(get_user_token_only)):
+    """Verify the client's attestation digest. A mismatch on a valid, fresh,
+    owner-matched challenge is a strong tamper signal → flag for moderators."""
+    _rate_limit(f"attest:{_client_ip(request)}", max_hits=30, window=60.0)
+    ch = _attest_challenges.pop(req.attest_id, None)
+    # Unknown/expired/foreign challenge: inconclusive (e.g. server restart) — don't
+    # accuse, just report not-ok so the client retries on its next cycle.
+    if not ch or ch["expires"] < time.time() or str(ch["user_id"]) != str(user["user_id"]):
+        return AttestResult(ok=False)
+    if secrets.compare_digest(ch["expected"], (req.digest or "").strip().lower()):
+        return AttestResult(ok=True)
+    await flag_suspicion(
+        int(user["guild_id"]), int(user["user_id"]), user.get("username", ""),
+        reason="dll_tamper",
+        details=("The client failed challenge-response attestation: SHA256 of its "
+                 "DLL window + server nonce did not match the published build. This "
+                 "usually means the GeneKerman.dll on this account has been modified "
+                 "or replaced from the official release."),
+        severity="high")
+    return AttestResult(ok=False)
 
 
 # ── User Profile ─────────────────────────────────────────────────────────────
@@ -2071,6 +2230,13 @@ async def submit_contract(
             if illegal:
                 log.info("Submission rejected for contract %s: craft uses disallowed mods %s",
                          contract_id, illegal)
+                await flag_suspicion(
+                    gid, uid, user.get("username", ""), reason="illegal_mods",
+                    details=(f"Craft submitted to contract `{contract_id}` used mods "
+                             f"outside the allowed list: {', '.join(illegal)}. "
+                             "(Auto-rejected server-side; flagged only after repeats — "
+                             "may be an honest mod-loadout mistake.)"),
+                    severity="medium")
                 return SubmissionResult(
                     success=False,
                     message=f"Craft uses parts outside this contract's allowed mods: {', '.join(illegal)}.",

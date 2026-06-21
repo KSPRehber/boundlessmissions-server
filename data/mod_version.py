@@ -21,13 +21,24 @@ Document shape:
     }
 """
 
+import logging
 from datetime import datetime, timezone
 
-from data.store import _db
+from data.store import _db, _storage_bucket
+
+log = logging.getLogger(__name__)
+
+# Pristine DLL bytes per hash, cached in-process so attestation doesn't hit
+# Storage on every challenge. Keyed by lowercase sha256 hex.
+_dll_cache: dict[str, bytes] = {}
 
 
 def _doc():
     return _db.collection("config").document("mod_version")
+
+
+def _dll_path(sha256: str) -> str:
+    return f"mod_dll/{sha256}.dll"
 
 
 def get_config() -> dict:
@@ -37,33 +48,74 @@ def get_config() -> dict:
 
 
 def publish_version(version: str, sha256: str, download_url: str,
-                    set_latest: bool, updated_by: str) -> dict:
+                    set_latest: bool, updated_by: str,
+                    dll_bytes: bytes | None = None) -> dict:
     """Register a version's DLL hash + download URL, optionally marking it latest.
 
     The first version published is always made latest (so the gate has a target),
-    even if set_latest is False. Returns the stored document.
+    even if set_latest is False. If `dll_bytes` is provided, the pristine DLL is
+    stored so the server can answer challenge-response attestations for it (the
+    bytes are the only way to verify a nonce-salted hash the client can't precompute).
+    Returns the stored document.
     """
     version = version.strip()
     sha256 = sha256.strip().lower()
     download_url = download_url.strip()
+
+    # Persist the pristine bytes for attestation (best-effort; never block publish).
+    has_dll = False
+    if dll_bytes is not None and _storage_bucket is not None:
+        try:
+            blob = _storage_bucket.blob(_dll_path(sha256))
+            blob.upload_from_string(dll_bytes, content_type="application/octet-stream")
+            _dll_cache[sha256] = dll_bytes
+            has_dll = True
+            log.info("Stored pristine DLL for attestation (%s, %d bytes)", sha256[:12], len(dll_bytes))
+        except Exception as exc:
+            log.warning("Could not store pristine DLL for %s: %s", version, exc)
 
     ref = _doc()
     snap = ref.get()
     data = snap.to_dict() if snap.exists else {}
 
     versions = data.get("versions") or {}
-    versions[version] = {"hash": sha256, "download_url": download_url}
+    versions[version] = {"hash": sha256, "download_url": download_url, "has_dll": has_dll}
     data["versions"] = versions
 
     if set_latest or not data.get("latest_hash"):
         data["latest_version"] = version
         data["latest_hash"] = sha256
         data["download_url"] = download_url
+        data["has_dll"] = has_dll
 
     data["updated_at"] = datetime.now(timezone.utc).isoformat()
     data["updated_by"] = updated_by
     ref.set(data)
     return data
+
+
+def get_latest_dll_bytes() -> tuple[str, bytes] | None:
+    """Return (sha256, pristine_bytes) for the published-latest DLL, or None if no
+    DLL was stored (attestation unavailable → callers fail open). Cached in-process."""
+    cfg_doc = get_config()
+    h = (cfg_doc.get("latest_hash") or "").lower()
+    if not h or not cfg_doc.get("has_dll"):
+        return None
+    cached = _dll_cache.get(h)
+    if cached is not None:
+        return h, cached
+    if _storage_bucket is None:
+        return None
+    try:
+        blob = _storage_bucket.blob(_dll_path(h))
+        if not blob.exists():
+            return None
+        data = blob.download_as_bytes()
+        _dll_cache[h] = data
+        return h, data
+    except Exception as exc:
+        log.warning("Could not load pristine DLL for attestation (%s): %s", h[:12], exc)
+        return None
 
 
 def check(client_hash: str, client_version: str) -> dict:
@@ -78,14 +130,16 @@ def check(client_hash: str, client_version: str) -> dict:
     download_url = cfg_doc.get("download_url")
 
     if not latest_hash:
-        # Nothing published — don't gate anyone.
-        return {"enabled": True, "up_to_date": True, "your_version": client_version or None}
+        # Nothing published — don't gate anyone (no hash to advertise yet).
+        return {"enabled": True, "up_to_date": True, "latest_hash": None,
+                "your_version": client_version or None}
 
     up_to_date = bool(client_hash) and client_hash.strip().lower() == latest_hash
     return {
         "enabled": True,
         "up_to_date": up_to_date,
         "latest_version": latest_version,
+        "latest_hash": latest_hash,
         "download_url": download_url,
         "your_version": client_version or None,
         "message": None if up_to_date else f"A new version ({latest_version}) is available.",

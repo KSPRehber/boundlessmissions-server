@@ -105,11 +105,12 @@ async def create_ticket(
     client: discord.Client,
     guild: discord.Guild,
     *,
-    opener_id: int,
+    opener_id: int | None,
     kind: str,
     title: str,
     description: str = "",
     color: discord.Color | None = None,
+    subject_user_id: int | None = None,
     extra_user_ids: list[int] | None = None,
     extra_embeds: list[discord.Embed] | None = None,
     extra_view: View | None = None,
@@ -117,7 +118,11 @@ async def create_ticket(
     ping_mods: bool = True,
 ) -> discord.TextChannel | None:
     """Create a private ticket channel under TICKET_CATEGORY_ID and post the opening
-    message. Visible only to @mods, the opener, and any extra_user_ids. Returns the
+    message. Visible only to @mods, the opener (if any), and any extra_user_ids.
+
+    `opener_id=None` makes a **mods-only** ticket (used for auto-flagged anti-cheat
+    reports where the suspect must NOT see it); only mods can then close it.
+    `subject_user_id` is shown for context but is NOT granted access. Returns the
     channel, or None if the ticket system is unconfigured / creation failed."""
     cat_id = settings.TICKET_CATEGORY_ID
     if not cat_id:
@@ -145,7 +150,7 @@ async def create_ticket(
         overwrites[mod_role] = discord.PermissionOverwrite(
             view_channel=True, send_messages=True, attach_files=True)
 
-    member_ids = [int(opener_id)] + [int(u) for u in (extra_user_ids or [])]
+    member_ids = ([int(opener_id)] if opener_id else []) + [int(u) for u in (extra_user_ids or [])]
     for uid in dict.fromkeys(member_ids):  # de-dupe, preserve order
         member = guild.get_member(uid)
         if member is None:
@@ -164,7 +169,7 @@ async def create_ticket(
             name=chan_name,
             category=category,
             overwrites=overwrites,
-            topic=f"GKTicket|opener={opener_id}|kind={kind}",
+            topic=f"GKTicket|opener={opener_id or ''}|kind={kind}",
             reason=f"Ticket #{num:04d} ({kind}) opened",
         )
     except Exception as exc:
@@ -178,9 +183,14 @@ async def create_ticket(
         color=color or discord.Color.blurple(),
     )
     e.set_footer(text=f"Ticket #{num:04d}")
-    opener = guild.get_member(int(opener_id))
+    opener = guild.get_member(int(opener_id)) if opener_id else None
     if opener:
         e.set_author(name=str(opener), icon_url=getattr(opener.display_avatar, "url", None))
+    if subject_user_id:
+        subj = guild.get_member(int(subject_user_id))
+        e.add_field(name="Reported user",
+                    value=(f"{subj.mention} (`{subject_user_id}`)" if subj else f"`{subject_user_id}`"),
+                    inline=False)
 
     content_bits = []
     if opener:
@@ -348,45 +358,100 @@ class TicketPanelView(View):
         self.add_item(OpenTicketButton())
 
 
+def _panel_embed() -> discord.Embed:
+    return discord.Embed(
+        title="📩 Need help or want to report something?",
+        description=(
+            "Open a **private ticket** that only you and the moderators can see.\n\n"
+            "🚨 **Report a user** — rule-breaking, account sharing, harassment…\n"
+            "🐛 **Report a bug / issue** — something in the bot or KSP mod is broken.\n"
+            "💬 **Something else** — questions, requests, anything.\n\n"
+            "Press the button below and pick a reason."
+        ),
+        color=discord.Color.blurple(),
+    )
+
+
+async def _find_existing_panel(channel: discord.TextChannel, bot_user_id: int):
+    """Return the bot's existing panel message in the channel (by its Open-Ticket
+    button custom_id), or None — so we never post a duplicate panel on restart."""
+    try:
+        async for msg in channel.history(limit=50):
+            if msg.author.id != bot_user_id:
+                continue
+            for row in msg.components:
+                for comp in getattr(row, "children", []):
+                    if getattr(comp, "custom_id", None) == "gk_ticket_open":
+                        return msg
+    except Exception as exc:
+        log.warning("Could not scan ticket panel channel %s: %s", channel.id, exc)
+    return None
+
+
 # ── Cog ───────────────────────────────────────────────────────────────────────
 
 class Tickets(commands.Cog, name="Tickets"):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self._panel_ensured = False
+
+    async def _resolve_panel_channel(self):
+        ch_id = settings.TICKET_PANEL_CHANNEL_ID
+        if not ch_id:
+            return None
+        channel = self.bot.get_channel(ch_id)
+        if channel is None:
+            try:
+                channel = await self.bot.fetch_channel(ch_id)
+            except Exception as exc:
+                log.warning("Ticket panel channel %s not found: %s", ch_id, exc)
+                return None
+        return channel
+
+    @commands.Cog.listener()
+    async def on_ready(self):
+        # Auto-post the panel once per process so it's always present without an
+        # admin having to run /ticketpanel. Idempotent: skips if one already exists.
+        if self._panel_ensured:
+            return
+        self._panel_ensured = True
+        channel = await self._resolve_panel_channel()
+        if channel is None:
+            return
+        if await _find_existing_panel(channel, self.bot.user.id):
+            log.info("Ticket panel already present in #%s", getattr(channel, "name", channel.id))
+            return
+        try:
+            await channel.send(embed=_panel_embed(), view=TicketPanelView())
+            log.info("Auto-posted ticket panel in #%s", getattr(channel, "name", channel.id))
+        except discord.Forbidden:
+            log.warning("Missing permission to post the ticket panel in channel %s "
+                        "(need View Channel + Send Messages + Embed Links)", channel.id)
+        except Exception as exc:
+            log.warning("Could not auto-post ticket panel: %s", exc)
 
     @app_commands.command(name="ticketpanel",
                           description="Post the 'Open a Ticket' panel in the ticket channel")
     @app_commands.default_permissions(administrator=True)
     async def ticketpanel(self, interaction: discord.Interaction):
-        """(Admin) Post or refresh the ticket panel message."""
+        """(Admin) Post a fresh ticket panel message."""
         ch_id = settings.TICKET_PANEL_CHANNEL_ID
         if not ch_id:
             await interaction.response.send_message(
                 "❌ `TICKET_PANEL_CHANNEL_ID` is not set in settings.py.", ephemeral=True)
             return
-        channel = interaction.guild.get_channel(ch_id) if interaction.guild else None
-        if channel is None:
-            try:
-                channel = await interaction.client.fetch_channel(ch_id)
-            except Exception:
-                channel = None
+        channel = await self._resolve_panel_channel()
         if channel is None:
             await interaction.response.send_message(
                 f"❌ Could not find the panel channel (`{ch_id}`).", ephemeral=True)
             return
-
-        e = discord.Embed(
-            title="📩 Need help or want to report something?",
-            description=(
-                "Open a **private ticket** that only you and the moderators can see.\n\n"
-                "🚨 **Report a user** — rule-breaking, account sharing, harassment…\n"
-                "🐛 **Report a bug / issue** — something in the bot or KSP mod is broken.\n"
-                "💬 **Something else** — questions, requests, anything.\n\n"
-                "Press the button below and pick a reason."
-            ),
-            color=discord.Color.blurple(),
-        )
-        await channel.send(embed=e, view=TicketPanelView())
+        try:
+            await channel.send(embed=_panel_embed(), view=TicketPanelView())
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                f"❌ I don't have permission to post in {channel.mention} "
+                "(need View Channel + Send Messages + Embed Links).", ephemeral=True)
+            return
         await interaction.response.send_message(
             f"✅ Ticket panel posted in {channel.mention}.", ephemeral=True)
 

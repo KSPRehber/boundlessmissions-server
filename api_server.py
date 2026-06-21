@@ -10,12 +10,13 @@ No API keys, Firebase creds, or secrets are exposed to clients.
 import asyncio
 import io
 import logging
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List
 
 from fastapi import (
-    FastAPI, Depends, HTTPException, Header, UploadFile, File, Form,
+    FastAPI, Depends, HTTPException, Header, UploadFile, File, Form, Request,
     WebSocket, WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,9 +26,10 @@ import settings
 from config import cfg
 from api_auth import (
     validate_link_code, create_session_token, verify_session_token,
+    logout_all_devices, create_2fa_challenge, verify_2fa_challenge,
 )
 from api_models import (
-    LinkRequest, LinkResponse,
+    LinkRequest, LinkResponse, TwoFARequest,
     UserProfile,
     WeeklyMissionsResponse, Mission, MissionSelectRequest, MissionSelectResponse,
     ContractSummary, ContractListResponse, ContractAcceptResponse,
@@ -128,7 +130,75 @@ def _push_notification(gid: int, uid: int, payload: dict):
 # ── Auth Dependency ──────────────────────────────────────────────────────────
 
 def _get_api_secret() -> str:
-    return getattr(cfg, "API_SECRET_KEY", "gk-default-secret-change-me")
+    # config.py refuses to start with a blank/default secret when the KSP API is
+    # enabled, so this is always a real key here.
+    return cfg.API_SECRET_KEY
+
+
+# ── Rate limiting (link / 2FA brute-force defense) ───────────────────────────
+#
+# The link and 2FA endpoints accept short numeric codes, so they're the only
+# guessable attack surface. A simple in-memory sliding window (per-IP and a
+# global cap) keeps an attacker from sweeping the code space within a code's
+# 3-minute life. In-process is sufficient: the bot is a single process.
+
+_RATE_BUCKETS: dict[str, list[float]] = {}
+_last_bucket_sweep: float = 0.0
+
+
+def _sweep_rate_buckets(now: float):
+    """Drop buckets with no recent hits so the dict can't grow unboundedly with
+    one entry per IP ever seen. Cheap: runs at most every 5 minutes."""
+    global _last_bucket_sweep
+    if now - _last_bucket_sweep < 300:
+        return
+    _last_bucket_sweep = now
+    for k in list(_RATE_BUCKETS.keys()):
+        recent = [t for t in _RATE_BUCKETS[k] if now - t < 120]
+        if recent:
+            _RATE_BUCKETS[k] = recent
+        else:
+            del _RATE_BUCKETS[k]
+
+
+def _rate_limit(key: str, max_hits: int, window: float):
+    """Record a hit for `key`; raise 429 if it exceeds max_hits within window."""
+    now = time.time()
+    _sweep_rate_buckets(now)
+    hits = [t for t in _RATE_BUCKETS.get(key, []) if now - t < window]
+    if len(hits) >= max_hits:
+        raise HTTPException(status_code=429, detail="Too many attempts. Wait a moment and try again.")
+    hits.append(now)
+    _RATE_BUCKETS[key] = hits
+
+
+def _client_ip(request: Request) -> str:
+    """The real client IP for rate limiting.
+
+    X-Forwarded-For is honored ONLY when the request's direct peer is a
+    configured trusted proxy — otherwise the header is attacker-controlled (each
+    forged value would mint a fresh bucket and defeat per-IP limiting), so we use
+    the raw socket peer. With trusted proxies set, walk the XFF chain from the
+    right past any trusted hops; the first untrusted address is the client.
+    """
+    peer = request.client.host if request.client else "unknown"
+    trusted = cfg.API_TRUSTED_PROXIES
+    if trusted and peer in trusted:
+        chain = [h.strip() for h in request.headers.get("x-forwarded-for", "").split(",") if h.strip()]
+        for hop in reversed(chain):
+            if hop not in trusted:
+                return hop
+    return peer
+
+
+def _guard_link_attempt(request: Request):
+    """Throttle link/2FA attempts: per-IP and globally."""
+    ip = _client_ip(request)
+    # Tuned for headroom on a shared public IP without ever approaching a
+    # feasible brute-force rate: even 60/min over a code's 3-min life is ~180
+    # guesses against a 1,000,000-code space. Raise if many players share one IP.
+    _rate_limit(f"link:{ip}", max_hits=10, window=60.0)    # 10 / min per IP
+    _rate_limit("link:global", max_hits=60, window=60.0)   # 60 / min overall
 
 
 async def get_current_user(authorization: str = Header(...)) -> dict:
@@ -146,24 +216,85 @@ async def get_current_user(authorization: str = Header(...)) -> dict:
 
 # ── Auth Endpoints ───────────────────────────────────────────────────────────
 
-@app.post("/api/v1/auth/link", response_model=LinkResponse)
-async def auth_link(req: LinkRequest):
-    """Exchange a 6-digit link code for a session token."""
-    result = validate_link_code(req.code)
-    if result is None:
-        raise HTTPException(status_code=400, detail="Invalid or expired link code")
-
+def _issue_link_token(result: dict) -> LinkResponse:
+    """Mint a session token for a validated identity and return the linked response."""
     token = create_session_token(
         result["guild_id"], result["user_id"], result["username"],
         _get_api_secret(),
     )
-
     return LinkResponse(
+        status="ok",
         token=token,
         username=result["username"],
         guild_id=result["guild_id"],
         user_id=result["user_id"],
     )
+
+
+async def _dm_2fa_code(user_id: int, otp: str) -> bool:
+    """DM the 2FA code to the Discord user. Returns False if it couldn't be sent."""
+    if not _bot_instance:
+        return False
+    try:
+        import discord
+        u = await _bot_instance.fetch_user(user_id)
+        e = discord.Embed(
+            title="🔐 KSP Login Verification",
+            description=(
+                f"Your KSP linking code:\n\n# `{otp}`\n\n"
+                "Enter it in KSP to finish linking. Expires in 3 minutes.\n"
+                "If you didn't try to link KSP, ignore this — someone may have "
+                "your link code."
+            ),
+            color=discord.Color.orange(),
+        )
+        await u.send(embed=e)
+        return True
+    except Exception as exc:
+        log.warning("Could not DM 2FA code to user %s: %s", user_id, exc)
+        return False
+
+
+@app.post("/api/v1/auth/link", response_model=LinkResponse)
+async def auth_link(req: LinkRequest, request: Request):
+    """Exchange a 6-digit link code for a session token (or a 2FA challenge)."""
+    _guard_link_attempt(request)
+
+    result = validate_link_code(req.code)
+    if result is None:
+        raise HTTPException(status_code=400, detail="Invalid or expired link code")
+
+    # 2FA off → link immediately.
+    if not cfg.KSP_2FA_ENABLED:
+        return _issue_link_token(result)
+
+    # 2FA on → DM a one-time code and wait for /auth/link/2fa. The link code is
+    # already consumed, so a failed DM means this attempt can't proceed.
+    challenge_id, otp = create_2fa_challenge(
+        result["guild_id"], result["user_id"], result["username"])
+    sent = await _dm_2fa_code(int(result["user_id"]), otp)
+    if not sent:
+        raise HTTPException(
+            status_code=502,
+            detail="Couldn't DM your verification code. Enable DMs from server "
+                   "members in Discord, then request a new link code.",
+        )
+
+    log.info("KSP: 2FA challenge issued for %s", result["username"])
+    return LinkResponse(status="2fa_required", challenge_id=challenge_id)
+
+
+@app.post("/api/v1/auth/link/2fa", response_model=LinkResponse)
+async def auth_link_2fa(req: TwoFARequest, request: Request):
+    """Complete linking by submitting the code DM'd to the user."""
+    _guard_link_attempt(request)
+
+    result = verify_2fa_challenge(req.challenge_id, req.code)
+    if result is None:
+        raise HTTPException(status_code=400, detail="Invalid or expired verification code")
+
+    log.info("KSP: 2FA verified, linking %s", result["username"])
+    return _issue_link_token(result)
 
 
 @app.get("/api/v1/auth/verify", response_model=UserProfile)
@@ -184,6 +315,20 @@ async def auth_verify(user: dict = Depends(get_current_user)):
         unlocked_levels=u.get("unlocked_levels", []),
         currency_name=settings.CURRENCY_NAME,
     )
+
+
+@app.post("/api/v1/auth/logout_all")
+async def auth_logout_all(user: dict = Depends(get_current_user)):
+    """Log the current user out of every device.
+
+    The user's own privacy control for an account left linked somewhere else.
+    Bumps their token version so every session token — including this caller's —
+    is rejected from here on; each device drops to its unlinked state on its next
+    request. Not an admin action: a user can only log out their own sessions.
+    """
+    new_version = logout_all_devices(user["user_id"])
+    log.info("KSP: %s logged out of all devices", user["username"])
+    return {"success": True, "token_version": new_version}
 
 
 # ── User Profile ─────────────────────────────────────────────────────────────

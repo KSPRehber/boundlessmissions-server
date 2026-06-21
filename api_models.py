@@ -11,11 +11,19 @@ from typing import Optional
 class LinkRequest(BaseModel):
     code: str = Field(..., min_length=6, max_length=6, description="6-digit link code from Discord")
 
+class TwoFARequest(BaseModel):
+    challenge_id: str = Field(..., description="Challenge id returned by the link step")
+    code: str = Field(..., min_length=6, max_length=6, description="6-digit code from the Discord DM")
+
 class LinkResponse(BaseModel):
-    token: str
-    username: str
-    guild_id: str
-    user_id: str
+    # status: "ok" → linked, token populated. "2fa_required" → enter the DM'd
+    # code via /auth/link/2fa using challenge_id; token stays empty for now.
+    status: str = "ok"
+    token: str = ""
+    username: str = ""
+    guild_id: str = ""
+    user_id: str = ""
+    challenge_id: Optional[str] = None
 
 class AuthError(BaseModel):
     detail: str

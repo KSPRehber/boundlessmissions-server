@@ -60,7 +60,27 @@ class Config:
     KSP_API_ENABLED: bool = _optional("KSP_API_ENABLED", "true").lower() not in ("false", "0", "no", "off")
     API_HOST: str = _optional("API_HOST", "0.0.0.0")
     API_PORT: int = int(_optional("API_PORT", "5022"))
-    API_SECRET_KEY: str = _optional("API_SECRET_KEY", "gk-change-this-secret-key")
+    API_SECRET_KEY: str = _optional("API_SECRET_KEY", "")
+
+    # Discord DM 2FA for KSP account linking. When on, a valid link code only
+    # earns a one-time code DM'd to the user, which must be entered to finish
+    # linking. Default on (secure); set KSP_2FA_ENABLED=false in .env to skip it
+    # while testing.
+    KSP_2FA_ENABLED: bool = _optional("KSP_2FA_ENABLED", "true").lower() not in ("false", "0", "no", "off")
+
+    # IPs of trusted reverse proxies (comma-separated, e.g. "127.0.0.1"). When a
+    # request's direct peer is one of these, the real client IP is read from
+    # X-Forwarded-For for rate limiting. Leave empty when clients connect the API
+    # directly — the header is attacker-controlled and is ignored unless the peer
+    # is a configured proxy.
+    _raw_proxies = _optional("API_TRUSTED_PROXIES", "")
+    API_TRUSTED_PROXIES: set[str] = {p.strip() for p in _raw_proxies.split(",") if p.strip()}
+
+    # Optional direct TLS for the in-process API server. Set BOTH to serve HTTPS
+    # straight from uvicorn (no proxy). Leave empty when terminating TLS at a
+    # reverse proxy (the recommended setup) or on localhost.
+    API_SSL_CERTFILE: str = _optional("API_SSL_CERTFILE", "")
+    API_SSL_KEYFILE: str = _optional("API_SSL_KEYFILE", "")
 
     # ── Firebase / Firestore ────────────────────
     # Path to the Firebase service account JSON key file
@@ -71,6 +91,22 @@ class Config:
 
 
 cfg = Config()
+
+# The API secret signs every KSP session token. A blank or placeholder value
+# means the signing key is publicly known, letting anyone forge a token for any
+# user — so refuse to start with one (unless the KSP API is disabled entirely).
+_DEFAULT_API_SECRETS = {
+    "", "gk-change-this-secret-key", "gk-default-secret-change-me",
+    "your_random_secret_here",
+}
+if cfg.KSP_API_ENABLED and cfg.API_SECRET_KEY.strip() in _DEFAULT_API_SECRETS:
+    raise EnvironmentError(
+        "API_SECRET_KEY is unset or still a default placeholder. It signs KSP "
+        "session tokens; with a known value anyone can forge a token for any "
+        "user. Set a strong random value in .env, e.g.:\n"
+        "    python -c \"import secrets; print(secrets.token_urlsafe(48))\"\n"
+        "Or disable the KSP API with KSP_API_ENABLED=false."
+    )
 
 # Configure root logger once here so every module inherits it
 logging.basicConfig(

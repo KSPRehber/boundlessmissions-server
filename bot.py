@@ -342,16 +342,28 @@ async def main() -> None:
             import uvicorn
             from api_server import app as api_app
 
+            # Serve HTTPS directly if a cert+key are configured; otherwise plain
+            # HTTP (fine on localhost or behind a TLS-terminating reverse proxy).
+            ssl_kwargs = {}
+            scheme = "http"
+            if cfg.API_SSL_CERTFILE and cfg.API_SSL_KEYFILE:
+                ssl_kwargs = {
+                    "ssl_certfile": cfg.API_SSL_CERTFILE,
+                    "ssl_keyfile": cfg.API_SSL_KEYFILE,
+                }
+                scheme = "https"
+
             api_config = uvicorn.Config(
                 api_app,
                 host=cfg.API_HOST,
                 port=cfg.API_PORT,
                 log_level="info",
                 access_log=False,
+                **ssl_kwargs,
             )
             api_server = uvicorn.Server(api_config)
             asyncio.create_task(api_server.serve())
-            log.info("KSP API server starting on %s:%d", cfg.API_HOST, cfg.API_PORT)
+            log.info("KSP API server starting on %s://%s:%d", scheme, cfg.API_HOST, cfg.API_PORT)
         else:
             log.info("KSP API server: DISABLED (KSP_API_ENABLED=false)")
 

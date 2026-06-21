@@ -32,10 +32,10 @@ _gk_channels: dict[str, set[str]] = {}
 from i18n import S
 
 S.update({
-    "gk.channel_enabled":     {"en": "✅ This channel is now a Gene Kerman channel."},
-    "gk.channel_disabled":    {"en": "❌ This channel is no longer a Gene Kerman channel."},
-    "gk.wrong_channel":       {"en": "⚠️ Your message was deleted. You can only interact with Gene Kerman in GK channels.\n\nGK channels: {channels}"},
-    "gk.cmd_wrong_channel":   {"en": "❌ You can only use this command in Gene Kerman channels.\n\nGK channels: {channels}"},
+    "gk.channel_enabled":     {"en": "✅ This channel is now a Boundless Missions channel."},
+    "gk.channel_disabled":    {"en": "❌ This channel is no longer a Boundless Missions channel."},
+    "gk.wrong_channel":       {"en": "⚠️ Your message was deleted. You can only interact with Boundless Missions in its channels.\n\nBoundless Missions channels: {channels}"},
+    "gk.cmd_wrong_channel":   {"en": "❌ You can only use this command in Boundless Missions channels.\n\nBoundless Missions channels: {channels}"},
 })
 
 
@@ -140,7 +140,7 @@ class GKChannels(commands.Cog, name="GKChannels"):
     # ── /setchannel (mod toggle) ─────────────────────────────────────────────
     @app_commands.command(
         name="setchannel",
-        description="Toggle this channel as a Gene Kerman channel (Mod only)",
+        description="Toggle this channel as a Boundless Missions channel (Mod only)",
     )
     @app_commands.default_permissions(kick_members=True)
     @mod_only()

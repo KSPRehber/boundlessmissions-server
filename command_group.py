@@ -14,7 +14,7 @@ from config import cfg
 if cfg.COMMAND_GROUP:
     gk = app_commands.Group(
         name=cfg.COMMAND_GROUP.lower(),
-        description="Gene Kerman bot commands",
+        description="Boundless Missions bot commands",
     )
 else:
     gk = None

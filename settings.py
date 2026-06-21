@@ -100,6 +100,21 @@ CONTRACT_MOD_CHANNEL_ID: int | None = 1513934242315374744
 # Allow users to send contracts to themselves (for testing only!)
 CONTRACT_ALLOW_SELF = False
 
+# ── Auctions (reverse / Dutch) ───────────────────────────────────────────────
+# An issuer posts a mission with a STARTING price (escrowed up front). Contractors
+# bid the price DOWN; the lowest bid when the auction ends wins and is bound to an
+# active contract for that amount. The leftover escrow is refunded to the issuer.
+# Channel where auctions are posted. None disables the /auction command.
+AUCTION_CHANNEL_ID: int | None = 1518305724667527198
+# A new bid must undercut the current lowest by at least this many KCoins.
+AUCTION_MIN_DECREMENT = 1
+# Bids placed within this many seconds of the end push the end back by the same
+# amount (anti-snipe). Set to 0 to disable.
+AUCTION_ANTISNIPE_SECONDS = 60
+# Bounds on how long an auction may run (hours).
+AUCTION_MIN_DURATION_HOURS = 1
+AUCTION_MAX_DURATION_HOURS = 168  # 7 days
+
 # ── Marketplace ──────────────────────────────────────────────────────────────
 
 # Channel where craft sale listings are posted. Set to None to disable the

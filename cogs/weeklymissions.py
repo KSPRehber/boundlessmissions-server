@@ -270,7 +270,7 @@ async def _handle_selection(interaction: discord.Interaction, week_key: str, gui
     c = cdb.create_contract(
         guild_id=guild_id,
         issuer_id=interaction.client.user.id,
-        issuer_name="Gene Kerman",
+        issuer_name="Boundless Missions",
         contractor_id=uid,
         contractor_name=interaction.user.display_name,
         mission=desc,
@@ -374,7 +374,7 @@ class CustomMissionAcceptView(discord.ui.View):
         c = cdb.create_contract(
             guild_id=guild_id,
             issuer_id=interaction.client.user.id,
-            issuer_name="Gene Kerman",
+            issuer_name="Boundless Missions",
             contractor_id=uid,
             contractor_name=interaction.user.display_name,
             mission=desc,

@@ -38,7 +38,7 @@ from api_models import (
     WeeklyMissionsResponse, Mission, MissionSelectRequest, MissionSelectResponse,
     ContractSummary, ContractListResponse, ContractAcceptResponse,
     PartCatalogUpload, PartCatalogResponse,
-    CorpInfo, CorpListResponse, ContractCreateRequest, ContractReviewRequest,
+    CorpInfo, CorpListResponse, ContractCreateRequest, AuctionCreateRequest, ContractReviewRequest,
     ContractDisputeRequest, RescueTarget,
     SubmissionResult, FlightSubmission, VesselSnapshot,
     Notification, NotificationsResponse,
@@ -62,7 +62,7 @@ TZ = timezone(timedelta(hours=3))
 # ── FastAPI App ──────────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title="Gene Kerman KSP Bridge API",
+    title="Boundless Missions KSP Bridge API",
     version="1.0.0",
     docs_url="/api/docs",
     redoc_url=None,
@@ -263,7 +263,7 @@ def enforce_mod_version(x_mod_hash: str) -> None:
             "latest_version": cfg_doc.get("latest_version"),
             "latest_hash": latest_hash,
             "download_url": cfg_doc.get("download_url"),
-            "message": "Your Gene Kerman mod is out of date. Update to keep playing.",
+            "message": "Your Boundless Missions mod is out of date. Update to keep playing.",
         })
 
 
@@ -1178,7 +1178,7 @@ async def select_mission(req: MissionSelectRequest, user: dict = Depends(get_cur
     c = cdb.create_contract(
         guild_id=gid,
         issuer_id=bot_user_id,
-        issuer_name="Gene Kerman",
+        issuer_name="Boundless Missions",
         contractor_id=uid,
         contractor_name=user["username"],
         mission=mission["desc_en"],
@@ -1898,6 +1898,61 @@ async def create_contract_from_ksp(req: ContractCreateRequest, user: dict = Depe
              user["username"], c["contract_id"], contractor_id, req.payment)
 
     return ContractAcceptResponse(success=True, message=f"Contract sent! ID: {c['contract_id']}")
+
+
+@app.post("/api/v1/auctions/create", response_model=ContractAcceptResponse)
+async def create_auction_from_ksp(req: AuctionCreateRequest, user: dict = Depends(get_current_user)):
+    """Open a reverse auction from the KSP mod. Escrows start_value, posts it to the
+    Discord auction channel; bidding/closing happen in Discord."""
+    from datetime import date
+
+    gid = int(user["guild_id"])
+    uid = int(user["user_id"])
+
+    if not settings.AUCTION_CHANNEL_ID:
+        return ContractAcceptResponse(success=False, message="Auctions are not configured on this server.")
+    if not (settings.AUCTION_MIN_DURATION_HOURS <= req.duration_hours <= settings.AUCTION_MAX_DURATION_HOURS):
+        return ContractAcceptResponse(
+            success=False,
+            message=f"Duration must be {settings.AUCTION_MIN_DURATION_HOURS}–{settings.AUCTION_MAX_DURATION_HOURS} hours.",
+        )
+    try:
+        dt = datetime.strptime(req.due_date, "%Y-%m-%d").date()
+        if dt <= date.today():
+            return ContractAcceptResponse(success=False, message="Due date must be in the future.")
+    except ValueError:
+        return ContractAcceptResponse(success=False, message="Invalid date format. Use YYYY-MM-DD.")
+
+    bal = store.get_user(gid, uid).get("balance", 0)
+    if bal < req.start_value:
+        return ContractAcceptResponse(
+            success=False,
+            message=f"Insufficient balance ({req.start_value} needed, you have {bal}).",
+        )
+    if cdb.count_active(gid, uid) >= settings.MAX_ACTIVE_CONTRACTS_PER_USER:
+        return ContractAcceptResponse(
+            success=False,
+            message=f"Active contract limit reached ({settings.MAX_ACTIVE_CONTRACTS_PER_USER}).",
+        )
+    if not _bot_instance:
+        return ContractAcceptResponse(success=False, message="Bot is offline — try again shortly.")
+
+    # Only the build/active types carry through to the winner's contract.
+    mission_type = req.contract_type if req.contract_type in ("craft_build", "active_vessel") else None
+    try:
+        from cogs.auctions import open_auction
+        a = await open_auction(
+            _bot_instance, gid, uid, user["username"], req.mission,
+            req.start_value, req.fine, req.due_date, req.duration_hours, req.modlist,
+            mission_type=mission_type,
+        )
+    except Exception as exc:
+        log.error("KSP auction create failed for user %d: %s", uid, exc)
+        return ContractAcceptResponse(success=False, message="Could not post the auction. Try again.")
+
+    log.info("KSP: %s opened auction %s (start %d, %dh)",
+             user["username"], a["auction_id"], req.start_value, req.duration_hours)
+    return ContractAcceptResponse(success=True, message="Auction posted to Discord!")
 
 
 # Stock Kerbol-system bodies — used as a server-side fallback to flag a rescue

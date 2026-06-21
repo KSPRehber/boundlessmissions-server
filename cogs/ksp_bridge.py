@@ -27,7 +27,7 @@ log = logging.getLogger(__name__)
 S.update({
     "ksp.linkcode.title":  {"en": "🎮 KSP Link Code"},
     "ksp.linkcode.desc":   {"en": "Enter this code in KSP:\n\n# `{code}`\n\n⏰ Expires in 3 minutes."},
-    "ksp.linkcode.footer": {"en": "Gene Kerman KSP Mod"},
+    "ksp.linkcode.footer": {"en": "Boundless Missions KSP Mod"},
     "ksp.linked.title":    {"en": "✅ KSP Linked"},
     "ksp.linked.desc":     {"en": "Your KSP account has been linked successfully!"},
 })
@@ -334,14 +334,14 @@ class KSPBridge(commands.Cog, name="KSPBridge"):
         log.info("%s generated KSP link code", interaction.user)
 
     @app_commands.command(name="privacy",
-                          description="How Gene Kerman uses your data, and how to delete it")
+                          description="How Boundless Missions uses your data, and how to delete it")
     async def privacy(self, interaction: discord.Interaction):
         """Show a privacy/terms summary and links."""
         e = discord.Embed(
             title="🔒 Privacy & Terms",
             color=discord.Color.blurple(),
             description=(
-                "**What Gene Kerman stores about you:**\n"
+                "**What Boundless Missions stores about you:**\n"
                 "• Your Discord ID and gameplay progress (XP, balance, levels, "
                 "contracts, corp, marketplace).\n"
                 "• KSP linking & security: a session token (on your device) and a "
@@ -363,7 +363,7 @@ class KSPBridge(commands.Cog, name="KSPBridge"):
         await interaction.response.send_message(embed=e, ephemeral=True)
 
     @app_commands.command(name="deletemydata",
-                          description="Permanently delete all your Gene Kerman data")
+                          description="Permanently delete all your Boundless Missions data")
     async def deletemydata(self, interaction: discord.Interaction):
         """Open a confirmation modal, then erase the user's data."""
         if interaction.guild_id is None:

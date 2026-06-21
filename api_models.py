@@ -226,6 +226,21 @@ class ContractCreateRequest(BaseModel):
     contract_type: str = "auto"
 
 
+class AuctionCreateRequest(BaseModel):
+    """Open a reverse (Dutch) auction from the KSP mod. No contractor — it's open
+    to everyone in Discord; the lowest bidder when it ends is bound to the contract.
+    start_value is escrowed up front; the leftover is refunded when it closes."""
+    mission: str = Field(..., min_length=3, max_length=500)
+    start_value: int = Field(..., gt=0)
+    fine: int = Field(default=0, ge=0)
+    due_date: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$")
+    duration_hours: int = Field(..., gt=0)
+    modlist: Optional[str] = None  # mods required / limited to
+    # craft_build / active_vessel — inherited by the winner's contract. Other
+    # values (or null) are ignored, leaving the contract untyped.
+    contract_type: Optional[str] = None
+
+
 class ContractReviewRequest(BaseModel):
     approve: bool  # True = accept the submission, False = refuse (→ dispute)
 

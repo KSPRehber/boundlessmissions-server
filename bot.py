@@ -130,6 +130,7 @@ class GeneKermanBot(commands.Bot):
             "cogs.gkchannels",
             "cogs.screenshots",
             "cogs.contracts",
+            "cogs.auctions",
             "cogs.weeklymissions",
             "cogs.roles",
             "cogs.ksp_bridge",
@@ -183,7 +184,7 @@ class GeneKermanBot(commands.Bot):
 
             parent = GKGroup(
                 name=group_name,
-                description="Gene Kerman bot commands",
+                description="Boundless Missions bot commands",
             )
 
             admin_group = app_commands.Group(

@@ -301,7 +301,7 @@ class TicketModal(Modal):
         )
         if channel is None:
             await interaction.followup.send(
-                "⚠️ Couldn't open a ticket right now — the ticket system may be "
+                "⚠️ Couldn't open a ticket right now; the ticket system may be "
                 "misconfigured. Please ping a moderator directly.", ephemeral=True)
             return
         await interaction.followup.send(
@@ -367,9 +367,9 @@ def _panel_embed() -> discord.Embed:
         title="📩 Need help or want to report something?",
         description=(
             "Open a **private ticket** that only you and the moderators can see.\n\n"
-            "🚨 **Report a user** — rule-breaking, account sharing, harassment…\n"
-            "🐛 **Report a bug / issue** — something in the bot or KSP mod is broken.\n"
-            "💬 **Something else** — questions, requests, anything.\n\n"
+            "🚨 **Report a user**: rule-breaking, account sharing, harassment…\n"
+            "🐛 **Report a bug / issue**: something in the bot or KSP mod is broken.\n"
+            "💬 **Something else**: questions, requests, anything.\n\n"
             "Press the button below and pick a reason."
         ),
         color=discord.Color.blurple(),

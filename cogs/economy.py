@@ -129,7 +129,7 @@ class Economy(commands.Cog, name="Economy"):
             prefix = medals[i] if i < 3 else f"`{i + 1}.`"
             member = interaction.guild.get_member(int(uid))
             name = member.display_name if member else f"User {uid}"
-            lines.append(f"{prefix} **{name}** — {settings.CURRENCY_SYMBOL} `{data['balance']:,}`")
+            lines.append(f"{prefix} **{name}** · {settings.CURRENCY_SYMBOL} `{data['balance']:,}`")
 
         if not lines:
             await interaction.response.send_message(t(gid, "eco.richest.empty"), ephemeral=True)

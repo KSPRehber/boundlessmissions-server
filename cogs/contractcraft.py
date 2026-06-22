@@ -55,7 +55,7 @@ class CorpLoadButton(DynamicItem[Button], template=r"cc_load:" + _ID_PATTERN):
         # No self-imports — the builder already has their own work.
         if str(interaction.user.id) == str(c.get("contractor_id")):
             await interaction.followup.send(
-                "❌ You built this craft — you can't import your own work.", ephemeral=True)
+                "❌ You built this craft, so you can't import your own work.", ephemeral=True)
             return
 
         cf = craft_files[0]

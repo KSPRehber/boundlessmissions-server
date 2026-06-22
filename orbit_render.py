@@ -89,7 +89,7 @@ def _num(v: Any) -> float | None:
 def _fmt_alt(metres: float | None) -> str:
     """Human-readable altitude: m / km / Mm."""
     if metres is None:
-        return "—"
+        return "N/A"
     a = abs(metres)
     if a >= 1_000_000_000:
         return f"{metres / 1_000_000_000:.2f} Gm"
@@ -102,7 +102,7 @@ def _fmt_alt(metres: float | None) -> str:
 
 def _fmt_period(seconds: float | None) -> str:
     if seconds is None or seconds <= 0:
-        return "—"
+        return "N/A"
     s = int(seconds)
     d, s = divmod(s, 86400)
     h, s = divmod(s, 3600)
@@ -388,12 +388,12 @@ def _render(vd: dict) -> bytes | None:
     _draw_panel(draw, fonts, {
         "vessel": vessel_name,
         "body": str(body_name),
-        "situation": situation.title() if situation else "—",
-        "apoapsis": _fmt_alt(apo_alt) if has_orbit else "—",
-        "periapsis": _fmt_alt(peri_alt) if has_orbit else "—",
-        "inclination": f"{incl:.1f}°" if incl is not None else "—",
-        "eccentricity": f"{ecc:.4f}" if has_orbit else "—",
-        "period": _fmt_period(period) if has_orbit else "—",
+        "situation": situation.title() if situation else "N/A",
+        "apoapsis": _fmt_alt(apo_alt) if has_orbit else "N/A",
+        "periapsis": _fmt_alt(peri_alt) if has_orbit else "N/A",
+        "inclination": f"{incl:.1f}°" if incl is not None else "N/A",
+        "eccentricity": f"{ecc:.4f}" if has_orbit else "N/A",
+        "period": _fmt_period(period) if has_orbit else "N/A",
     }, known=not rec.get("unknown"))
 
     out = io.BytesIO()

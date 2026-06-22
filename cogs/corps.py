@@ -43,7 +43,7 @@ async def _create_corp_channel(
     channel = await guild.create_text_channel(
         name=f"corp-{name}",
         category=category,
-        topic=f"🏢 {name} — Founded by {owner.display_name}",
+        topic=f"🏢 {name} · Founded by {owner.display_name}",
         reason=f"Corporation established by {owner}",
     )
 

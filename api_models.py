@@ -77,6 +77,10 @@ class VersionCheckResponse(BaseModel):
     download_url: Optional[str] = None
     your_version: Optional[str] = None
     message: Optional[str] = None
+    # Current Privacy Policy / Terms version the client must have accepted. When
+    # this exceeds the version recorded in the client's consent.cfg, the mod
+    # re-prompts the opt-in gate and stops transmitting until the player re-accepts.
+    policy_version: Optional[int] = None
 
 
 # ── User Profile ─────────────────────────────────────────────────────────────

@@ -41,8 +41,13 @@ _bucket_name = os.getenv("FIREBASE_STORAGE_BUCKET", "")
 _app = firebase_admin.initialize_app(_cred, {
     "storageBucket": _bucket_name,
 } if _bucket_name else None)
-_db = firestore.client()
-_storage_bucket = fb_storage.bucket() if _bucket_name else None
+from data.firebase_guard import wrap_firestore, wrap_bucket
+
+# All Firestore / Storage access flows through these two handles (every cog
+# imports them from here), so wrapping them is enough to meter spend and enforce
+# the Firebase budget cap project-wide. See cost_guard.py / firebase_guard.py.
+_db = wrap_firestore(firestore.client())
+_storage_bucket = wrap_bucket(fb_storage.bucket() if _bucket_name else None)
 if _storage_bucket:
     log.info("Firebase Storage configured: %s", _bucket_name)
 else:

@@ -49,7 +49,9 @@ from api_models import (
 from data.store import store, _db, _storage_bucket
 from data import contracts as cdb
 from data import mod_version as mver
+from data import policy as policy
 from data import suspicion as susp
+from data import telemetry_check as tcheck
 from data import mission_constraints as mc
 from data import part_resolver as pr
 from data import marketplace as mkt
@@ -94,6 +96,8 @@ MAX_UPLOAD_BYTES = 25 * 1024 * 1024          # per uploaded file (craft, screens
 MAX_LOG_BYTES = 60 * 1024 * 1024             # KSP.log diagnostics can be large
 MAX_DECOMPRESSED_BYTES = 64 * 1024 * 1024    # cap on any single gzip expansion
 MAX_REQUEST_BYTES = 80 * 1024 * 1024         # whole-request guard (a submission carries several files)
+_LOG_HEAD_BYTES = 2_000_000                  # KSP.log: keep the first 2 MB (mod list, system specs)
+_LOG_TAIL_BYTES = 7_000_000                  # KSP.log: keep the last 7 MB (most recent events)
 
 
 @app.middleware("http")
@@ -219,6 +223,21 @@ def broadcast_version_update():
         log.info("WS: broadcast version-update poke to live clients")
     except Exception as exc:
         log.warning("WS: failed to broadcast version update: %s", exc)
+
+
+def broadcast_policy_update():
+    """Poke every connected KSP client to re-fetch the policy version. Called after
+    the Privacy Policy / Terms version is bumped so already-running clients raise
+    the re-consent gate live instead of only on their next restart. Clients learn
+    the new version from /version/check, so this just nudges them to re-check.
+    Safe no-op if the API server isn't up yet."""
+    if _loop is None:
+        return
+    try:
+        asyncio.run_coroutine_threadsafe(_hub.broadcast({"type": "policy"}), _loop)
+        log.info("WS: broadcast policy-update poke to live clients")
+    except Exception as exc:
+        log.warning("WS: failed to broadcast policy update: %s", exc)
 
 
 # ── Auth Dependency ──────────────────────────────────────────────────────────
@@ -398,7 +417,7 @@ async def _dm_login_approval(user_id: int, challenge_id: str, client_ip: str) ->
                 "A KSP client just entered your link code and wants to sign in as you.\n\n"
                 f"**When:** {when}\n**From IP:** `{where}`\n\n"
                 "If this is you, press **✅ Log in**. If you didn't try to link KSP, "
-                "press **🚫 Not me** — someone may have your link code.\n"
+                "press **🚫 Not me**, since someone may have your link code.\n"
                 "This request expires in 3 minutes."
             ),
             color=discord.Color.orange(),
@@ -486,12 +505,12 @@ async def _dm_device_approval(user_id: int, challenge_id: str,
                 "**Did you just switch PCs, reinstall, or clear the mod's files?**\n"
                 "→ Press **✅ Yes, it's me** to trust this device.\n\n"
                 "**Not sure which PC this is?**\n"
-                "→ Press **🔔 Ping this PC** — the blocked PC will flash an "
+                "→ Press **🔔 Ping this PC** and the blocked PC will flash an "
                 "*“Is this you?”* alert on its screen, so you can check before reporting.\n\n"
                 "If this wasn't you, someone may be using your account. Press "
-                "**🚫 No — report** to alert the moderators.\n\n"
-                "⚠️ Try **✅ Yes, it's me** first if you changed anything yourself — "
-                "only report if you're sure it wasn't you."
+                "**🚫 No, report it** to alert the moderators.\n\n"
+                "⚠️ Try **✅ Yes, it's me** first if you changed anything yourself, "
+                "and only report if you're sure it wasn't you."
             ),
             color=discord.Color.orange(),
         )
@@ -517,7 +536,7 @@ async def _post_device_report(target: dict, mac: str, log_bytes: bytes | None):
         import discord
         ch = _bot_instance.get_channel(int(ch_id)) or await _bot_instance.fetch_channel(int(ch_id))
         e = discord.Embed(
-            title="📎 Device report — client diagnostics",
+            title="📎 Device report: client diagnostics",
             description=(
                 f"**User:** {target.get('username')} (`{target.get('user_id')}`)\n"
                 f"**Device id:** `{target.get('device_id')}`\n"
@@ -564,9 +583,16 @@ async def device_report(report_id: str,
     log.info("Device report %s received from user %s (mac=%s, log=%d bytes)",
              report_id, user.get("user_id"), "yes" if mac else "no",
              len(log_bytes) if log_bytes else 0)
-    # Cap the log to a Discord-friendly size (keep the tail — most recent events).
-    if log_bytes and len(log_bytes) > 7_000_000:
-        log_bytes = log_bytes[-7_000_000:]
+    # Cap the log to a Discord-friendly size. Keep both ends: the head carries the
+    # loaded-assembly/mod list and system specs (key for moderation), the tail carries
+    # the most recent events. Drop only the middle, marking where it was cut.
+    if log_bytes and len(log_bytes) > _LOG_HEAD_BYTES + _LOG_TAIL_BYTES:
+        head, tail = log_bytes[:_LOG_HEAD_BYTES], log_bytes[-_LOG_TAIL_BYTES:]
+        dropped = len(log_bytes) - _LOG_HEAD_BYTES - _LOG_TAIL_BYTES
+        marker = (f"\n\n... [GeneKerman: {dropped:,} bytes of log omitted "
+                  f"between the first {_LOG_HEAD_BYTES // 1_000_000} MB and "
+                  f"last {_LOG_TAIL_BYTES // 1_000_000} MB] ...\n\n").encode("utf-8")
+        log_bytes = head + marker + tail
     await _post_device_report(target, mac, log_bytes)
     mark_report_done(target["_doc_id"])
     return {"success": True}
@@ -617,6 +643,9 @@ async def version_check(hash: str = "", version: str = ""):
     version info. `hash` is the SHA256 of the client's GeneKerman.dll; `version`
     is its self-reported version label (display only).
     """
+    # Advertised independently of the DLL version gate: a policy bump must be able
+    # to force re-consent even when the update gate is off or nothing is published.
+    pver = policy.get_version()
     if not cfg.KSP_VERSION_CHECK_ENABLED:
         # Gate disabled — never tell a client to update, but still advertise the
         # published DLL hash so the client can always confirm the expected build.
@@ -625,8 +654,11 @@ async def version_check(hash: str = "", version: str = ""):
             enabled=False, up_to_date=True,
             latest_version=cfg_doc.get("latest_version"),
             latest_hash=(cfg_doc.get("latest_hash") or None),
-            your_version=version or None)
-    return VersionCheckResponse(**mver.check(hash, version))
+            your_version=version or None,
+            policy_version=pver)
+    resp = mver.check(hash, version)
+    resp["policy_version"] = pver
+    return VersionCheckResponse(**resp)
 
 
 # ── Anti-cheat: suspicion flagging → moderator ticket ─────────────────────────
@@ -797,12 +829,14 @@ async def _classify_missions(missions: list[dict], week_key: str) -> list[dict]:
 
     # No cache — run AI classification
     try:
-        from cogs.screenshots import _client as gemini_client, _MODEL
+        from cogs.screenshots import active_client, record_gemini, _MODEL
+        gemini_client = active_client()
     except Exception:
         gemini_client = None
+        record_gemini = lambda *_: None
 
     if not gemini_client:
-        # No AI — fall back to heuristic classification
+        # No AI (key missing OR monthly budget reached) — heuristic fallback.
         return _classify_heuristic(missions)
 
     # Build AI prompt
@@ -841,6 +875,7 @@ async def _classify_missions(missions: list[dict], week_key: str) -> list[dict]:
             contents=[types.Content(role="user", parts=[types.Part.from_text(text=prompt)])],
             config=types.GenerateContentConfig(temperature=0.1, max_output_tokens=2048),
         )
+        record_gemini(response)
         raw = response.text.strip()
         if raw.startswith("```"):
             raw = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]
@@ -994,9 +1029,11 @@ def _ai_resolve_part(mission_text: str):
     """Build an ai_resolver(loose, candidates)->name|None bound to this mission's
     text, or None when no AI is configured."""
     try:
-        from cogs.screenshots import _client as gemini_client, _MODEL
+        from cogs.screenshots import active_client, record_gemini, _MODEL
+        gemini_client = active_client()
     except Exception:
         gemini_client = None
+        record_gemini = lambda *_: None
     if not gemini_client:
         return None
 
@@ -1023,6 +1060,7 @@ def _ai_resolve_part(mission_text: str):
                 contents=[types.Content(role="user", parts=[types.Part.from_text(text=prompt)])],
                 config=types.GenerateContentConfig(temperature=0.0, max_output_tokens=64),
             )
+            record_gemini(resp)
             ans = (resp.text or "").strip().strip("`").splitlines()[0].strip()
             if not ans or ans.upper() == "NONE":
                 return None
@@ -1068,9 +1106,11 @@ async def _classify_single_contract(gid: int, contract_id: str, mission_text: st
     """
     # Try AI first
     try:
-        from cogs.screenshots import _client as gemini_client, _MODEL
+        from cogs.screenshots import active_client, record_gemini, _MODEL
+        gemini_client = active_client()
     except Exception:
         gemini_client = None
+        record_gemini = lambda *_: None
 
     if gemini_client:
         from google.genai import types
@@ -1130,6 +1170,7 @@ async def _classify_single_contract(gid: int, contract_id: str, mission_text: st
                 contents=[types.Content(role="user", parts=[types.Part.from_text(text=prompt)])],
                 config=types.GenerateContentConfig(temperature=0.1, max_output_tokens=512),
             )
+            record_gemini(response)
             raw = response.text.strip()
             if raw.startswith("```"):
                 raw = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]
@@ -1538,7 +1579,7 @@ async def review_submission(contract_id: str, req: ContractReviewRequest,
             _create_notification(
                 gid, int(c["issuer_id"]), "flag_delivered",
                 "🚩 Flag Delivered",
-                "Your custom flag is queued — open KSP at the Space Center to install it "
+                "Your custom flag is queued. Open KSP at the Space Center to install it "
                 "into your flag picker.",
                 {"contract_id": contract_id},
             )
@@ -1990,7 +2031,7 @@ async def create_auction_from_ksp(req: AuctionCreateRequest, user: dict = Depend
             message=f"Active contract limit reached ({settings.MAX_ACTIVE_CONTRACTS_PER_USER}).",
         )
     if not _bot_instance:
-        return ContractAcceptResponse(success=False, message="Bot is offline — try again shortly.")
+        return ContractAcceptResponse(success=False, message="Bot is offline. Try again shortly.")
 
     # Only the build/active types carry through to the winner's contract.
     mission_type = req.contract_type if req.contract_type in ("craft_build", "active_vessel") else None
@@ -2151,7 +2192,7 @@ async def create_rescue_contract(
                 if member:
                     e = _embed(c, gid)
                     e.description = (f"🛟 **{user['username']}** needs a rescue at **{body}** "
-                                     f"({len(rescue_kerbals)} kerbal(s)) — via KSP!")
+                                     f"({len(rescue_kerbals)} kerbal(s)), via KSP!")
                     dm_msg = await member.send(embed=e, view=ContractOfferView(c["contract_id"], gid))
                     cdb.update_contract(gid, c["contract_id"], dm_message_id=str(dm_msg.id))
         except Exception as exc:
@@ -2244,7 +2285,7 @@ async def _deliver_rescue_craft(gid: int, contract_id: str, c: dict):
         log.warning("Could not record rescue stat for contract %s: %s", contract_id, exc)
     _create_notification(
         gid, issuer_id, "rescue_delivered", "🛟 Kerbals Returned!",
-        "Your rescued kerbals are home — the rescue craft will appear in your save.",
+        "Your rescued kerbals are home. The rescue craft will appear in your save.",
         {"contract_id": contract_id},
     )
     log.info("Rescue %s: delivered craft to issuer %d", contract_id, issuer_id)
@@ -2267,7 +2308,7 @@ async def _restore_issuer_vessel(gid: int, contract_id: str, c: dict):
     cdb.update_contract(gid, contract_id, issuer_vessel_removed=False)
     _create_notification(
         gid, issuer_id, "rescue_failed", "↩️ Rescue Cancelled",
-        "The rescue didn't go through — your vessel is being returned to its place.",
+        "The rescue didn't go through. Your vessel is being returned to its place.",
         {"contract_id": contract_id},
     )
     log.info("Rescue %s: restored issuer %d vessel", contract_id, issuer_id)
@@ -2353,7 +2394,7 @@ async def submit_contract(
                     gid, uid, user.get("username", ""), reason="illegal_mods",
                     details=(f"Craft submitted to contract `{contract_id}` used mods "
                              f"outside the allowed list: {', '.join(illegal)}. "
-                             "(Auto-rejected server-side; flagged only after repeats — "
+                             "(Auto-rejected server-side; flagged only after repeats, "
                              "may be an honest mod-loadout mistake.)"),
                     severity="medium")
                 return SubmissionResult(
@@ -2389,6 +2430,29 @@ async def submit_contract(
                     success=False,
                     message="Craft breaks this contract's mission limits:\n- " + "\n- ".join(violations),
                 )
+
+    # Server-side flight-telemetry consistency check (defense-in-depth, like the
+    # rescue/part-limit gates above). The client's orbital snapshot is over-determined,
+    # so a forged "I'm at the target" claim usually leaves the apoapsis/periapsis/sma/
+    # eccentricity numbers mutually inconsistent — physically impossible, not a tolerance
+    # issue. Mode (reject / flag / both) is settings.TELEMETRY_CHECK_MODE. Skipped when
+    # the submission carries no telemetry (e.g. craft-build missions).
+    if vessel_data:
+        import json
+        try:
+            _vd_for_check = json.loads(vessel_data)
+        except Exception:
+            _vd_for_check = None
+        verdict = tcheck.evaluate(_vd_for_check)
+        if verdict.flag:
+            await flag_suspicion(
+                gid, uid, user.get("username", ""), reason="impossible_telemetry",
+                details=(f"Flight telemetry submitted to contract `{contract_id}` failed "
+                         f"the consistency check:\n{verdict.detail}"),
+                severity="high")
+        if verdict.reject:
+            log.info("Submission rejected for contract %s: implausible telemetry", contract_id)
+            return SubmissionResult(success=False, message=verdict.reject_message)
 
     # Upload files to Firebase Storage
     stored_files = []
@@ -2544,10 +2608,11 @@ async def _ai_review_submission(
 ) -> SubmissionResult:
     """Run Gemini AI review on a bot-issued contract submission."""
     import json
-    from cogs.screenshots import _client as gemini_client, _MODEL
+    from cogs.screenshots import active_client, record_gemini, _MODEL
+    gemini_client = active_client()
 
     if not gemini_client:
-        # No AI configured — auto-accept
+        # No AI (key missing OR monthly budget reached) — auto-accept
         return await _auto_accept_contract(gid, uid, contract_id, c)
 
     # Download screenshots for AI
@@ -2601,6 +2666,7 @@ async def _ai_review_submission(
             contents=[types.Content(role="user", parts=parts)],
             config=types.GenerateContentConfig(temperature=0.2, max_output_tokens=512),
         )
+        record_gemini(response)
         raw = response.text.strip()
         if raw.startswith("```"):
             raw = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]
@@ -3350,7 +3416,7 @@ async def _deliver_craft_to_corp(gid: int, builder_id: int, contract_id: str):
                         f"**{craft_name}** to {corp.get('name', 'the corp')}.",
             color=discord.Color.green(),
         )
-        embed.add_field(name="Mission", value=(c.get("mission") or "—")[:200], inline=False)
+        embed.add_field(name="Mission", value=(c.get("mission") or "N/A")[:200], inline=False)
         embed.set_footer(text="Download the .craft, or hit Load to KSP to auto-install it.")
         from cogs.contractcraft import CorpCraftView
         craft_file = discord.File(io.BytesIO(data), filename=cf["filename"])
@@ -3452,9 +3518,9 @@ async def _discord_notify_issuer(
                     fname = f"orbit_{idx}.png"
                     orbit_files.append(discord.File(io.BytesIO(orbit_png), filename=fname))
                     vname = snap.get("vessel_name") or snap.get("vesselName") or "Vessel"
-                    body = snap.get("body") or "—"
+                    body = snap.get("body") or "N/A"
                     orbit_embed = discord.Embed(
-                        title=f"🛰️ {vname} — Orbital Telemetry",
+                        title=f"🛰️ {vname}: Orbital Telemetry",
                         description=f"State around **{body}**.",
                         color=discord.Color.teal(),
                     )

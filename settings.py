@@ -5,6 +5,52 @@
 #  Adjust these to tune the XP economy for your server.
 # ─────────────────────────────────────────────────────────────────────────────
 
+import os as _os
+
+
+def _env_float(key: str, default: float) -> float:
+    """Read a float from .env, falling back to the default below if unset/blank."""
+    raw = _os.getenv(key, "")
+    try:
+        return float(raw) if raw.strip() else default
+    except ValueError:
+        return default
+
+
+# ── Cost Guard: paid-service spending caps ───────────────────────────────────
+#
+# The bot leans on two paid Google services: Gemini (AI screenshot/mission
+# analysis) and Firebase (Firestore + Storage). cost_guard.py meters estimated
+# monthly spend on each — to a LOCAL file, never to Firestore — and cuts a
+# service off once its monthly budget is hit. Budgets reset on the 1st (UTC).
+#
+#   • Gemini over budget  → SOFT degrade: AI calls fall back to heuristics /
+#     "temporarily disabled". The bot keeps running normally.
+#   • Firebase over budget → HARD stop: every Firestore read/write and Storage
+#     transfer raises, so the bot stops persisting until the budget resets.
+#
+# Set a budget to 0 (or negative) to mean "unlimited" — that service is never
+# capped. The values below are the defaults; each can be overridden in .env.
+COST_GUARD_ENABLED: bool = _os.getenv("COST_GUARD_ENABLED", "true").lower() not in ("false", "0", "no", "off")
+
+# Monthly budgets in USD (0 = unlimited).
+GEMINI_MONTHLY_BUDGET_USD: float = _env_float("GEMINI_MONTHLY_BUDGET_USD", 5.0)
+FIREBASE_MONTHLY_BUDGET_USD: float = _env_float("FIREBASE_MONTHLY_BUDGET_USD", 10.0)
+
+# Estimated unit prices used to convert usage → USD. These are ESTIMATES (Google
+# prices vary by region/tier); tune them in .env to match your billing reality.
+# Gemini token prices are per 1,000,000 tokens.
+GEMINI_INPUT_USD_PER_1M: float = _env_float("GEMINI_INPUT_USD_PER_1M", 0.10)
+GEMINI_OUTPUT_USD_PER_1M: float = _env_float("GEMINI_OUTPUT_USD_PER_1M", 0.40)
+# Firestore operation prices, per 100,000 operations.
+FIRESTORE_READ_USD_PER_100K: float = _env_float("FIRESTORE_READ_USD_PER_100K", 0.06)
+FIRESTORE_WRITE_USD_PER_100K: float = _env_float("FIRESTORE_WRITE_USD_PER_100K", 0.18)
+FIRESTORE_DELETE_USD_PER_100K: float = _env_float("FIRESTORE_DELETE_USD_PER_100K", 0.02)
+# Firebase Storage prices, per gigabyte (download = egress, the usual cost driver).
+STORAGE_DOWNLOAD_USD_PER_GB: float = _env_float("STORAGE_DOWNLOAD_USD_PER_GB", 0.12)
+STORAGE_UPLOAD_USD_PER_GB: float = _env_float("STORAGE_UPLOAD_USD_PER_GB", 0.0)
+
+
 # ── Moderation & Roles ───────────────────────────────────────────────────────
 
 # Role ID that grants access to moderation commands (/kick, /ban, /gk setchannel, etc.)
@@ -201,6 +247,36 @@ KSP_API_PORT = 5022
 # code lifetime, so it costs nothing defensively.
 KSP_LINK_RATELIMIT_PER_IP = 10       # link/2FA attempts per IP per minute
 KSP_LINK_RATELIMIT_GLOBAL = 600      # global backstop per minute (anti self-DoS)
+
+# ── KSP anti-exploit: flight-telemetry consistency ───────────────────────────
+# The KSP client is untrusted: a modified DLL could report a vessel as "ORBITING
+# Minmus" while it is really at Mun, to clear a contract it didn't complete. The
+# orbital snapshot it sends is over-determined, though — apoapsis, periapsis, sma
+# and eccentricity are bound by pure geometry (no GM needed, so these hold on any
+# rescaled install). data/telemetry_check.py re-derives those identities on submit
+# and catches a snapshot whose numbers don't add up. See data/telemetry_check.py.
+#
+# Mode controls what a violation does:
+#   "reject_and_flag" – hard (impossible) violations reject the submission AND open
+#                       a moderator suspicion; soft (body-radius) ones only flag.
+#   "flag_only"       – never reject; record a suspicion for mods to review.
+#   "reject_only"     – reject hard violations, but open no ticket (quieter for mods).
+#   "off"             – disable the check entirely (equivalent to ENABLED = False).
+TELEMETRY_CHECK_ENABLED = True
+TELEMETRY_CHECK_MODE = "reject_and_flag"
+
+# Relative tolerance on the Kepler geometry identity sma == r + (apo+peri)/2.
+# KSP reports these consistent to many digits, so 2% is comfortably slack for an
+# honest client while still catching a hand-edited field.
+TELEMETRY_SMA_TOLERANCE = 0.02
+# Absolute tolerance on the eccentricity identity (eccentricity is itself a small
+# 0..1 number, so an absolute band is the natural comparison).
+TELEMETRY_ECC_TOLERANCE = 0.05
+# Fractional mismatch between the claimed body's catalogued radius and the radius
+# the client reports, above which we SOFT-flag a possible body spoof. Generous on
+# purpose: legitimate rescale packs (RSS ≈10×, 2.5×, …) change radii a lot, so this
+# only ever flags (never rejects) and only when the gap is large.
+TELEMETRY_BODY_RADIUS_TOLERANCE = 0.5
 
 # ── Known Celestial Bodies ───────────────────────────────────────────────────
 # Used by the heuristic mission classifier (fallback when Gemini is unavailable).

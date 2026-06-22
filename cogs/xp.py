@@ -215,7 +215,7 @@ class XP(commands.Cog, name="XP"):
             member = interaction.guild.get_member(int(uid))
             name = member.display_name if member else f"User {uid}"
             lines.append(
-                f"{prefix} **{name}** — Lvl `{data['level']}` · `{data['xp']:,}` XP"
+                f"{prefix} **{name}** · Lvl `{data['level']}` · `{data['xp']:,}` XP"
             )
 
         embed = discord.Embed(

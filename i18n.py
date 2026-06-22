@@ -44,7 +44,7 @@ S: dict[str, dict[str, str]] = {
     "xp.rank.progress":             {"en": "Progress"},
     "xp.rank.messages":             {"en": "Messages"},
     "xp.lb.title":                  {"en": "🏆 XP Leaderboard"},
-    "xp.lb.empty":                  {"en": "No data yet — start chatting!"},
+    "xp.lb.empty":                  {"en": "No data yet, start chatting!"},
     "xp.setxp.done":                {"en": "✅ Set **{name}**'s XP to `{xp}` (Level {level})"},
 
     # ── Economy ──────────────────────────────────────────────────────────────

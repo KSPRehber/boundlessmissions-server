@@ -23,6 +23,7 @@ from google.genai import types
 from i18n import t, tp, S
 import settings
 from data.store import store
+from cost_guard import guard
 
 log = logging.getLogger(__name__)
 
@@ -38,6 +39,23 @@ else:
     _client = None
     _MODEL = None
     log.warning("GEMINI_API_KEY not set — screenshot analysis disabled")
+
+
+def active_client():
+    """The Gemini client, or None when AI should be skipped.
+
+    Returns None if no key is configured OR the monthly Gemini budget is spent
+    (cost_guard soft-degrade). Every Gemini call site goes through this so a
+    blown budget transparently falls back to heuristics / "disabled". Import
+    and call this instead of reading `_client` directly."""
+    if _client is None:
+        return None
+    return _client if guard.gemini_ok else None
+
+
+def record_gemini(response) -> None:
+    """Meter one Gemini call's token cost (no-op if metadata is absent)."""
+    guard.record_gemini(getattr(response, "usage_metadata", None))
 
 
 # ── System prompt ────────────────────────────────────────────────────────────
@@ -163,6 +181,7 @@ S.update({
     "ss.not_approved":    {"en": "❌ This is not a KSP screenshot."},
     "ss.error":           {"en": "💥 An error occurred during analysis."},
     "ss.no_api_key":      {"en": "❌ Gemini API key not configured."},
+    "ss.ai_budget":       {"en": "❌ AI analysis is temporarily disabled (monthly budget reached). Try again next month."},
     "ss.already_reviewed":{"en": "❌ This screenshot has already been analyzed."},
     "ss.not_yours":       {"en": "❌ You can only analyze screenshots that you posted."},
     "ss.title":           {"en": "🔭 KSP Screenshot Analysis"},
@@ -310,7 +329,11 @@ async def _run_gemini(image_list: list[bytes], guild_id: int | None = None) -> d
     for img_bytes in image_list:
         parts.append(types.Part.from_bytes(data=img_bytes, mime_type="image/png"))
 
-    response = _client.models.generate_content(
+    client = active_client()
+    if client is None:
+        raise RuntimeError("Gemini unavailable (no key or monthly budget reached)")
+
+    response = client.models.generate_content(
         model=_MODEL,
         contents=[types.Content(role="user", parts=parts)],
         config=types.GenerateContentConfig(
@@ -318,6 +341,7 @@ async def _run_gemini(image_list: list[bytes], guild_id: int | None = None) -> d
             max_output_tokens=2048,
         ),
     )
+    record_gemini(response)
 
     raw_text = response.text.strip()
     if raw_text.startswith("```"):
@@ -367,9 +391,11 @@ class Screenshots(commands.Cog, name="Screenshots"):
         gid = interaction.guild_id
         uid = interaction.user.id
 
-        if _client is None:
+        if active_client() is None:
+            # Distinguish "no key configured" from "budget reached" (soft degrade).
+            msg = "ss.no_api_key" if _client is None else "ss.ai_budget"
             await interaction.response.send_message(
-                tp(gid, uid, "ss.no_api_key"), ephemeral=True
+                tp(gid, uid, msg), ephemeral=True
             )
             return
 

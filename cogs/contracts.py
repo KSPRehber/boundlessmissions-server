@@ -60,8 +60,8 @@ S.update({
     "rescue.stat.title":  {"en": "🛟 {name}'s Rescues"},
     "rescue.stat.desc":   {"en": "Completed rescue missions: **{count}**"},
     "rescue.lb.title":    {"en": "🛟 Rescue Leaderboard"},
-    "rescue.lb.empty":    {"en": "No rescues completed yet — be the first to bring someone home!"},
-    "rescue.lb.line":     {"en": "{prefix} **{name}** — `{count}` rescue(s)"},
+    "rescue.lb.empty":    {"en": "No rescues completed yet. Be the first to bring someone home!"},
+    "rescue.lb.line":     {"en": "{prefix} **{name}** · `{count}` rescue(s)"},
 })
 
 

@@ -12,6 +12,8 @@ from config import cfg
 from cogs import perms
 from api_auth import generate_link_code
 from data import mod_version as mver
+from data import policy as policy
+from cost_guard import guard as cost_guard
 
 log = logging.getLogger(__name__)
 
@@ -139,7 +141,7 @@ class Admin(commands.Cog, name="Admin"):
             description=f"Linking as **{target.display_name}** (`{target.id}`).\n\nEnter this code in KSP:\n\n# `{code}`\n\n⏰ Expires in 10 minutes.",
             color=discord.Color.orange(),
         )
-        embed.set_footer(text=f"Issued by {interaction.user} — session will run as {target.display_name}")
+        embed.set_footer(text=f"Issued by {interaction.user}; session will run as {target.display_name}")
         await interaction.followup.send(embed=embed, ephemeral=True)
         log.info("%s generated admin link code for %s (%s)", interaction.user, target, target.id)
 
@@ -259,12 +261,12 @@ class Admin(commands.Cog, name="Admin"):
                 + ("\n📡 Live clients poked to re-check." if broadcast else "")
                 + ("\n🛡️ Attestation enabled (pristine DLL stored)."
                    if rec.get("versions", {}).get(version.strip(), {}).get("has_dll") else
-                   "\n⚠️ Attestation OFF for this version — upload the `dll` (not just a hash) to enable challenge-response anti-tamper.")
+                   "\n⚠️ Attestation OFF for this version. Upload the `dll` (not just a hash) to enable challenge-response anti-tamper.")
             ),
             color=discord.Color.green(),
         )
         if not cfg.KSP_VERSION_CHECK_ENABLED:
-            embed.set_footer(text="⚠️ The version gate is disabled (KSP_VERSION_CHECK_ENABLED=false) — clients won't be blocked.")
+            embed.set_footer(text="⚠️ The version gate is disabled (KSP_VERSION_CHECK_ENABLED=false), so clients won't be blocked.")
         await interaction.followup.send(embed=embed, ephemeral=True)
         log.info("%s published mod version %s (%s, latest=%s)",
                  interaction.user, version, digest[:12], rec.get("latest_version"))
@@ -280,15 +282,15 @@ class Admin(commands.Cog, name="Admin"):
         data = await asyncio.to_thread(mver.get_config)
         if not data or not data.get("latest_hash"):
             await interaction.followup.send(
-                "ℹ️ No mod version has been published yet — the update gate is inactive.",
+                "ℹ️ No mod version has been published yet; the update gate is inactive.",
                 ephemeral=True,
             )
             return
         versions = data.get("versions") or {}
         history = "\n".join(
-            f"• `{v}` — `{(info.get('hash') or '')[:12]}…`"
+            f"• `{v}`: `{(info.get('hash') or '')[:12]}…`"
             for v, info in versions.items()
-        ) or "—"
+        ) or "N/A"
         embed = discord.Embed(
             title="📦 KSP mod version registry",
             color=discord.Color.blurple(),
@@ -297,11 +299,141 @@ class Admin(commands.Cog, name="Admin"):
                 f"**Hash:** `{data.get('latest_hash')}`\n"
                 f"**Download:** {data.get('download_url')}\n"
                 f"**Gate:** {'on' if cfg.KSP_VERSION_CHECK_ENABLED else 'off (disabled in .env)'}\n"
-                f"**Updated:** {data.get('updated_at', '—')} by {data.get('updated_by', '—')}\n\n"
+                f"**Updated:** {data.get('updated_at', 'N/A')} by {data.get('updated_by', 'N/A')}\n\n"
                 f"**Published versions:**\n{history}"
             ),
         )
         await interaction.followup.send(embed=embed, ephemeral=True)
+
+    # ── /policyversion ──────────────────────────────────────────────────────────
+    @app_commands.command(
+        name="policyversion",
+        description="Show or bump the Privacy/Terms version players must accept (Admin only)",
+    )
+    @app_commands.describe(
+        version="New policy version to require (omit to just view the current one)",
+        summary="Short note on what changed (optional, stored for the record)",
+        privacy_url="Override the Privacy Policy URL shown to players (optional)",
+        terms_url="Override the Terms of Service URL shown to players (optional)",
+    )
+    @is_admin()
+    async def policyversion(
+        self,
+        interaction: discord.Interaction,
+        version: int | None = None,
+        summary: str | None = None,
+        privacy_url: str | None = None,
+        terms_url: str | None = None,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+
+        current = await asyncio.to_thread(policy.get_version)
+
+        # No version given → just report the current policy version.
+        if version is None:
+            data = await asyncio.to_thread(policy.get_config)
+            embed = discord.Embed(
+                title="📜 Policy version",
+                color=discord.Color.blurple(),
+                description=(
+                    f"**Current required version:** `{current}`\n"
+                    f"**Summary:** {data.get('summary') or 'N/A'}\n"
+                    f"**Updated:** {data.get('updated_at', 'N/A')} by {data.get('updated_by', 'N/A')}\n\n"
+                    f"Bump it with `/policyversion version:{current + 1}` to force every "
+                    f"player who accepted an older version to re-accept."
+                ),
+            )
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            return
+
+        # Guard against accidentally lowering the version: clients only re-prompt
+        # when the server version exceeds what they accepted, so going backwards
+        # silently does nothing and is almost always a mistake.
+        if version <= current:
+            await interaction.followup.send(
+                f"❌ New version (`{version}`) must be greater than the current one "
+                f"(`{current}`). Re-consent is only triggered by a higher version.",
+                ephemeral=True,
+            )
+            return
+
+        rec = await asyncio.to_thread(
+            policy.set_version, version, str(interaction.user),
+            summary, privacy_url, terms_url,
+        )
+
+        # Poke live clients so they raise the re-consent gate now rather than on
+        # their next restart.
+        poked = False
+        try:
+            import api_server
+            api_server.broadcast_policy_update()
+            poked = True
+        except Exception as exc:
+            log.warning("Could not broadcast policy update: %s", exc)
+
+        embed = discord.Embed(
+            title="✅ Policy version bumped",
+            color=discord.Color.green(),
+            description=(
+                f"**Now requires:** `{rec.get('version')}` (was `{current}`)\n"
+                f"**Summary:** {rec.get('summary') or 'N/A'}\n"
+                "Players who accepted an older version must now re-accept the "
+                "Privacy Policy & Terms before the mod transmits again."
+                + ("\n📡 Live clients poked to re-check." if poked else "")
+            ),
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        log.info("%s bumped policy version to %s (was %s)",
+                 interaction.user, version, current)
+
+    # ── /costs ────────────────────────────────────────────────────────────────
+    @app_commands.command(
+        name="costs",
+        description="Show this month's estimated Gemini & Firebase spend (Admin only)",
+    )
+    @is_admin()
+    async def costs(self, interaction: discord.Interaction) -> None:
+        snap = cost_guard.snapshot()
+
+        def fmt_budget(svc: dict) -> str:
+            if svc["unlimited"]:
+                return f"**${svc['usd']:.4f}** / unlimited"
+            pct = (svc["usd"] / svc["budget"] * 100) if svc["budget"] else 0
+            state = "🟢 active" if svc["ok"] else "🔴 capped"
+            return f"**${svc['usd']:.4f}** / ${svc['budget']:.2f}  ({pct:.0f}%) · {state}"
+
+        def human_bytes(n: int) -> str:
+            for unit in ("B", "KB", "MB", "GB"):
+                if n < 1024 or unit == "GB":
+                    return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+                n /= 1024
+
+        g = snap["gemini"]
+        f = snap["firebase"]
+
+        # Per-component Firebase breakdown (skip rows that cost nothing).
+        rows = []
+        for label, count, usd in f["lines"]:
+            if count == 0:
+                continue
+            qty = human_bytes(count) if "Storage" in label else f"{count:,}"
+            rows.append(f"• {label}: {qty} → **${usd:.4f}**")
+        breakdown = "\n".join(rows) or "• _no usage recorded yet_"
+
+        guard_state = "on" if snap["enabled"] else "OFF (caps disabled in settings)"
+        embed = discord.Embed(
+            title=f"💸 Estimated service spend: {snap['month']}",
+            color=discord.Color.green() if (g["ok"] and f["ok"]) else discord.Color.red(),
+            description=(
+                f"Cost guard: **{guard_state}**\n"
+                "Figures are local estimates from usage, not Google's billing.\n\n"
+                f"**🤖 Gemini** (soft-degrade)\n{fmt_budget(g)}\n\n"
+                f"**🔥 Firebase** (hard-stop)\n{fmt_budget(f)}\n{breakdown}"
+            ),
+        )
+        embed.set_footer(text="Budgets reset on the 1st (UTC). Tune prices/budgets in settings.py / .env.")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     # ── Error handler ─────────────────────────────────────────────────────────
     async def cog_app_command_error(

@@ -229,7 +229,7 @@ class ReviewAcceptButton(DynamicItem[Button], template=r"ct_rv_acc:" + _ID_PATTE
         if c.get("mission_type") == cdb.FLAG_DESIGN and c.get("flag_fullres_url"):
             e.set_image(url=c["flag_fullres_url"])
             e.add_field(name="🚩 Flag (full-res)",
-                        value=f"[Download]({c['flag_fullres_url']}) — also queued to your "
+                        value=f"[Download]({c['flag_fullres_url']}); also queued to your "
                               "in-game flag picker.", inline=False)
         await interaction.edit_original_response(embed=e, view=None)
         try:
@@ -782,7 +782,7 @@ class FileSelectView(View):
                 file_parts.append("⚠️ **WARNING: No craft file included!**")
             for s in screenshots:
                 file_parts.append(f"🖼️ [{s['filename']}]({s['url']})")
-            e.add_field(name="📁 Files", value="\n".join(file_parts) or "—", inline=False)
+            e.add_field(name="📁 Files", value="\n".join(file_parts) or "None", inline=False)
             view = ContractReviewView(self.cid, self.gid)
             msg = await issuer.send(embed=e, view=view)
             cdb.update_contract(self.gid, self.cid, issuer_review_msg_id=str(msg.id))
@@ -836,7 +836,7 @@ class FileSelectView(View):
             e.color = discord.Color.orange()
             e.add_field(
                 name="🚩 Flag",
-                value="Preview is watermarked — the full-res flag is delivered to your "
+                value="Preview is watermarked; the full-res flag is delivered to your "
                       "in-game flag picker on acceptance.",
                 inline=False)
             msg = await issuer.send(embed=e, view=ContractReviewView(self.cid, self.gid))
@@ -876,12 +876,13 @@ class FileSelectView(View):
 
         # Build AI review prompt
         mission_desc = c.get("mission", "")
-        from cogs.screenshots import _client as gemini_client, _MODEL
+        from cogs.screenshots import active_client, record_gemini, _MODEL
         from google.genai import types
         import json
 
+        gemini_client = active_client()
         if not gemini_client:
-            # Fallback: auto-accept if no Gemini
+            # Fallback: auto-accept if no Gemini (key missing OR budget reached)
             await self._auto_accept(interaction, c)
             return
 
@@ -913,6 +914,7 @@ class FileSelectView(View):
                 contents=[types.Content(role="user", parts=parts)],
                 config=types.GenerateContentConfig(temperature=0.2, max_output_tokens=512),
             )
+            record_gemini(response)
             raw = response.text.strip()
             if raw.startswith("```"):
                 raw = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]

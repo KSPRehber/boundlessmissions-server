@@ -48,10 +48,10 @@ async def _finish_approval(interaction: discord.Interaction, challenge_id: str, 
         msg = "⌛ This login request has expired or was already handled."
         color = discord.Color.greyple()
     elif approve:
-        msg = "✅ Login approved — switch back to KSP, it should link automatically."
+        msg = "✅ Login approved. Switch back to KSP, it should link automatically."
         color = discord.Color.green()
     else:
-        msg = "🚫 Login denied. If that wasn't you, your link code is now useless — generate a fresh one only when *you* want to link."
+        msg = "🚫 Login denied. If that wasn't you, your link code is now useless; generate a fresh one only when *you* want to link."
         color = discord.Color.red()
     e = discord.Embed(description=msg, color=color)
     # Replace the prompt so the buttons can't be pressed again.
@@ -161,7 +161,7 @@ async def _finish_device(interaction: discord.Interaction, challenge_id: str, ap
         msg = "⌛ This device request has expired or was already handled."
         color = discord.Color.greyple()
     elif approve:
-        msg = "✅ Device trusted — switch back to KSP, it should connect now."
+        msg = "✅ Device trusted. Switch back to KSP, it should connect now."
         color = discord.Color.green()
     else:
         msg = ("🚨 Reported to the moderators. As a precaution, run **/g logout** to "
@@ -190,7 +190,7 @@ class KSPDeviceOkButton(DynamicItem[Button], template=r"ksp_dev_ok:(?P<chid>[^:]
 
 class KSPDeviceReportButton(DynamicItem[Button], template=r"ksp_dev_no:(?P<chid>[^:]+)"):
     def __init__(self, challenge_id: str):
-        super().__init__(Button(label="🚫 No — report", style=discord.ButtonStyle.red,
+        super().__init__(Button(label="🚫 No, report it", style=discord.ButtonStyle.red,
                                 custom_id=f"ksp_dev_no:{challenge_id}"))
         self.chid = challenge_id
 
@@ -218,11 +218,11 @@ class KSPDevicePingButton(DynamicItem[Button], template=r"ksp_dev_ping:(?P<chid>
         ok = await asyncio.to_thread(
             request_device_ping, self.chid, str(interaction.user.id))
         if ok:
-            msg = ("🔔 **Ping sent.** Look at the PC that's trying to log in — within a "
+            msg = ("🔔 **Ping sent.** Look at the PC that's trying to log in; within a "
                    "few seconds it should flash an *“Is this you?”* alert on its screen.\n\n"
-                   "• If you see that alert on a PC in front of you, it's **you** — press "
+                   "• If you see that alert on a PC in front of you, it's **you**, so press "
                    "**✅ Yes, it's me**.\n"
-                   "• If no PC you can see lights up, it isn't you — press **🚫 No — report**.")
+                   "• If no PC you can see lights up, it isn't you, so press **🚫 No, report it**.")
         else:
             msg = "⌛ This device request has expired or was already handled, so the ping couldn't be sent."
         await interaction.response.send_message(msg, ephemeral=True)
@@ -268,7 +268,7 @@ class DeleteDataModal(discord.ui.Modal):
         typed = str(self.confirm.value).strip().lstrip("@").lower()
         if typed not in self._expected:
             await interaction.response.send_message(
-                "❌ That didn't match your username — **nothing was deleted**. "
+                "❌ That didn't match your username, so **nothing was deleted**. "
                 "Run the command again and type your username exactly.",
                 ephemeral=True,
             )
@@ -294,7 +294,7 @@ class DeleteDataModal(discord.ui.Modal):
             "KSP session & device bindings, and your installed-parts catalog. Every "
             "linked device has been logged out.\n\n"
             "Records that involve other members (contracts, corporation membership, "
-            "marketplace listings) are kept for those members — ask a moderator if "
+            "marketplace listings) are kept for those members; ask a moderator if "
             "you need those removed too.",
             ephemeral=True,
         )

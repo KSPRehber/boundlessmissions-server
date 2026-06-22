@@ -141,6 +141,11 @@ class GeneKermanBot(commands.Bot):
             log.info("Flushed user data on shutdown.")
         except Exception as exc:
             log.error("Failed to flush user data on shutdown: %s", exc)
+        try:
+            from cost_guard import guard
+            guard.flush()
+        except Exception as exc:
+            log.error("Failed to flush cost guard on shutdown: %s", exc)
         await super().close()
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -294,8 +299,8 @@ class GeneKermanBot(commands.Bot):
         await self.change_presence(
             activity=discord.Activity(
                 type=discord.ActivityType.playing,
-                name="/g",
-                state="Unified Players of KSP Bot",
+                name="/b",
+                state="Managing Missions",
             )
         )
         # Set bot user ID and instance for the KSP API server

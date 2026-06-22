@@ -45,11 +45,11 @@ def listing_embed(listing: dict) -> discord.Embed:
         color=discord.Color.dark_grey() if delisted else discord.Color.blurple(),
     )
     e.add_field(name="Price", value=f"**{listing['price']:,}** {sym}", inline=True)
-    e.add_field(name="Editor", value=listing.get("craft_type", "—"), inline=True)
+    e.add_field(name="Editor", value=listing.get("craft_type", "N/A"), inline=True)
     e.add_field(name="Parts", value=f"{listing.get('part_count', 0)}", inline=True)
     e.add_field(name="Mass", value=f"{listing.get('mass', 0):.1f} t", inline=True)
     e.add_field(name="Cost", value=f"{listing.get('cost', 0):,.0f}", inline=True)
-    e.add_field(name="Seller", value=listing.get("seller_name", "—"), inline=True)
+    e.add_field(name="Seller", value=listing.get("seller_name", "N/A"), inline=True)
     # The rendered blueprint is always shown publicly; the .craft file itself is
     # only delivered to the buyer's DMs after purchase.
     if listing.get("blueprint_url"):
@@ -137,7 +137,7 @@ class BuyButton(DynamicItem[Button], template=r"mk_buy:" + _ID_PATTERN):
             return
 
         if already_owned:
-            await interaction.followup.send("✅ Re-sent the blueprint to your DMs (free — you already own it).", ephemeral=True)
+            await interaction.followup.send("✅ Re-sent the blueprint to your DMs (free, since you already own it).", ephemeral=True)
             return
 
         # Record the sale and refresh the channel embed.
@@ -279,8 +279,8 @@ class Marketplace(commands.Cog, name="Marketplace"):
 
         sym = settings.CURRENCY_SYMBOL
         lines = [
-            f"**{l['craft_name']}** — {l['price']:,} {sym} · {l.get('part_count', 0)} parts "
-            f"· by {l.get('seller_name', '—')} · `{l['listing_id']}`"
+            f"**{l['craft_name']}** · {l['price']:,} {sym} · {l.get('part_count', 0)} parts "
+            f"· by {l.get('seller_name', 'N/A')} · `{l['listing_id']}`"
             for l in listings[:25]
         ]
         embed = discord.Embed(

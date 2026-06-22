@@ -35,7 +35,7 @@ S.update({
     "auc.issuer":          {"en": "👤 Issuer"},
     "auc.start":           {"en": "🏷️ Starting Price"},
     "auc.current":         {"en": "📉 Lowest Bid"},
-    "auc.nobids":          {"en": "No bids yet — be the first to undercut!"},
+    "auc.nobids":          {"en": "No bids yet. Be the first to undercut!"},
     "auc.bidder":          {"en": "by {name}"},
     "auc.bids":            {"en": "🔁 Bids"},
     "auc.ends":            {"en": "⏳ Ends"},
@@ -46,7 +46,7 @@ S.update({
                                   "Lowest bid when the timer ends wins."},
     "auc.winner":          {"en": "🏆 Result"},
     "auc.won_for":         {"en": "**{name}** won for **{price}** {sym}"},
-    "auc.no_winner":       {"en": "No bids were placed — escrow refunded to the issuer."},
+    "auc.no_winner":       {"en": "No bids were placed; escrow refunded to the issuer."},
     "auc.won_dm":          {"en": "🏆 You won the auction! Complete this mission for **{price}** {sym}."},
     # Buttons
     "auc.btn_bid":         {"en": "📉 Bid Lower"},
@@ -56,7 +56,7 @@ S.update({
     "auc.err_amount":      {"en": "❌ Starting price must be a positive amount."},
     "auc.err_duration":    {"en": "❌ Duration must be between {min} and {max} hours."},
     "auc.err_date":        {"en": "❌ Invalid date. Use YYYY-MM-DD (must be in the future)."},
-    "auc.err_funds":       {"en": "❌ Insufficient balance — you must escrow **{need}** {sym}."},
+    "auc.err_funds":       {"en": "❌ Insufficient balance. You must escrow **{need}** {sym}."},
     "auc.err_limit":       {"en": "❌ Active contract limit reached ({max})."},
     "auc.err_post":        {"en": "❌ Could not post to the auction channel. Escrow refunded."},
     "auc.created":         {"en": "✅ Auction posted to {channel}."},
@@ -66,7 +66,7 @@ S.update({
     "auc.bid_closed":      {"en": "❌ This auction has already ended."},
     "auc.bid_issuer":      {"en": "❌ You can't bid on your own auction."},
     "auc.bid_nan":         {"en": "❌ Enter a whole number."},
-    "auc.bid_toohigh":     {"en": "❌ Bid must be at most **{max}** {sym} — undercut the current lowest by ≥ {step}."},
+    "auc.bid_toohigh":     {"en": "❌ Bid must be at most **{max}** {sym}; undercut the current lowest by ≥ {step}."},
     "auc.bid_low":         {"en": "❌ Bid must be a positive amount."},
     "auc.bid_ok":          {"en": "✅ Bid placed: **{amount}** {sym}. You're the lowest bidder!"},
     # Ending
@@ -356,10 +356,10 @@ class Auctions(commands.Cog, name="Auctions"):
         self.close_loop.cancel()
 
     @app_commands.command(name="auction",
-                          description="Post a reverse auction — contractors bid the price down")
+                          description="Post a reverse auction where contractors bid the price down")
     @app_commands.describe(
         mission="Mission description",
-        start_value="Starting (maximum) payment in KCoins — escrowed up front",
+        start_value="Starting (maximum) payment in KCoins, escrowed up front",
         date_due="Contract due date once won (YYYY-MM-DD)",
         duration_hours="How many hours the auction runs",
         fine="Fine if the winner breaches the contract (default 0)",

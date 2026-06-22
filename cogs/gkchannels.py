@@ -72,13 +72,13 @@ def get_gk_channel_mentions(guild: discord.Guild) -> str:
     gid = str(guild.id)
     channels = _gk_channels.get(gid, set())
     if not channels:
-        return "—"
+        return "None"
     mentions = []
     for cid in channels:
         ch = guild.get_channel(int(cid))
         if ch:
             mentions.append(ch.mention)
-    return ", ".join(mentions) if mentions else "—"
+    return ", ".join(mentions) if mentions else "None"
 
 
 def is_mod(member: discord.Member) -> bool:

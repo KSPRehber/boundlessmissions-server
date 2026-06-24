@@ -3,7 +3,8 @@ data/auctions.py – Firestore helpers for reverse (Dutch) auctions.
 
 An auction is a contract whose price is bid DOWN by contractors. The lowest bid
 when the auction closes wins and is converted into an active contract.
-Documents live under guilds/{guild_id}/auctions/{auction_id}.
+Documents live in the GLOBAL auctions/{auction_id} collection (auctions are
+mirrored into every server); guild_id on the doc is the origin only.
 """
 import logging
 import uuid
@@ -22,8 +23,8 @@ CANCELLED = "cancelled"  # ended with no bids (escrow refunded)
 AuctionData = dict[str, Any]
 
 
-def _col(guild_id: int):
-    return _db.collection("guilds").document(str(guild_id)).collection("auctions")
+def _col():
+    return _db.collection("auctions")
 
 
 def create_auction(
@@ -53,27 +54,27 @@ def create_auction(
         "status": OPEN,
         "created_at": now,
         "ends_at": ends_at,
-        "channel_id": None,
-        "message_id": None,
+        # Cross-server message mirrors: [{guild_id, channel_id, message_id}, ...]
+        "mirrors": [],
         "result_contract_id": None,
     }
     # Mission type (craft_build / active_vessel) the winner's contract inherits.
     if mission_type:
         doc["mission_type"] = mission_type
-    _col(guild_id).document(aid).set(doc)
+    _col().document(aid).set(doc)
     log.info("Auction %s created by %s (start %d, ends %s)", aid, issuer_name, start_value, ends_at)
     return doc
 
 
 def get_auction(guild_id: int, auction_id: str) -> AuctionData | None:
-    snap = _col(guild_id).document(auction_id).get()
+    snap = _col().document(auction_id).get()
     return snap.to_dict() if snap.exists else None
 
 
 def update_auction(guild_id: int, auction_id: str, **fields) -> None:
-    _col(guild_id).document(auction_id).update(fields)
+    _col().document(auction_id).update(fields)
 
 
 def list_open(guild_id: int) -> list[AuctionData]:
-    """All open auctions for a guild (used by the close-expired loop)."""
-    return [d.to_dict() for d in _col(guild_id).where("status", "==", OPEN).stream()]
+    """All open auctions, globally (guild_id ignored; used by the close loop)."""
+    return [d.to_dict() for d in _col().where("status", "==", OPEN).stream()]

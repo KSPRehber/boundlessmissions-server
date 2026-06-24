@@ -132,33 +132,99 @@ class UserStore:
     """In-memory store backed by Firestore."""
 
     def __init__(self) -> None:
-        # guild_id (str) -> user_id (str) -> UserData
-        self._data: dict[str, dict[str, UserData]] = {}
+        # GLOBAL wallet: user_id (str) -> UserData. Balances/XP/levels are now one
+        # record per user across every server (see the economy-migration in load()).
+        # Methods still take guild_id for call-site compatibility, but it is only
+        # used as context (e.g. which guild announced a level-up), never as a key.
+        self._users: dict[str, UserData] = {}
         self._lock = asyncio.Lock()
-        self._dirty_users: set[tuple[str, str]] = set()  # (guild_id, user_id) pairs
+        self._dirty_users: set[str] = set()  # user_id strings
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def load(self) -> None:
-        """Load all guild/user data from Firestore into memory."""
+        """Load the GLOBAL user wallet from Firestore into memory, running a
+        one-time migration from the legacy per-guild layout on first start."""
         total = 0
         try:
-            guilds_ref = _db.collection("guilds")
-            for guild_doc in guilds_ref.stream():
-                guild_id = guild_doc.id
-                self._data[guild_id] = {}
-                users_ref = guilds_ref.document(guild_id).collection("users")
-                for user_doc in users_ref.stream():
-                    user_data = user_doc.to_dict()
-                    # Merge with defaults to handle schema evolution
-                    merged = _default_user()
-                    merged.update(user_data)
-                    self._data[guild_id][user_doc.id] = merged
-                    total += 1
-            log.info("Loaded %d user records from Firestore", total)
+            for user_doc in _db.collection("users").stream():
+                merged = _default_user()
+                merged.update(user_doc.to_dict() or {})
+                self._users[user_doc.id] = merged
+                total += 1
+            log.info("Loaded %d global user records from Firestore", total)
         except Exception as exc:
             log.error("Failed to load from Firestore: %s — starting fresh", exc)
-            self._data = {}
+            self._users = {}
+
+        # One-time merge of legacy guilds/{gid}/users/{uid} wallets into the global
+        # store. Guarded by a flag doc so it runs exactly once.
+        try:
+            flag = _db.collection("meta").document("economy_migration").get()
+            if not (flag.exists and (flag.to_dict() or {}).get("done")):
+                await self._migrate_legacy_economy()
+        except Exception as exc:
+            log.error("Economy migration check failed: %s", exc)
+
+    async def _migrate_legacy_economy(self) -> None:
+        """Merge legacy per-guild wallets into the global store (sum balance/xp/
+        messages/rescues, union unlocked_levels, max last_xp_time), then copy any
+        in-flight marketplace/auction/contract docs into the new global
+        collections.
+
+        The merge is computed purely from the (immutable) legacy data into a fresh
+        accumulator and then SET onto the global records — so even if this crashes
+        before the meta/economy_migration flag is written, a re-run recomputes the
+        same values instead of double-counting."""
+        acc: dict[str, UserData] = {}
+        try:
+            for guild_doc in _db.collection("guilds").stream():
+                users_ref = _db.collection("guilds").document(guild_doc.id).collection("users")
+                for udoc in users_ref.stream():
+                    data = udoc.to_dict() or {}
+                    uid = udoc.id
+                    rec = acc.get(uid)
+                    if rec is None:
+                        rec = _default_user()
+                        rec.update({"user_id": uid, "balance": 0, "xp": 0, "messages": 0,
+                                    "rescues": 0, "unlocked_levels": [], "last_xp_time": 0.0,
+                                    "joined_at": "", "language": "", "username": ""})
+                        acc[uid] = rec
+                    rec["balance"] += int(data.get("balance", 0) or 0)
+                    rec["xp"] += int(data.get("xp", 0) or 0)
+                    rec["messages"] += int(data.get("messages", 0) or 0)
+                    rec["rescues"] = int(rec.get("rescues", 0) or 0) + int(data.get("rescues", 0) or 0)
+                    levels = set(rec.get("unlocked_levels", []) or []) | set(data.get("unlocked_levels", []) or [])
+                    old_max = int(data.get("max_unlocked_level", 0) or 0)
+                    if old_max > 0:
+                        levels.add(old_max)
+                    rec["unlocked_levels"] = sorted(levels)
+                    rec["last_xp_time"] = max(float(rec.get("last_xp_time", 0.0) or 0.0),
+                                              float(data.get("last_xp_time", 0.0) or 0.0))
+                    ja = data.get("joined_at") or ""
+                    if ja and (not rec.get("joined_at") or ja < rec["joined_at"]):
+                        rec["joined_at"] = ja
+                    if not rec.get("language") and data.get("language"):
+                        rec["language"] = data["language"]
+                    if not rec.get("username") and data.get("username"):
+                        rec["username"] = data["username"]
+
+            # SET the merged values onto the global records (idempotent).
+            for uid, rec in acc.items():
+                rec["level"] = level_from_xp(rec["xp"])
+                self._users[uid] = rec
+                self._mark_dirty(0, uid)
+            merged_users = len(acc)
+
+            await self.save()  # flush merged global wallets immediately
+
+            moved = _migrate_inflight_economic_docs()
+            _db.collection("meta").document("economy_migration").set(
+                {"done": True, "merged_users": merged_users, "moved_docs": moved})
+            log.warning("Economy migration complete: merged %d legacy wallet rows, "
+                        "moved %d in-flight docs to global collections.", merged_users, moved)
+        except Exception as exc:
+            log.error("Economy migration failed (will retry next start): %s", exc, exc_info=True)
 
     async def save(self) -> None:
         """Flush all dirty user records to Firestore."""
@@ -169,24 +235,15 @@ class UserStore:
             self._dirty_users.clear()
 
         try:
-            # Collect which guilds were touched so we create parent docs
-            touched_guilds: set[str] = set()
             batch = _db.batch()
             count = 0
 
-            for guild_id, user_id in dirty:
-                guild_data = self._data.get(guild_id, {})
-                user_data = guild_data.get(user_id)
+            for user_id in dirty:
+                user_data = self._users.get(user_id)
                 if user_data is None:
                     continue
 
-                touched_guilds.add(guild_id)
-                doc_ref = (
-                    _db.collection("guilds")
-                    .document(guild_id)
-                    .collection("users")
-                    .document(user_id)
-                )
+                doc_ref = _db.collection("users").document(user_id)
                 batch.set(doc_ref, user_data)
                 count += 1
 
@@ -197,15 +254,9 @@ class UserStore:
                     batch = _db.batch()
                     count = 0
 
-            # Ensure guild parent documents exist so load() can discover them
-            for guild_id in touched_guilds:
-                guild_ref = _db.collection("guilds").document(guild_id)
-                batch.set(guild_ref, {"_exists": True}, merge=True)
-                count += 1
-
             if count > 0:
                 batch.commit()
-            log.info("Saved %d user records to Firestore", len(dirty))
+            log.info("Saved %d global user records to Firestore", len(dirty))
         except Exception as exc:
             log.error("Failed to save to Firestore: %s", exc, exc_info=True)
             # Re-add to dirty so we retry next cycle
@@ -218,44 +269,38 @@ class UserStore:
             await self.save()
 
     def _mark_dirty(self, guild_id: int, user_id: int) -> None:
-        """Mark a user record as needing a Firestore write."""
-        self._dirty_users.add((str(guild_id), str(user_id)))
+        """Mark a user record as needing a Firestore write (guild_id ignored —
+        the wallet is global)."""
+        self._dirty_users.add(str(user_id))
 
     # ── User access ──────────────────────────────────────────────────────────
 
-    def _guild(self, guild_id: int) -> dict[str, UserData]:
-        """Get or create the guild bucket."""
-        key = str(guild_id)
-        if key not in self._data:
-            self._data[key] = {}
-        return self._data[key]
-
     def get_user(self, guild_id: int, user_id: int) -> UserData:
-        """Get a user's record, creating a default one if needed."""
-        guild = self._guild(guild_id)
+        """Get a user's GLOBAL record, creating a default one if needed.
+        (guild_id is accepted for call-site compatibility but not used as a key.)"""
         key = str(user_id)
-        if key not in guild:
-            guild[key] = _default_user()
+        if key not in self._users:
+            self._users[key] = _default_user()
             self._mark_dirty(guild_id, user_id)
-        return guild[key]
+        return self._users[key]
 
     def get_all_users(self, guild_id: int) -> dict[str, UserData]:
-        """Get all user records for a guild."""
-        return self._guild(guild_id)
+        """Get all (global) user records. guild_id is ignored."""
+        return self._users
 
     async def delete_user(self, guild_id: int, user_id: int) -> bool:
-        """Erase a user's profile record from memory and Firestore. Used by the
-        user-initiated 'delete my data' flow. Returns True if a record existed."""
-        gkey, ukey = str(guild_id), str(user_id)
+        """Erase a user's GLOBAL profile record from memory and Firestore. Used by
+        the user-initiated 'delete my data' flow. Returns True if a record existed."""
+        ukey = str(user_id)
         async with self._lock:
-            existed = self._data.get(gkey, {}).pop(ukey, None) is not None
-            self._dirty_users.discard((gkey, ukey))  # don't let a pending write resurrect it
+            existed = self._users.pop(ukey, None) is not None
+            self._dirty_users.discard(ukey)  # don't let a pending write resurrect it
         try:
-            _db.collection("guilds").document(gkey).collection("users").document(ukey).delete()
+            _db.collection("users").document(ukey).delete()
         except Exception as exc:
-            log.error("Failed to delete user %s/%s from Firestore: %s", gkey, ukey, exc)
+            log.error("Failed to delete user %s from Firestore: %s", ukey, exc)
             raise
-        log.warning("Deleted user record %s/%s (existed=%s)", gkey, ukey, existed)
+        log.warning("Deleted global user record %s (existed=%s)", ukey, existed)
         return existed
 
     # ── XP operations ────────────────────────────────────────────────────────
@@ -393,16 +438,44 @@ class UserStore:
         self, guild_id: int, key: str = "xp", limit: int | None = None
     ) -> list[tuple[str, UserData]]:
         """
-        Return users sorted by `key` (descending).
+        Return GLOBAL users sorted by `key` (descending). guild_id is ignored —
+        with a global wallet the leaderboard is global.
         Each item is (user_id_str, user_data).
         """
-        guild = self._guild(guild_id)
         limit = limit or settings.LEADERBOARD_PAGE_SIZE
         return sorted(
-            guild.items(),
+            self._users.items(),
             key=lambda kv: kv[1].get(key, 0),
             reverse=True,
         )[:limit]
+
+
+# ── One-time migration of in-flight economic docs ────────────────────────────
+
+def _migrate_inflight_economic_docs() -> int:
+    """Copy non-terminal marketplace/auction/contract docs out of the legacy
+    guilds/{gid}/{coll} subcollections into the new top-level global collections,
+    preserving document ids. Returns the number of docs moved. Idempotent (set by
+    document id) and only invoked from the guarded economy migration."""
+    # collection -> set of statuses that are still "live" and worth moving.
+    live = {
+        "marketplace": {"active"},
+        "auctions": {"open"},
+        "contracts": {"pending", "active", "submitted", "disputed", "mod_review"},
+    }
+    moved = 0
+    try:
+        for guild_doc in _db.collection("guilds").stream():
+            for coll, keep in live.items():
+                sub = _db.collection("guilds").document(guild_doc.id).collection(coll)
+                for doc in sub.stream():
+                    data = doc.to_dict() or {}
+                    if data.get("status") in keep:
+                        _db.collection(coll).document(doc.id).set(data)
+                        moved += 1
+    except Exception as exc:
+        log.error("In-flight economic doc migration failed: %s", exc)
+    return moved
 
 
 # Singleton – import this from anywhere

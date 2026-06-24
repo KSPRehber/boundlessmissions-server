@@ -12,6 +12,7 @@ import settings
 from data.store import store
 from data import contracts as cdb
 from data import imports as imp
+from data import guild_config
 
 log = logging.getLogger(__name__)
 
@@ -418,7 +419,7 @@ class SueButton(DynamicItem[Button], template=r"ct_sue:" + _ID_PATTERN):
         # Prefer a private ticket (both parties + mods); fall back to the shared
         # mod channel if the ticket system isn't configured.
         ticket_channel = None
-        if settings.TICKET_CATEGORY_ID:
+        if guild_config.get_channel_id(self.gid, "ticket_category"):
             try:
                 from cogs.tickets import create_ticket
                 guild = interaction.guild or bot.get_guild(self.gid)
@@ -442,11 +443,10 @@ class SueButton(DynamicItem[Button], template=r"ct_sue:" + _ID_PATTERN):
                 log.warning("Could not open sue ticket for %s: %s", self.cid, exc)
 
         if ticket_channel is None:
-            mod_ch_id = settings.CONTRACT_MOD_CHANNEL_ID
-            if not mod_ch_id:
+            ch = guild_config.resolve_channel(bot, self.gid, "contract_mod")
+            if ch is None:
                 await interaction.followup.send("❌ Not configured.", ephemeral=True)
                 return
-            ch = bot.get_channel(mod_ch_id) or await bot.fetch_channel(mod_ch_id)
             await ch.send(embed=e, view=ModReviewView(self.cid, self.gid))
 
         await interaction.edit_original_response(content=t(self.gid, "ct.sued"), view=None)

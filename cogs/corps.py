@@ -18,6 +18,7 @@ log = logging.getLogger(__name__)
 # Import the shared Firestore client
 from data.store import _db
 import settings
+from data import guild_config
 from i18n import t, tp
 from cogs.gkchannels import add_gk_channel, remove_gk_channel
 
@@ -39,7 +40,8 @@ async def _create_corp_channel(
 ) -> tuple[discord.TextChannel, discord.Message]:
     """Create the corp text channel and pin the establishment embed."""
     # Sanitise channel name (Discord auto-lowercases and replaces spaces with hyphens)
-    category = guild.get_channel(settings.CORP_CATEGORY_ID)
+    cat_id = guild_config.get_channel_id(guild.id, "corp_category")
+    category = guild.get_channel(cat_id) if cat_id else None
     channel = await guild.create_text_channel(
         name=f"corp-{name}",
         category=category,
@@ -90,29 +92,75 @@ def _save_corp(guild_id: int, user_id: int, data: dict) -> None:
 
 
 def _get_corp(guild_id: int, user_id: int) -> dict | None:
-    """Read corporation data from Firestore. Returns None if not found."""
+    """Read a user's corporation. Checks the given guild first, then falls back to
+    the user's GLOBAL corp (which may live in another server), so callers that pass
+    a contract/session guild still find the one corp the user owns anywhere.
+    The returned dict carries `guild_id` so callers can resolve its channel."""
     doc = _get_corp_ref(guild_id, user_id).get()
-    return doc.to_dict() if doc.exists else None
+    if doc.exists:
+        d = doc.to_dict()
+        d.setdefault("guild_id", str(guild_id))
+        return d
+    ptr = get_user_corp_global(user_id)
+    if ptr:
+        og = int(ptr.get("guild_id", 0) or 0)
+        if og and og != guild_id:
+            d2 = _get_corp_ref(og, user_id).get()
+            if d2.exists:
+                d = d2.to_dict()
+                d.setdefault("guild_id", str(og))
+                return d
+    return None
 
 
 def find_user_corp(guild_id: int, user_id: int) -> dict | None:
     """Find the corp a user belongs to, as owner or member. None if they're in none.
 
-    Corps are keyed by the owner's id, so an owner is a direct lookup; members are
-    found via the `members` array.
+    Corps are keyed by the owner's id, so an owner is a direct (now global) lookup;
+    members are found via the `members` array within the given guild.
     """
     own = _get_corp(guild_id, user_id)
     if own:
         return own
     col = _db.collection("guilds").document(str(guild_id)).collection("corps")
     for doc in col.where("members", "array_contains", str(user_id)).stream():
-        return doc.to_dict()
+        d = doc.to_dict()
+        d.setdefault("guild_id", str(guild_id))
+        return d
     return None
 
 
 def _delete_corp(guild_id: int, user_id: int) -> None:
     """Delete a corporation record from Firestore."""
     _get_corp_ref(guild_id, user_id).delete()
+
+
+# ── Global corp ownership (one corp per user across ALL servers) ─────────────
+# The per-guild corp doc still lives at guilds/{gid}/corps/{uid} (its channel is in
+# a specific server), but a global pointer records the ONE server a user owns a
+# corp in, so establishing a corp anywhere replaces a corp owned elsewhere.
+
+def _owner_ref(user_id: int):
+    return _db.collection("corp_owners").document(str(user_id))
+
+
+def get_user_corp_global(user_id: int) -> dict | None:
+    """Where (if anywhere) this user owns a corp: {guild_id, channel_id, name}."""
+    snap = _owner_ref(user_id).get()
+    return snap.to_dict() if snap.exists else None
+
+
+def _set_owner_ptr(user_id: int, guild_id: int, channel_id: int, name: str) -> None:
+    _owner_ref(user_id).set({
+        "user_id": str(user_id),
+        "guild_id": str(guild_id),
+        "channel_id": str(channel_id),
+        "name": name,
+    })
+
+
+def _clear_owner_ptr(user_id: int) -> None:
+    _owner_ref(user_id).delete()
 
 
 # ── Confirmation UI ──────────────────────────────────────────────────────────
@@ -176,12 +224,16 @@ class Corps(commands.Cog, name="Corps"):
         member = interaction.user
         gid = guild.id
 
-        # Check if user already has a corporation
-        existing = _get_corp(guild.id, member.id)
+        # One corp per user GLOBALLY — check whether they own one in any server.
+        existing = get_user_corp_global(member.id)
 
         if existing:
-            # User already has a corp — DM them for confirmation
+            # User already owns a corp somewhere — DM them for confirmation. The
+            # replace flow deletes the old one wherever it lives, then creates the
+            # new one here.
             old_name = existing.get("name", "Unknown")
+            old_guild = self.bot.get_guild(int(existing.get("guild_id", 0) or 0))
+            old_guild_name = old_guild.name if old_guild else "another server"
             old_channel_id = existing.get("channel_id")
 
             view = CorpReplaceView(self, guild, member, name)
@@ -190,7 +242,7 @@ class Corps(commands.Cog, name="Corps"):
                 dm_embed = discord.Embed(
                     title=t(gid, "corps.replace.title"),
                     description=t(gid, "corps.replace.desc",
-                        guild=guild.name, old=old_name,
+                        guild=old_guild_name, old=old_name,
                         channel=old_channel_id, new=name),
                     color=discord.Color.orange(),
                 )
@@ -214,7 +266,7 @@ class Corps(commands.Cog, name="Corps"):
         # Auto-register as GK channel
         add_gk_channel(guild.id, channel.id)
 
-        # Save to Firestore
+        # Save to Firestore (per-guild record + global ownership pointer)
         now = datetime.datetime.now(datetime.timezone.utc)
         _save_corp(guild.id, member.id, {
             "name": name,
@@ -225,6 +277,7 @@ class Corps(commands.Cog, name="Corps"):
             "established_at": now.isoformat(),
             "members": [str(member.id)],
         })
+        _set_owner_ptr(member.id, guild.id, channel.id, name)
 
         await interaction.followup.send(
             tp(gid, member.id, "corps.setup.done", name=name, channel=channel.mention),
@@ -235,29 +288,30 @@ class Corps(commands.Cog, name="Corps"):
     async def _replace_corp(
         self, guild: discord.Guild, owner: discord.Member, new_name: str
     ) -> None:
-        """Delete old corp channel and create a replacement."""
-        existing = _get_corp(guild.id, owner.id)
-        if not existing:
-            return
+        """Delete the user's existing corp WHEREVER it lives (possibly another
+        server), then create a replacement in `guild`."""
+        existing = get_user_corp_global(owner.id)
+        if existing:
+            old_gid = int(existing.get("guild_id", 0) or 0)
+            old_channel_id = existing.get("channel_id")
+            old_guild = self.bot.get_guild(old_gid)
 
-        # Try to delete old channel
-        old_channel_id = existing.get("channel_id")
-        if old_channel_id:
-            old_channel = guild.get_channel(int(old_channel_id))
-            if old_channel:
-                try:
-                    await old_channel.delete(reason=f"Corporation replaced by {owner}")
-                except discord.Forbidden:
-                    log.warning("No permission to delete old corp channel %s", old_channel_id)
+            # Delete the old channel + GK registration in whichever guild it was in.
+            if old_channel_id and old_guild:
+                old_channel = old_guild.get_channel(int(old_channel_id))
+                if old_channel:
+                    try:
+                        await old_channel.delete(reason=f"Corporation replaced by {owner}")
+                    except discord.Forbidden:
+                        log.warning("No permission to delete old corp channel %s", old_channel_id)
+                remove_gk_channel(old_gid, int(old_channel_id))
 
-        # Remove old channel from GK list
-        if old_channel_id:
-            remove_gk_channel(guild.id, int(old_channel_id))
+            # Delete the old per-guild record + clear the global pointer.
+            if old_gid:
+                _delete_corp(old_gid, owner.id)
+            _clear_owner_ptr(owner.id)
 
-        # Delete old Firestore record
-        _delete_corp(guild.id, owner.id)
-
-        # Create new corp
+        # Create new corp in the requesting guild.
         channel, pin_msg = await _create_corp_channel(guild, owner, new_name)
 
         # Auto-register as GK channel
@@ -273,6 +327,7 @@ class Corps(commands.Cog, name="Corps"):
             "established_at": now.isoformat(),
             "members": [str(owner.id)],
         })
+        _set_owner_ptr(owner.id, guild.id, channel.id, new_name)
 
         try:
             await owner.send(t(guild.id, "corps.replace.done",

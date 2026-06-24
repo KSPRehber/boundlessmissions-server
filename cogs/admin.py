@@ -5,17 +5,338 @@ cogs/admin.py – Administrative commands (bot owner / server admins only).
 import asyncio
 import hashlib
 import logging
+import re
 import discord
 from discord import app_commands
 from discord.ext import commands
+from discord.ui import View, Select, Button, Modal, TextInput
 from config import cfg
 from cogs import perms
 from api_auth import generate_link_code
 from data import mod_version as mver
 from data import policy as policy
+from data import guild_config
 from cost_guard import guard as cost_guard
 
 log = logging.getLogger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  /admin setchannel — per-guild channel configuration UI
+# ═══════════════════════════════════════════════════════════════════════════
+
+class SetChannelView(View):
+    """Embed + selects letting the admin map each channel type to a channel in
+    THIS guild. Re-renders after every change so the status list stays current."""
+
+    def __init__(self, guild: discord.Guild, author_id: int):
+        super().__init__(timeout=300)
+        self.guild = guild
+        self.author_id = author_id
+        self.selected_key: str | None = None
+        self._rebuild()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("This panel isn't yours.", ephemeral=True)
+            return False
+        return True
+
+    def _rebuild(self) -> None:
+        self.clear_items()
+        self.add_item(_ChannelTypeSelect(self))
+        if self.selected_key:
+            kind = guild_config.CHANNEL_TYPES[self.selected_key][2]
+            # Text slots accept both normal text and announcement (news) channels —
+            # the bot can post in either. Category slots accept only categories.
+            ctypes = ([discord.ChannelType.category] if kind == "category"
+                      else [discord.ChannelType.text, discord.ChannelType.news])
+            self.add_item(_GuildChannelSelect(self, ctypes))
+            self.add_item(_ClearChannelButton(self))
+            # Fallback for Discord's native picker, which truncates the channel
+            # list (channels in the bottom-most category often don't appear).
+            # Lets the admin paste a channel ID / #mention directly instead.
+            self.add_item(_SetChannelByIdButton(self))
+
+    def build_embed(self) -> discord.Embed:
+        lines = []
+        for key, (label, desc, kind, _attr) in guild_config.CHANNEL_TYPES.items():
+            cid = guild_config.get_channel_id(self.guild.id, key)
+            ch = self.guild.get_channel(cid) if cid else None
+            mark = "✅" if ch else "❌"
+            value = ch.mention if ch else "_not set_"
+            sel = " ⬅️" if key == self.selected_key else ""
+            lines.append(f"{mark} **{label}** — {value}{sel}")
+        embed = discord.Embed(
+            title="⚙️ Channel configuration",
+            description="\n".join(lines),
+            color=discord.Color.blurple(),
+        )
+        embed.set_footer(text=f"{self.guild.name} • pick a type below, then choose a channel.")
+        return embed
+
+
+class _ChannelTypeSelect(Select):
+    def __init__(self, parent: SetChannelView):
+        self.parent_view = parent
+        options = []
+        for key, (label, desc, kind, _attr) in guild_config.CHANNEL_TYPES.items():
+            cid = guild_config.get_channel_id(parent.guild.id, key)
+            ch = parent.guild.get_channel(cid) if cid else None
+            options.append(discord.SelectOption(
+                label=label[:100],
+                value=key,
+                description=(f"Currently: #{ch.name}" if ch else "Not set")[:100],
+                emoji="✅" if ch else "⬜",
+                default=(key == parent.selected_key),
+            ))
+        super().__init__(placeholder="Pick a channel type to configure…",
+                         min_values=1, max_values=1, options=options, row=0)
+
+    async def callback(self, interaction: discord.Interaction):
+        self.parent_view.selected_key = self.values[0]
+        self.parent_view._rebuild()
+        await interaction.response.edit_message(
+            embed=self.parent_view.build_embed(), view=self.parent_view)
+
+
+class _GuildChannelSelect(discord.ui.ChannelSelect):
+    def __init__(self, parent: SetChannelView, ctypes: list[discord.ChannelType]):
+        self.parent_view = parent
+        label = guild_config.CHANNEL_TYPES[parent.selected_key][0]
+        # Pre-select the currently configured channel so the picker reflects it.
+        cid = guild_config.get_channel_id(parent.guild.id, parent.selected_key)
+        current = parent.guild.get_channel(cid) if cid else None
+        defaults = [current] if current is not None else []
+        super().__init__(channel_types=ctypes, min_values=1, max_values=1,
+                         default_values=defaults,
+                         placeholder=f"Choose a channel for: {label}"[:150], row=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        ch = self.values[0]
+        key = self.parent_view.selected_key
+        guild_id = self.parent_view.guild.id
+        guild_config.set_channel(guild_id, key, ch.id)
+        log.info("%s set channel '%s' -> %s in guild %s",
+                 interaction.user, key, ch.id, guild_id)
+        self.parent_view._rebuild()
+        await interaction.response.edit_message(
+            embed=self.parent_view.build_embed(), view=self.parent_view)
+        # When a marketplace/auction channel is first set, mirror the existing
+        # global catalogue into it (back-fill) so the server isn't empty.
+        if key in ("marketplace", "auction"):
+            interaction.client.loop.create_task(
+                _backfill_after_setchannel(interaction, key, guild_id))
+
+
+async def _backfill_after_setchannel(interaction: discord.Interaction, key: str, guild_id: int) -> None:
+    """Background task: mirror existing marketplace/auction content into a freshly
+    configured channel, then quietly report the count to the admin."""
+    try:
+        if key == "marketplace":
+            from cogs.marketplace import backfill_guild
+            label = "marketplace listing"
+        else:
+            from cogs.auctions import backfill_guild
+            label = "open auction"
+        n = await backfill_guild(interaction.client, guild_id)
+        if n:
+            await interaction.followup.send(
+                f"📦 Mirrored **{n}** existing {label}(s) into this server's channel.",
+                ephemeral=True)
+    except Exception as exc:
+        log.error("Back-fill (%s) failed for guild %s: %s", key, guild_id, exc)
+
+
+class _ClearChannelButton(Button):
+    def __init__(self, parent: SetChannelView):
+        self.parent_view = parent
+        super().__init__(label="Clear this channel", style=discord.ButtonStyle.red, row=2)
+
+    async def callback(self, interaction: discord.Interaction):
+        guild_config.clear_channel(self.parent_view.guild.id, self.parent_view.selected_key)
+        log.info("%s cleared channel '%s' in guild %s",
+                 interaction.user, self.parent_view.selected_key, self.parent_view.guild.id)
+        self.parent_view._rebuild()
+        await interaction.response.edit_message(
+            embed=self.parent_view.build_embed(), view=self.parent_view)
+
+
+class _SetChannelByIdButton(Button):
+    """Opens a modal to set the selected slot from a pasted channel ID / #mention,
+    bypassing Discord's native channel picker (which truncates long lists)."""
+
+    def __init__(self, parent: SetChannelView):
+        self.parent_view = parent
+        super().__init__(label="Enter ID / #mention",
+                         style=discord.ButtonStyle.gray, row=2)
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(_SetChannelByIdModal(self.parent_view))
+
+
+class _SetChannelByIdModal(Modal, title="Set channel by ID / mention"):
+    channel_ref = TextInput(
+        label="Channel ID or name",
+        placeholder="e.g. 1518702830637027526 or ticket-creation",
+        required=True, max_length=100,
+    )
+
+    def __init__(self, parent: SetChannelView):
+        super().__init__()
+        self.parent_view = parent
+
+    async def on_submit(self, interaction: discord.Interaction):
+        key = self.parent_view.selected_key
+        kind = guild_config.CHANNEL_TYPES[key][2]
+        guild = self.parent_view.guild
+
+        raw = str(self.channel_ref.value).strip()
+        # Accept a raw ID or a <#id> mention (modals submit mentions as plain text,
+        # but a pasted <#id> still carries the digits).
+        m = re.search(r"\d{15,25}", raw)
+        ch = guild.get_channel(int(m.group())) if m else None
+        # Otherwise resolve by channel name (with or without a leading '#').
+        if ch is None:
+            name = raw.lstrip("#").casefold()
+            ch = next((c for c in guild.channels if c.name.casefold() == name), None)
+
+        if ch is None:
+            return await interaction.response.send_message(
+                "❌ Couldn't find a channel with that ID/name in this server.",
+                ephemeral=True)
+
+        # Enforce the same type constraint as the native picker.
+        if kind == "category":
+            ok = isinstance(ch, discord.CategoryChannel)
+            want = "a category"
+        else:
+            ok = ch.type in (discord.ChannelType.text, discord.ChannelType.news)
+            want = "a text or announcement channel"
+        if not ok:
+            return await interaction.response.send_message(
+                f"❌ **{guild_config.CHANNEL_TYPES[key][0]}** must be {want}.",
+                ephemeral=True)
+
+        guild_config.set_channel(guild.id, key, ch.id)
+        log.info("%s set channel '%s' -> %s (by ID) in guild %s",
+                 interaction.user, key, ch.id, guild.id)
+        self.parent_view._rebuild()
+        await interaction.response.edit_message(
+            embed=self.parent_view.build_embed(), view=self.parent_view)
+
+        if key in ("marketplace", "auction"):
+            interaction.client.loop.create_task(
+                _backfill_after_setchannel(interaction, key, guild.id))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  /admin setrole — per-guild role mapping UI
+# ═══════════════════════════════════════════════════════════════════════════
+
+class SetRoleView(View):
+    """Embed + selects letting the admin map each bot role key (level_1..15,
+    notifications, mod) to a role in THIS guild."""
+
+    def __init__(self, guild: discord.Guild, author_id: int):
+        super().__init__(timeout=300)
+        self.guild = guild
+        self.author_id = author_id
+        self.selected_key: str | None = None
+        self._rebuild()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("This panel isn't yours.", ephemeral=True)
+            return False
+        return True
+
+    def _rebuild(self) -> None:
+        self.clear_items()
+        self.add_item(_RoleKeySelect(self))
+        if self.selected_key:
+            self.add_item(_GuildRoleSelect(self))
+            self.add_item(_ClearRoleButton(self))
+
+    def build_embed(self) -> discord.Embed:
+        missing = guild_config.missing_role_keys(self.guild)
+        ready = not missing
+        lines = []
+        for key in guild_config.all_role_keys():
+            role = guild_config.resolve_role(self.guild, key)
+            mark = "✅" if role else "❌"
+            value = role.mention if role else "_not set_"
+            sel = " ⬅️" if key == self.selected_key else ""
+            lines.append(f"{mark} **{guild_config.role_label(key)}** — {value}{sel}")
+        status = ("🟢 **Role feature ENABLED** — all required roles are mapped."
+                  if ready else
+                  f"🔴 **Role feature DISABLED** — {len(missing)} required role(s) "
+                  "still unmapped (level + notification roles must all be set).")
+        embed = discord.Embed(
+            title="🎭 Role configuration",
+            description=status + "\n\n" + "\n".join(lines),
+            color=discord.Color.green() if ready else discord.Color.orange(),
+        )
+        embed.set_footer(text=f"{self.guild.name} • pick a role key below, then choose a role.")
+        return embed
+
+
+class _RoleKeySelect(Select):
+    def __init__(self, parent: SetRoleView):
+        self.parent_view = parent
+        options = []
+        for key in guild_config.all_role_keys():
+            role = guild_config.resolve_role(parent.guild, key)
+            options.append(discord.SelectOption(
+                label=guild_config.role_label(key)[:100],
+                value=key,
+                description=(f"Currently: @{role.name}" if role else "Not set")[:100],
+                emoji="✅" if role else "⬜",
+                default=(key == parent.selected_key),
+            ))
+        super().__init__(placeholder="Pick a role to map…",
+                         min_values=1, max_values=1, options=options, row=0)
+
+    async def callback(self, interaction: discord.Interaction):
+        self.parent_view.selected_key = self.values[0]
+        self.parent_view._rebuild()
+        await interaction.response.edit_message(
+            embed=self.parent_view.build_embed(), view=self.parent_view)
+
+
+class _GuildRoleSelect(discord.ui.RoleSelect):
+    def __init__(self, parent: SetRoleView):
+        self.parent_view = parent
+        label = guild_config.role_label(parent.selected_key)
+        # Pre-select the currently mapped role so the picker reflects it.
+        current = guild_config.resolve_role(parent.guild, parent.selected_key)
+        defaults = [current] if current is not None else []
+        super().__init__(min_values=1, max_values=1,
+                         default_values=defaults,
+                         placeholder=f"Choose a role for: {label}"[:150], row=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        role = self.values[0]
+        guild_config.set_role(self.parent_view.guild.id, self.parent_view.selected_key, role.id)
+        log.info("%s mapped role '%s' -> %s in guild %s",
+                 interaction.user, self.parent_view.selected_key, role.id, self.parent_view.guild.id)
+        self.parent_view._rebuild()
+        await interaction.response.edit_message(
+            embed=self.parent_view.build_embed(), view=self.parent_view)
+
+
+class _ClearRoleButton(Button):
+    def __init__(self, parent: SetRoleView):
+        self.parent_view = parent
+        super().__init__(label="Clear this mapping", style=discord.ButtonStyle.red, row=2)
+
+    async def callback(self, interaction: discord.Interaction):
+        guild_config.clear_role(self.parent_view.guild.id, self.parent_view.selected_key)
+        log.info("%s cleared role '%s' in guild %s",
+                 interaction.user, self.parent_view.selected_key, self.parent_view.guild.id)
+        self.parent_view._rebuild()
+        await interaction.response.edit_message(
+            embed=self.parent_view.build_embed(), view=self.parent_view)
 
 
 def is_admin():
@@ -41,6 +362,36 @@ class Admin(commands.Cog, name="Admin"):
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+
+    # ── /setchannel ───────────────────────────────────────────────────────────
+    @app_commands.command(
+        name="setchannel",
+        description="Configure which channels the bot uses in this server (Admin only)",
+    )
+    @is_admin()
+    async def setchannel(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "❌ Run this inside a server.", ephemeral=True)
+            return
+        view = SetChannelView(interaction.guild, interaction.user.id)
+        await interaction.response.send_message(
+            embed=view.build_embed(), view=view, ephemeral=True)
+
+    # ── /setrole ──────────────────────────────────────────────────────────────
+    @app_commands.command(
+        name="setrole",
+        description="Map the bot's level / notification / mod roles in this server (Admin only)",
+    )
+    @is_admin()
+    async def setrole(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "❌ Run this inside a server.", ephemeral=True)
+            return
+        view = SetRoleView(interaction.guild, interaction.user.id)
+        await interaction.response.send_message(
+            embed=view.build_embed(), view=view, ephemeral=True)
 
     # ── /announce ─────────────────────────────────────────────────────────────
     @app_commands.command(

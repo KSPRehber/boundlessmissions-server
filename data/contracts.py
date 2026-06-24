@@ -30,8 +30,11 @@ FLAG_DESIGN = "flag_design"
 ContractData = dict[str, Any]
 
 
-def _col(guild_id: int):
-    return _db.collection("guilds").document(str(guild_id)).collection("contracts")
+def _col(guild_id: int = 0):
+    """The single GLOBAL contracts collection — a contract can run between users in
+    different servers. guild_id is accepted for call-site compatibility but is only
+    stored on the doc as the origin guild (used for channel routing)."""
+    return _db.collection("contracts")
 
 
 def create_contract(

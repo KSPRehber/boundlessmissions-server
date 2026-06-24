@@ -23,6 +23,7 @@ from data.store import store
 from data import marketplace as mkt
 from data import imports as imp
 from data.contracts import download_url
+from data import guild_config
 
 log = logging.getLogger(__name__)
 
@@ -91,79 +92,162 @@ class BuyButton(DynamicItem[Button], template=r"mk_buy:" + _ID_PATTERN):
         price = int(listing["price"])
         already_owned = str(buyer_id) in listing.get("buyers", [])
 
-        # Charge only first-time buyers; repeat buyers get a free re-delivery.
-        if not already_owned:
-            # Atomic check-and-deduct so a double-click / concurrent buy can't pay
-            # for the craft twice from the same balance (or overdraw via the clamp).
-            if not await store.try_debit(gid, buyer_id, price):
-                buyer = store.get_user(gid, buyer_id)
-                await interaction.followup.send(
-                    f"❌ You need **{price:,}** {settings.CURRENCY_SYMBOL} but only have "
-                    f"**{buyer['balance']:,}**.",
-                    ephemeral=True,
-                )
-                return
-            await store.add_balance(gid, seller_id, price)
-
-        # Download the blueprint and DM it to the buyer.
-        try:
-            data = await download_url(listing["craft_url"])
-        except Exception as exc:
-            log.error("Failed to download craft for listing %s: %s", lid, exc)
-            if not already_owned:  # refund — we charged but can't deliver
-                await store.add_balance(gid, buyer_id, price)
-                await store.add_balance(gid, seller_id, -price)
-            await interaction.followup.send("❌ Could not fetch the craft file. You were not charged.", ephemeral=True)
+        # Repeat buyers get a free re-delivery — nothing is charged, so skip the
+        # confirmation and re-send straight away.
+        if already_owned:
+            await _execute_purchase(interaction, gid, listing)
             return
 
-        craft_file = discord.File(io.BytesIO(data), filename=listing["craft_filename"])
-        try:
-            await interaction.user.send(
-                content=(f"🛒 Here is **{listing['craft_name']}** that you purchased.\n"
-                         f"Place the `.craft` file in your KSP `Ships/{listing.get('craft_type', 'VAB')}/` "
-                         f"folder, or hit **Load to KSP** to auto-import it at the Space Center."),
-                file=craft_file,
-                view=DMImportView(lid, gid),
-            )
-        except discord.Forbidden:
-            if not already_owned:  # refund — DMs closed, no delivery
-                await store.add_balance(gid, buyer_id, price)
-                await store.add_balance(gid, seller_id, -price)
+        # First-time buyers see a confirmation showing the price and their balance
+        # before/after, and must press Confirm before any coins move.
+        balance = store.get_user(gid, buyer_id)["balance"]
+        if balance < price:
             await interaction.followup.send(
-                "❌ I couldn't DM you. Enable **Direct Messages** from server members and try again. "
-                "You were not charged.",
+                f"❌ You need **{price:,}** {settings.CURRENCY_SYMBOL} but only have "
+                f"**{balance:,}**.",
                 ephemeral=True,
             )
             return
 
-        if already_owned:
-            await interaction.followup.send("✅ Re-sent the blueprint to your DMs (free, since you already own it).", ephemeral=True)
-            return
-
-        # Record the sale and refresh the channel embed.
-        mkt.record_purchase(gid, lid, buyer_id)
-        listing = mkt.get_listing(gid, lid)
-        try:
-            await interaction.message.edit(embed=listing_embed(listing), view=self.view)
-        except Exception:
-            pass
-
         await interaction.followup.send(
-            f"✅ Purchased **{listing['craft_name']}** for **{price:,}** {settings.CURRENCY_SYMBOL}. "
-            "Check your DMs for the blueprint!",
+            embed=confirm_purchase_embed(listing, balance, price),
+            view=ConfirmPurchaseView(lid, gid, buyer_id),
             ephemeral=True,
         )
 
-        # Notify the seller.
-        try:
-            seller = await interaction.client.fetch_user(seller_id)
-            await seller.send(
-                f"💰 **{interaction.user.display_name}** bought your craft **{listing['craft_name']}** "
-                f"for **{price:,}** {settings.CURRENCY_SYMBOL}."
+
+def confirm_purchase_embed(listing: dict, balance_before: int, price: int) -> discord.Embed:
+    """Pre-purchase confirmation: price plus the buyer's balance before and after."""
+    sym = settings.CURRENCY_SYMBOL
+    balance_after = balance_before - price
+    e = discord.Embed(
+        title="🛒 Confirm purchase",
+        description=f"You're about to buy **{listing['craft_name']}**.",
+        color=discord.Color.gold(),
+    )
+    e.add_field(name="Price", value=f"−{price:,} {sym}", inline=False)
+    e.add_field(name="Balance now", value=f"{balance_before:,} {sym}", inline=True)
+    e.add_field(name="Balance after", value=f"**{balance_after:,}** {sym}", inline=True)
+    e.set_footer(text="Confirm within 60 seconds.")
+    return e
+
+
+class ConfirmPurchaseView(View):
+    """Transient ephemeral confirmation shown before a first-time purchase. Not a
+    persistent DynamicItem — it only needs to live for its 60s timeout, and the
+    purchase is re-validated on confirm so a stale click can't double-charge."""
+
+    def __init__(self, listing_id: str, guild_id: int, buyer_id: int):
+        super().__init__(timeout=60)
+        self.lid = listing_id
+        self.gid = int(guild_id)
+        self.buyer_id = int(buyer_id)
+
+    @discord.ui.button(label="✅ Confirm", style=discord.ButtonStyle.green)
+    async def confirm(self, interaction: discord.Interaction, button: Button):
+        if interaction.user.id != self.buyer_id:
+            await interaction.response.send_message("❌ This isn't your purchase.", ephemeral=True)
+            return
+        listing = mkt.get_listing(self.gid, self.lid)
+        if not listing or listing.get("status") != mkt.ACTIVE:
+            await interaction.response.edit_message(
+                content="❌ This craft is no longer for sale.", embed=None, view=None)
+            return
+        await interaction.response.edit_message(
+            content="⏳ Processing your purchase…", embed=None, view=None)
+        await _execute_purchase(interaction, self.gid, listing)
+
+    @discord.ui.button(label="✖️ Cancel", style=discord.ButtonStyle.grey)
+    async def cancel(self, interaction: discord.Interaction, button: Button):
+        if interaction.user.id != self.buyer_id:
+            await interaction.response.send_message("❌ This isn't your purchase.", ephemeral=True)
+            return
+        await interaction.response.edit_message(
+            content="Purchase cancelled.", embed=None, view=None)
+
+
+async def _execute_purchase(interaction: discord.Interaction, gid: int, listing: dict) -> None:
+    """Charge a first-time buyer, deliver the blueprint via DM, and notify the seller.
+    The interaction must already be deferred or responded to (so followup works).
+    Reused by the confirm button and the free re-delivery path for repeat buyers."""
+    lid = listing["listing_id"]
+    buyer_id = interaction.user.id
+    seller_id = int(listing["seller_id"])
+    price = int(listing["price"])
+    already_owned = str(buyer_id) in listing.get("buyers", [])
+
+    # Charge only first-time buyers; repeat buyers get a free re-delivery.
+    if not already_owned:
+        # Atomic check-and-deduct so a double-click / concurrent buy can't pay
+        # for the craft twice from the same balance (or overdraw via the clamp).
+        if not await store.try_debit(gid, buyer_id, price):
+            buyer = store.get_user(gid, buyer_id)
+            await interaction.followup.send(
+                f"❌ You need **{price:,}** {settings.CURRENCY_SYMBOL} but only have "
+                f"**{buyer['balance']:,}**.",
+                ephemeral=True,
             )
-        except (discord.Forbidden, discord.HTTPException):
-            pass
-        log.info("Marketplace: %s bought listing %s for %d", interaction.user, lid, price)
+            return
+        await store.add_balance(gid, seller_id, price)
+
+    # Download the blueprint and DM it to the buyer.
+    try:
+        data = await download_url(listing["craft_url"])
+    except Exception as exc:
+        log.error("Failed to download craft for listing %s: %s", lid, exc)
+        if not already_owned:  # refund — we charged but can't deliver
+            await store.add_balance(gid, buyer_id, price)
+            await store.add_balance(gid, seller_id, -price)
+        await interaction.followup.send("❌ Could not fetch the craft file. You were not charged.", ephemeral=True)
+        return
+
+    craft_file = discord.File(io.BytesIO(data), filename=listing["craft_filename"])
+    try:
+        await interaction.user.send(
+            content=(f"🛒 Here is **{listing['craft_name']}** that you purchased.\n"
+                     f"Place the `.craft` file in your KSP `Ships/{listing.get('craft_type', 'VAB')}/` "
+                     f"folder, or hit **Load to KSP** to auto-import it at the Space Center."),
+            file=craft_file,
+            view=DMImportView(lid, gid),
+        )
+    except discord.Forbidden:
+        if not already_owned:  # refund — DMs closed, no delivery
+            await store.add_balance(gid, buyer_id, price)
+            await store.add_balance(gid, seller_id, -price)
+        await interaction.followup.send(
+            "❌ I couldn't DM you. Enable **Direct Messages** from server members and try again. "
+            "You were not charged.",
+            ephemeral=True,
+        )
+        return
+
+    if already_owned:
+        await interaction.followup.send("✅ Re-sent the blueprint to your DMs (free, since you already own it).", ephemeral=True)
+        return
+
+    # Record the sale and refresh every mirrored embed (sales count).
+    mkt.record_purchase(gid, lid, buyer_id)
+    listing = mkt.get_listing(gid, lid)
+    await edit_all_mirrors(interaction.client, listing)
+
+    new_balance = store.get_user(gid, buyer_id)["balance"]
+    await interaction.followup.send(
+        f"✅ Purchased **{listing['craft_name']}** for **{price:,}** {settings.CURRENCY_SYMBOL}. "
+        f"Your balance is now **{new_balance:,}** {settings.CURRENCY_SYMBOL}. "
+        "Check your DMs for the blueprint!",
+        ephemeral=True,
+    )
+
+    # Notify the seller.
+    try:
+        seller = await interaction.client.fetch_user(seller_id)
+        await seller.send(
+            f"💰 **{interaction.user.display_name}** bought your craft **{listing['craft_name']}** "
+            f"for **{price:,}** {settings.CURRENCY_SYMBOL}."
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+    log.info("Marketplace: %s bought listing %s for %d", interaction.user, lid, price)
 
 
 class LoadToKspButton(DynamicItem[Button], template=r"mk_load:" + _ID_PATTERN):
@@ -225,10 +309,7 @@ class DelistButton(DynamicItem[Button], template=r"mk_delist:" + _ID_PATTERN):
         if listing.get("status") == mkt.ACTIVE:
             mkt.update_listing(self.gid, self.lid, status=mkt.DELISTED)
             listing["status"] = mkt.DELISTED
-        try:
-            await interaction.message.edit(embed=listing_embed(listing), view=None)
-        except Exception:
-            pass
+        await edit_all_mirrors(interaction.client, listing)
         await interaction.followup.send("✅ Craft delisted.", ephemeral=True)
         log.info("Marketplace: %s delisted listing %s", interaction.user, self.lid)
 
@@ -244,19 +325,86 @@ class ListingView(View):
 MARKETPLACE_DYNAMIC_ITEMS = [BuyButton, DelistButton, LoadToKspButton]
 
 
-async def post_listing(bot: commands.Bot, guild_id: int, listing: dict) -> int | None:
-    """Post a listing embed to the marketplace channel. Returns the message id."""
-    if not settings.MARKETPLACE_CHANNEL_ID:
-        log.warning("MARKETPLACE_CHANNEL_ID not set — cannot post listing %s", listing["listing_id"])
-        return None
-    channel = bot.get_channel(settings.MARKETPLACE_CHANNEL_ID)
+async def post_listing(bot: commands.Bot, listing: dict) -> list[dict]:
+    """Mirror a listing into EVERY server that has a marketplace channel configured,
+    recording each mirror so status edits can fan out. Returns the mirrors list."""
+    lid = listing["listing_id"]
+    mirrors: list[dict] = []
+    for guild in bot.guilds:
+        channel = guild_config.resolve_channel(bot, guild.id, "marketplace")
+        if channel is None:
+            continue
+        try:
+            msg = await channel.send(embed=listing_embed(listing), view=ListingView(lid, guild.id))
+            mirrors.append({"guild_id": str(guild.id), "channel_id": str(channel.id),
+                            "message_id": str(msg.id)})
+        except discord.Forbidden:
+            log.warning("No permission to post marketplace listing in guild %s", guild.id)
+        except Exception as exc:
+            log.warning("Failed to mirror listing %s into guild %s: %s", lid, guild.id, exc)
+    if mirrors:
+        mkt.update_listing(0, lid, mirrors=mirrors)
+    else:
+        log.warning("Listing %s created but no server has a marketplace channel set", lid)
+    return mirrors
+
+
+async def backfill_guild(bot: commands.Bot, guild_id: int) -> int:
+    """Mirror every active listing into `guild_id`'s marketplace channel — used when
+    a server configures its marketplace channel after listings already exist.
+    Idempotent: skips listings already mirrored in this guild. Returns count posted."""
+    channel = guild_config.resolve_channel(bot, guild_id, "marketplace")
     if channel is None:
-        log.warning("Marketplace channel %s not found", settings.MARKETPLACE_CHANNEL_ID)
-        return None
-    view = ListingView(listing["listing_id"], guild_id)
-    msg = await channel.send(embed=listing_embed(listing), view=view)
-    mkt.update_listing(guild_id, listing["listing_id"], channel_msg_id=str(msg.id))
-    return msg.id
+        return 0
+    posted = 0
+    for listing in mkt.list_active(0):
+        lid = listing["listing_id"]
+        mirrors = listing.get("mirrors", []) or []
+        if any(str(m.get("guild_id")) == str(guild_id) for m in mirrors):
+            continue
+        try:
+            msg = await channel.send(embed=listing_embed(listing), view=ListingView(lid, guild_id))
+        except Exception as exc:
+            log.warning("Backfill: could not mirror listing %s into guild %s: %s", lid, guild_id, exc)
+            continue
+        mirrors.append({"guild_id": str(guild_id), "channel_id": str(channel.id),
+                        "message_id": str(msg.id)})
+        mkt.update_listing(0, lid, mirrors=mirrors)
+        posted += 1
+    if posted:
+        log.info("Backfilled %d marketplace listings into guild %s", posted, guild_id)
+    return posted
+
+
+async def delete_all_mirrors(bot: commands.Bot, listing: dict) -> None:
+    """Delete every mirrored marketplace message for a listing across servers — used
+    when the seller permanently deletes a listing (vs. just delisting it)."""
+    for m in listing.get("mirrors", []) or []:
+        ch = bot.get_channel(int(m["channel_id"]))
+        if ch is None:
+            continue
+        try:
+            msg = await ch.fetch_message(int(m["message_id"]))
+            await msg.delete()
+        except (discord.NotFound, discord.HTTPException):
+            pass
+
+
+async def edit_all_mirrors(bot: commands.Bot, listing: dict) -> None:
+    """Refresh every mirrored message for a listing (e.g. after a sale or delist).
+    Drops the Buy/Delist view once the listing is no longer active."""
+    lid = listing["listing_id"]
+    active = listing.get("status") == mkt.ACTIVE
+    for m in listing.get("mirrors", []) or []:
+        ch = bot.get_channel(int(m["channel_id"]))
+        if ch is None:
+            continue
+        try:
+            msg = await ch.fetch_message(int(m["message_id"]))
+            view = ListingView(lid, int(m["guild_id"])) if active else None
+            await msg.edit(embed=listing_embed(listing), view=view)
+        except (discord.NotFound, discord.HTTPException):
+            pass
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -288,7 +436,7 @@ class Marketplace(commands.Cog, name="Marketplace"):
             description="\n".join(lines),
             color=discord.Color.blurple(),
         )
-        if settings.MARKETPLACE_CHANNEL_ID:
+        if guild_config.get_channel_id(gid, "marketplace"):
             embed.set_footer(text="Buy crafts from the marketplace channel.")
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -308,16 +456,8 @@ class Marketplace(commands.Cog, name="Marketplace"):
             mkt.update_listing(gid, listing_id, status=mkt.DELISTED)
             listing["status"] = mkt.DELISTED
 
-        # Update the channel message if we know it.
-        msg_id = listing.get("channel_msg_id")
-        if msg_id and settings.MARKETPLACE_CHANNEL_ID:
-            channel = self.bot.get_channel(settings.MARKETPLACE_CHANNEL_ID)
-            if channel:
-                try:
-                    msg = await channel.fetch_message(int(msg_id))
-                    await msg.edit(embed=listing_embed(listing), view=None)
-                except (discord.NotFound, discord.HTTPException):
-                    pass
+        # Update every mirrored message across servers.
+        await edit_all_mirrors(self.bot, listing)
         await interaction.response.send_message("✅ Craft delisted.", ephemeral=True)
 
 

@@ -313,9 +313,42 @@ class MarketplaceListing(BaseModel):
     price: int
     sales_count: int = 0
     created_at: Optional[str] = None
+    # Fields the website needs (the KSP mod ignores them). mods powers the
+    # filter-by-mod facet; thumbnail_url is the square NW-view card image and
+    # blueprint_url the full multi-view render shown in the detail view; status lets
+    # the "My Uploads" view show delisted crafts; craft_url is the direct download.
+    mods: list[str] = []
+    thumbnail_url: Optional[str] = None
+    blueprint_url: Optional[str] = None
+    craft_url: Optional[str] = None
+    craft_filename: Optional[str] = None
+    status: str = "active"
 
 class MarketplaceListingsResponse(BaseModel):
     listings: list[MarketplaceListing]
+
+
+# ── Marketplace (website) ────────────────────────────────────────────────────
+
+class MarketplaceListingsPage(BaseModel):
+    """A single page of marketplace listings for the website grid (25/page),
+    plus the total count and the set of mods present across the filtered result
+    so the UI can render a filter facet."""
+    listings: list[MarketplaceListing]
+    total: int
+    page: int
+    pages: int
+    available_mods: list[str] = []
+
+class WebBuyResult(BaseModel):
+    success: bool
+    message: str
+    balance: int = 0
+    # On success, a direct download of the purchased .craft (the listing's public
+    # Storage URL). The craft is also queued for KSP auto-import server-side.
+    craft_url: Optional[str] = None
+    craft_filename: Optional[str] = None
+    already_owned: bool = False
 
 
 # ── Notifications ────────────────────────────────────────────────────────────

@@ -16,6 +16,7 @@ from cogs.contract_views import (
     ContractOfferView, ContractWorkView, ContractReviewView,
     DisputeView, SettleApprovalView, ModReviewView, _embed,
 )
+from cogs import perms
 
 log = logging.getLogger(__name__)
 
@@ -85,6 +86,9 @@ class Contracts(commands.Cog, name="Contracts"):
         gid = interaction.guild_id
         uid = interaction.user.id
         sym = settings.CURRENCY_SYMBOL
+
+        if await perms.block_if_mod_only(interaction):
+            return
 
         # Validations (fast — before defer)
         if user.id == uid and not settings.CONTRACT_ALLOW_SELF:
@@ -159,6 +163,9 @@ class Contracts(commands.Cog, name="Contracts"):
         gid = interaction.guild_id
         uid = interaction.user.id
         sym = settings.CURRENCY_SYMBOL
+
+        if await perms.block_if_mod_only(interaction):
+            return
 
         if user.id == uid and not settings.CONTRACT_ALLOW_SELF:
             await interaction.response.send_message(tp(gid, uid, "ct.err_self"), ephemeral=True)

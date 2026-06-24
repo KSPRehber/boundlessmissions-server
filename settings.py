@@ -17,6 +17,20 @@ def _env_float(key: str, default: float) -> float:
         return default
 
 
+# ── Blueprint render scale ───────────────────────────────────────────────────
+#
+# The KSP mod renders vessel "blueprint" images at a fixed base size of
+# 2048×1100 px, multiplied by this scale (SCALE=2 → 4096×2200). The server uses
+# this value to derive a tight per-file upload cap for blueprint/screenshot
+# uploads (see MAX_BLUEPRINT_BYTES in api_server.py), so a tampered client can't
+# pad a render to the generic 25 MB cap and spray oversized uploads at the API.
+#
+# IMPORTANT: keep this in sync with `const int SCALE` in
+# KSP Mod Side/GeneKerman/VesselRenderer.cs. If you raise the mod's SCALE,
+# raise this too or legitimate renders will be rejected as too large.
+BLUEPRINT_SCALE = 2
+
+
 # ── Cost Guard: paid-service spending caps ───────────────────────────────────
 #
 # The bot leans on two paid Google services: Gemini (AI screenshot/mission
@@ -129,6 +143,20 @@ SCREENSHOT_XP_PER_DIFFICULTY = 50
 # KCoins awarded per difficulty point (e.g. difficulty 7 × 18 = 126 KCoins)
 SCREENSHOT_COINS_PER_DIFFICULTY = 18
 
+# Per-user rate limit on /analyze (each call is a paid Gemini request drawn from
+# the shared monthly budget). At most SCREENSHOT_RATELIMIT_RATE calls per
+# SCREENSHOT_RATELIMIT_PER seconds per user; further calls are rejected until the
+# window clears. Stops one user from draining everyone's AI budget.
+SCREENSHOT_RATELIMIT_RATE = 3
+SCREENSHOT_RATELIMIT_PER = 60.0
+
+# Anti-cheat: extreme-rate flood detection on authenticated, cost/reward-bearing
+# API endpoints. These are far above any human play rate, so crossing one is a
+# strong scripted-abuse signal that opens a (deduped) moderator ticket via the
+# suspicion system. Tuple = (max actions, window seconds) per user.
+FLOOD_SUBMIT = (12, 60.0)        # contract submissions
+FLOOD_ACHIEVEMENT = (20, 60.0)   # achievement-photo captures
+
 # ── Corporations ─────────────────────────────────────────────────────────────
 
 # Discord category ID where corp channels are created
@@ -145,6 +173,14 @@ CONTRACT_MOD_CHANNEL_ID: int | None = 1513934242315374744
 
 # Allow users to send contracts to themselves (for testing only!)
 CONTRACT_ALLOW_SELF = False
+
+# ── Mod-only gameplay ─────────────────────────────────────────────────────────
+# When True, gameplay commands that the in-game KSP mod can perform itself
+# (screenshot analysis, player-to-player contracts) are disabled on Discord, so
+# the actions can only be triggered from inside the game. Players who invoke
+# them on Discord get an ephemeral notice pointing them to the mod. Gated
+# commands: /analyze, /contract, /flagcontract.
+MOD_ONLY_GAMEPLAY = False
 
 # ── Auctions (reverse / Dutch) ───────────────────────────────────────────────
 # An issuer posts a mission with a STARTING price (escrowed up front). Contractors
@@ -181,8 +217,8 @@ WEEKLY_MISSIONS_CHANNEL_ID = 1510353237922938949
 WEEKLY_MISSIONS_COUNT = 20
 
 # Rewards per difficulty point
-WEEKLY_XP_PER_DIFFICULTY = 50
-WEEKLY_COINS_PER_DIFFICULTY = 30
+WEEKLY_XP_PER_DIFFICULTY = 100
+WEEKLY_COINS_PER_DIFFICULTY = 60
 
 # Fine = 50% of money reward
 WEEKLY_FINE_PERCENT = 50

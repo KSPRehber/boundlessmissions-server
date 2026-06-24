@@ -12,6 +12,7 @@ from discord.ext import commands, tasks
 
 import settings
 from data.store import store, xp_for_level
+from data import guild_config
 from i18n import t, tp, load_all_langs
 
 log = logging.getLogger(__name__)
@@ -27,6 +28,7 @@ class XP(commands.Cog, name="XP"):
         """Called when the cog is loaded — start background tasks."""
         await store.load()
         load_all_langs()
+        guild_config.load()
         self.auto_save.start()
         self.scan_members_loop.start()
 
@@ -122,10 +124,9 @@ class XP(commands.Cog, name="XP"):
             )
 
             channel = message.channel
-            if settings.LEVEL_UP_CHANNEL_ID:
-                ch = message.guild.get_channel(settings.LEVEL_UP_CHANNEL_ID)
-                if ch:
-                    channel = ch
+            ch = guild_config.resolve_channel(self.bot, message.guild.id, "level_up")
+            if ch:
+                channel = ch
 
             gid = message.guild.id
             embed = discord.Embed(

@@ -25,6 +25,7 @@ from discord.ui import View, Button, DynamicItem, Select, Modal, TextInput
 
 import settings
 from data.store import _db
+from data import guild_config
 
 try:
     from firebase_admin import firestore as _fs
@@ -124,9 +125,9 @@ async def create_ticket(
     reports where the suspect must NOT see it); only mods can then close it.
     `subject_user_id` is shown for context but is NOT granted access. Returns the
     channel, or None if the ticket system is unconfigured / creation failed."""
-    cat_id = settings.TICKET_CATEGORY_ID
+    cat_id = guild_config.get_channel_id(guild.id, "ticket_category")
     if not cat_id:
-        log.warning("create_ticket called but TICKET_CATEGORY_ID is unset")
+        log.warning("create_ticket called but no ticket_category is configured for guild %s", guild.id)
         return None
 
     category = guild.get_channel(cat_id)
@@ -145,7 +146,7 @@ async def create_ticket(
             embed_links=True, attach_files=True,
         ),
     }
-    mod_role = guild.get_role(settings.MOD_ROLE_ID) if settings.MOD_ROLE_ID else None
+    mod_role = guild_config.resolve_role(guild, "mod")
     if mod_role:
         overwrites[mod_role] = discord.PermissionOverwrite(
             view_channel=True, send_messages=True, attach_files=True)
@@ -399,55 +400,51 @@ class Tickets(commands.Cog, name="Tickets"):
         self.bot = bot
         self._panel_ensured = False
 
-    async def _resolve_panel_channel(self):
-        ch_id = settings.TICKET_PANEL_CHANNEL_ID
-        if not ch_id:
+    def _resolve_panel_channel(self, guild: discord.Guild):
+        """The ticket-panel channel configured for this specific guild (or None)."""
+        if guild is None:
             return None
-        channel = self.bot.get_channel(ch_id)
-        if channel is None:
-            try:
-                channel = await self.bot.fetch_channel(ch_id)
-            except Exception as exc:
-                log.warning("Ticket panel channel %s not found: %s", ch_id, exc)
-                return None
-        return channel
+        return guild_config.resolve_channel(self.bot, guild.id, "ticket_panel")
 
     @commands.Cog.listener()
     async def on_ready(self):
         # Auto-post the panel once per process so it's always present without an
         # admin having to run /ticketpanel. Idempotent: skips if one already exists.
+        # Runs per guild so every server with a configured panel channel gets one.
         if self._panel_ensured:
             return
         self._panel_ensured = True
-        channel = await self._resolve_panel_channel()
-        if channel is None:
-            return
-        if await _find_existing_panel(channel, self.bot.user.id):
-            log.info("Ticket panel already present in #%s", getattr(channel, "name", channel.id))
-            return
-        try:
-            await channel.send(embed=_panel_embed(), view=TicketPanelView())
-            log.info("Auto-posted ticket panel in #%s", getattr(channel, "name", channel.id))
-        except discord.Forbidden:
-            log.warning("Missing permission to post the ticket panel in channel %s "
-                        "(need View Channel + Send Messages + Embed Links)", channel.id)
-        except Exception as exc:
-            log.warning("Could not auto-post ticket panel: %s", exc)
+        for guild in self.bot.guilds:
+            channel = self._resolve_panel_channel(guild)
+            if channel is None:
+                continue
+            if await _find_existing_panel(channel, self.bot.user.id):
+                log.info("Ticket panel already present in #%s", getattr(channel, "name", channel.id))
+                continue
+            try:
+                await channel.send(embed=_panel_embed(), view=TicketPanelView())
+                log.info("Auto-posted ticket panel in #%s", getattr(channel, "name", channel.id))
+            except discord.Forbidden:
+                log.warning("Missing permission to post the ticket panel in channel %s "
+                            "(need View Channel + Send Messages + Embed Links)", channel.id)
+            except Exception as exc:
+                log.warning("Could not auto-post ticket panel: %s", exc)
 
     @app_commands.command(name="ticketpanel",
                           description="Post the 'Open a Ticket' panel in the ticket channel")
     @app_commands.default_permissions(administrator=True)
     async def ticketpanel(self, interaction: discord.Interaction):
         """(Admin) Post a fresh ticket panel message."""
-        ch_id = settings.TICKET_PANEL_CHANNEL_ID
+        ch_id = guild_config.get_channel_id(interaction.guild_id, "ticket_panel")
         if not ch_id:
             await interaction.response.send_message(
-                "❌ `TICKET_PANEL_CHANNEL_ID` is not set in settings.py.", ephemeral=True)
+                "❌ No ticket panel channel is configured for this server. "
+                "Set one with `/admin setchannel`.", ephemeral=True)
             return
-        channel = await self._resolve_panel_channel()
+        channel = self._resolve_panel_channel(interaction.guild)
         if channel is None:
             await interaction.response.send_message(
-                f"❌ Could not find the panel channel (`{ch_id}`).", ephemeral=True)
+                f"❌ Could not find the configured panel channel (`{ch_id}`) in this server.", ephemeral=True)
             return
         try:
             await channel.send(embed=_panel_embed(), view=TicketPanelView())

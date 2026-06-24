@@ -12,14 +12,7 @@ from i18n import t, tp
 
 def mod_only():
     async def predicate(interaction: discord.Interaction) -> bool:
-        u = perms.real_user(interaction)   # mimic-safe: gate on the real invoker
-        if isinstance(u, discord.Member):
-            import settings
-            if settings.MOD_ROLE_ID and u.get_role(settings.MOD_ROLE_ID):
-                return True
-            return (u.guild_permissions.kick_members
-                    or u.guild_permissions.administrator)
-        return False
+        return perms.is_mod_user(interaction)   # mimic-safe, per-guild mod role
     return app_commands.check(predicate)
 
 

@@ -82,9 +82,13 @@ def get_gk_channel_mentions(guild: discord.Guild) -> str:
 
 
 def is_mod(member: discord.Member) -> bool:
-    """Check if a member has mod permissions (kick, admin, or MOD_ROLE_ID)."""
-    import settings
-    if settings.MOD_ROLE_ID and member.get_role(settings.MOD_ROLE_ID):
+    """Check if a member has mod permissions (owner, per-guild mod role, kick, or admin)."""
+    from config import cfg
+    from data import guild_config
+    if member.id == cfg.OWNER_ID:
+        return True
+    mod_role = guild_config.resolve_role(member.guild, "mod")
+    if mod_role and member.get_role(mod_role.id):
         return True
     return (
         member.guild_permissions.kick_members

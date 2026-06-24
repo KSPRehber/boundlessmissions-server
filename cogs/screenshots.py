@@ -24,6 +24,7 @@ from i18n import t, tp, S
 import settings
 from data.store import store
 from cost_guard import guard
+from cogs import perms
 
 log = logging.getLogger(__name__)
 
@@ -132,6 +133,12 @@ Assign the highest applicable KSP achievement level from this exact list:
 
 Set "ksp_level" to the corresponding integer (1-15). If the screenshot does not clearly depict one of these achievements, set it to 0. NOTE: Both crewed and uncrewed (probe) missions count equally for all achievements. A probe landing on Eve qualifies for Eve Landing.
 
+### CRITICAL: Landing vs Orbit — do NOT confuse them
+A "**Landing**" achievement (e.g. Mun Landing, Duna Landing, Eve Landing, RSS Moon/Venus Landing) requires the craft to be **physically on the surface** of that body — landing legs/wheels touching the ground, dust/terrain right under the craft, or a planted flag/EVA kerbal standing on the surface. The `situation` must be **landed** or **splashed**.
+- A craft **orbiting**, doing a **flyby**, or hanging in **space above** a body does **NOT** qualify for that body's Landing achievement, no matter how close it looks. Being in orbit of the Mun is NOT "Mun Landing". Being in orbit of Duna is NOT "Duna Landing".
+- If the craft is only in **orbit / suborbital / flying / in space** (not touching the surface), pick the highest achievement that IS satisfied by an orbit (e.g. "Kerbin Orbit" / "RSS Earth Orbit"), or set ksp_level to **0** if no orbit-level achievement in the list applies to that body.
+- When unsure whether the craft is truly landed, treat it as NOT landed and do not award a Landing achievement.
+
 ## Crew Detection
 - Look for crew portraits in bottom-right corner
 - Look for IVA (interior) views showing kerbals
@@ -182,6 +189,7 @@ S.update({
     "ss.error":           {"en": "💥 An error occurred during analysis."},
     "ss.no_api_key":      {"en": "❌ Gemini API key not configured."},
     "ss.ai_budget":       {"en": "❌ AI analysis is temporarily disabled (monthly budget reached). Try again next month."},
+    "ss.cooldown":        {"en": "⏳ You're analyzing too fast. Try again in {seconds}s."},
     "ss.already_reviewed":{"en": "❌ This screenshot has already been analyzed."},
     "ss.not_yours":       {"en": "❌ You can only analyze screenshots that you posted."},
     "ss.title":           {"en": "🔭 KSP Screenshot Analysis"},
@@ -376,6 +384,15 @@ class Screenshots(commands.Cog, name="Screenshots"):
         name="analyze",
         description="Analyze a KSP screenshot (attach images or auto-detect above)",
     )
+    # Each analysis is a paid Gemini call against the shared monthly budget, so
+    # cap it per-user (keyed on guild+user) to stop one player draining the budget
+    # for the whole community. A blown cooldown raises CommandOnCooldown, handled
+    # below in cog_app_command_error before the command body (and any defer) runs.
+    @app_commands.checks.cooldown(
+        settings.SCREENSHOT_RATELIMIT_RATE,
+        settings.SCREENSHOT_RATELIMIT_PER,
+        key=lambda i: (i.guild_id, i.user.id),
+    )
     @app_commands.describe(
         image1="Screenshot to analyze",
         image2="Second screenshot (optional)",
@@ -390,6 +407,9 @@ class Screenshots(commands.Cog, name="Screenshots"):
     ) -> None:
         gid = interaction.guild_id
         uid = interaction.user.id
+
+        if await perms.block_if_mod_only(interaction):
+            return
 
         if active_client() is None:
             # Distinguish "no key configured" from "budget reached" (soft degrade).
@@ -431,17 +451,13 @@ class Screenshots(commands.Cog, name="Screenshots"):
             rating = data.get("difficulty_rating", 0)
             xp_r, coin_r = await _grant_rewards(gid, uid, rating)
 
-            try:
-                ksp_level = int(data.get("ksp_level", 0))
-            except (ValueError, TypeError):
-                ksp_level = 0
-            if ksp_level > 0:
-                from cogs.roles import check_and_award_level
-                self.bot.loop.create_task(check_and_award_level(self.bot, gid, uid, ksp_level))
+            # Note: level/title ROLES are no longer awarded here. Roles are earned
+            # only through the verified in-game capture (POST /api/v1/achievement-photo).
+            # This command still grants XP + KCoins for the analysis.
 
             await interaction.followup.send(embed=embed)
-            log.info("%s analyzed %d direct upload(s) — difficulty %d (+%d XP, +%d coins), ksp_level %d",
-                     interaction.user, len(direct), rating, xp_r, coin_r, ksp_level)
+            log.info("%s analyzed %d direct upload(s) — difficulty %d (+%d XP, +%d coins)",
+                     interaction.user, len(direct), rating, xp_r, coin_r)
             return
 
         # ── Mode 2: Auto-detect the most recent image message above ──────────
@@ -512,29 +528,33 @@ class Screenshots(commands.Cog, name="Screenshots"):
         rating = data.get("difficulty_rating", 0)
         xp_r, coin_r = await _grant_rewards(gid, uid, rating)
 
-        try:
-            ksp_level = int(data.get("ksp_level", 0))
-        except (ValueError, TypeError):
-            ksp_level = 0
-        if ksp_level > 0:
-            from cogs.roles import check_and_award_level
-            self.bot.loop.create_task(check_and_award_level(self.bot, gid, uid, ksp_level))
+        # Roles are earned only via the in-game capture flow now (see above); this
+        # command grants XP + KCoins only.
 
         await target_msg.reply(embed=embed, mention_author=False)
         await interaction.followup.send("✅", ephemeral=True)
 
         log.info(
-            "%s analyzed screenshot (msg %d, %d imgs): %s @ %s — difficulty %d (+%d XP, +%d coins), ksp_level %d",
+            "%s analyzed screenshot (msg %d, %d imgs): %s @ %s — difficulty %d (+%d XP, +%d coins)",
             interaction.user, target_msg.id, len(images),
             data.get("location", {}).get("celestial_body", "?"),
             data.get("location", {}).get("situation", "?"),
-            rating, xp_r, coin_r, ksp_level
+            rating, xp_r, coin_r
         )
 
     # ── Error handler ─────────────────────────────────────────────────────────
     async def cog_app_command_error(
         self, interaction: discord.Interaction, error: app_commands.AppCommandError
     ) -> None:
+        # Cooldown isn't an error — tell the user how long to wait, no traceback.
+        if isinstance(error, app_commands.CommandOnCooldown):
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    tp(interaction.guild_id, interaction.user.id, "ss.cooldown",
+                       seconds=round(error.retry_after)),
+                    ephemeral=True,
+                )
+            return
         log.error("Screenshots cog error: %s", error, exc_info=True)
         if not interaction.response.is_done():
             await interaction.response.send_message(

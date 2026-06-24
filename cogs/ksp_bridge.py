@@ -19,6 +19,7 @@ from api_auth import (
     purge_ksp_user_data, request_device_ping, set_device_ticket_channel,
 )
 from data.store import store, _db
+from data import guild_config
 from i18n import S, tp
 
 log = logging.getLogger(__name__)
@@ -114,18 +115,19 @@ async def _post_device_base_ticket(client: discord.Client, data: dict, challenge
         "The user reports this device isn't theirs. Awaiting the client's "
         "diagnostics (MAC address + KSP.log)…"
     )
+    guild = None
+    gid = data.get("guild_id")
     try:
         from cogs.tickets import create_ticket
-        guild = None
-        gid = data.get("guild_id")
         if gid:
             guild = client.get_guild(int(gid))
-        if guild is None and settings.TICKET_CATEGORY_ID:
+        if guild is None:
+            # Best-effort: find any guild that has a ticket category configured.
             for g in client.guilds:
-                if g.get_channel(settings.TICKET_CATEGORY_ID):
+                if guild_config.resolve_channel(client, g.id, "ticket_category"):
                     guild = g
                     break
-        if guild is not None and settings.TICKET_CATEGORY_ID:
+        if guild is not None and guild_config.get_channel_id(guild.id, "ticket_category"):
             channel = await create_ticket(
                 client, guild,
                 opener_id=int(data["user_id"]),
@@ -140,13 +142,13 @@ async def _post_device_base_ticket(client: discord.Client, data: dict, challenge
     except Exception as exc:
         log.warning("Could not open device-report ticket, falling back: %s", exc)
 
-    # Fallback: shared mod channel.
-    ch_id = settings.CONTRACT_MOD_CHANNEL_ID
-    if not ch_id:
+    # Fallback: the guild's contract-mod channel.
+    fb_gid = guild.id if guild is not None else (int(gid) if gid else None)
+    ch = guild_config.resolve_channel(client, fb_gid, "contract_mod") if fb_gid else None
+    if ch is None:
         log.warning("Device report raised but no ticket category / mod channel set")
         return
     try:
-        ch = client.get_channel(ch_id) or await client.fetch_channel(ch_id)
         e = discord.Embed(title="🚨 Account-sharing report", description=desc,
                           color=discord.Color.red())
         await ch.send(embed=e)

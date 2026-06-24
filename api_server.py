@@ -18,7 +18,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional, List
 
 from fastapi import (
-    FastAPI, Depends, HTTPException, Header, UploadFile, File, Form, Request,
+    FastAPI, Depends, HTTPException, Header, UploadFile, File, Form, Query, Request,
     WebSocket, WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware
@@ -43,11 +43,13 @@ from api_models import (
     SubmissionResult, FlightSubmission, VesselSnapshot,
     Notification, NotificationsResponse,
     MarketplaceListResult, MarketplaceListing, MarketplaceListingsResponse,
+    MarketplaceListingsPage, WebBuyResult,
     VersionCheckResponse,
     AttestChallenge, AttestRespondRequest, AttestResult,
 )
 from data.store import store, _db, _storage_bucket
 from data import contracts as cdb
+from data import guild_config
 from data import mod_version as mver
 from data import policy as policy
 from data import suspicion as susp
@@ -98,6 +100,23 @@ MAX_DECOMPRESSED_BYTES = 64 * 1024 * 1024    # cap on any single gzip expansion
 MAX_REQUEST_BYTES = 80 * 1024 * 1024         # whole-request guard (a submission carries several files)
 _LOG_HEAD_BYTES = 2_000_000                  # KSP.log: keep the first 2 MB (mod list, system specs)
 _LOG_TAIL_BYTES = 7_000_000                  # KSP.log: keep the last 7 MB (most recent events)
+
+# ── Blueprint/screenshot cap, derived from the mod's render scale ─────────────
+# A blueprint is a deterministic 2048×1100 px image multiplied by BLUEPRINT_SCALE
+# (see settings.py / VesselRenderer.cs). Its byte size therefore grows with the
+# scale *squared*. We budget a generous per-pixel allowance — far above what a
+# real (mostly-flat) blueprint or even a noisy full-res game screenshot encodes
+# to — and cap there, plus a small fixed floor for headers. This is much tighter
+# than the generic 25 MB cap, so a tampered client can't pad renders huge and
+# spray oversized uploads at the API. Auto-tracks the scale: bump BLUEPRINT_SCALE
+# and the ceiling rises with it, no separate constant to edit.
+_BLUEPRINT_BASE_W = 2048
+_BLUEPRINT_BASE_H = 1100
+_BLUEPRINT_BYTES_PER_PX = 1.5                # worst-case legitimate PNG budget
+MAX_BLUEPRINT_BYTES = 512 * 1024 + int(
+    _BLUEPRINT_BASE_W * _BLUEPRINT_BASE_H
+    * (settings.BLUEPRINT_SCALE ** 2) * _BLUEPRINT_BYTES_PER_PX
+)
 
 
 @app.middleware("http")
@@ -272,6 +291,16 @@ def _sweep_rate_buckets(now: float):
             _RATE_BUCKETS[k] = recent
         else:
             del _RATE_BUCKETS[k]
+    # Same treatment for the per-user flood windows (defined later in the module).
+    for k in list(_USER_FLOOD.keys()):
+        recent = [t for t in _USER_FLOOD[k] if now - t < 120]
+        if recent:
+            _USER_FLOOD[k] = recent
+        else:
+            del _USER_FLOOD[k]
+    for k in list(_USER_FLOOD_FLAGGED.keys()):
+        if now - _USER_FLOOD_FLAGGED[k] > 3600:
+            del _USER_FLOOD_FLAGGED[k]
 
 
 def _rate_limit(key: str, max_hits: int, window: float):
@@ -528,13 +557,19 @@ async def _post_device_report(target: dict, mac: str, log_bytes: bytes | None):
     if not _bot_instance:
         return
     # Prefer the ticket the base report opened, so all the diagnostics land there;
-    # fall back to the shared mod channel only if no ticket was created.
-    ch_id = target.get("ticket_channel_id") or settings.CONTRACT_MOD_CHANNEL_ID
-    if not ch_id:
+    # fall back to the guild's contract-mod channel only if no ticket was created.
+    ch_id = target.get("ticket_channel_id")
+    t_gid = target.get("guild_id")
+    if not ch_id and not t_gid:
         return
     try:
         import discord
-        ch = _bot_instance.get_channel(int(ch_id)) or await _bot_instance.fetch_channel(int(ch_id))
+        if ch_id:
+            ch = _bot_instance.get_channel(int(ch_id)) or await _bot_instance.fetch_channel(int(ch_id))
+        else:
+            ch = guild_config.resolve_channel(_bot_instance, int(t_gid), "contract_mod")
+        if ch is None:
+            return
         e = discord.Embed(
             title="📎 Device report: client diagnostics",
             description=(
@@ -672,6 +707,7 @@ _SUSPICION_RULES = {
     "dll_tamper":           ("🛡️ Possible modified mod (failed attestation)", 6 * 3600, 1),
     "illegal_mods":         ("⚠️ Repeated disallowed-mod submissions",        24 * 3600, 3),
     "impossible_telemetry": ("⚠️ Implausible flight telemetry",               12 * 3600, 1),
+    "request_flood":        ("⚠️ Extreme request rate (possible automation)", 6 * 3600, 1),
 }
 
 
@@ -712,6 +748,43 @@ async def flag_suspicion(gid: int, uid: int, username: str, reason: str,
         log.warning("flag_suspicion failed (%s/%s): %s", uid, reason, exc)
 
 
+# ── Anti-cheat: per-user extreme-rate flood detection ─────────────────────────
+#
+# Distinct from _rate_limit(): that BLOCKS guessable auth endpoints by IP. This
+# only OBSERVES authenticated, cost/reward-bearing endpoints by user and, when a
+# user's rate is far past any human play pattern, raises a (deduped) suspicion
+# ticket. It never blocks — that's the per-endpoint limit's job — and it stays
+# in-memory so detection itself costs no Firestore: flag_suspicion (which does
+# write) is reached only once a threshold trips, at most once per window.
+_USER_FLOOD: dict[tuple[int, str], list[float]] = {}    # (uid, bucket) -> hit times
+_USER_FLOOD_FLAGGED: dict[tuple[int, str], float] = {}  # (uid, bucket) -> last flag time
+
+
+def _note_user_action(gid: int, uid: int, username: str, bucket: str,
+                      threshold: int, window: float) -> None:
+    """Record one cost/reward action by `uid`. Fire a 'request_flood' suspicion
+    when they exceed `threshold` actions within `window` seconds. Cheap + safe to
+    call on the hot path; never raises and never blocks the request."""
+    now = time.time()
+    key = (uid, bucket)
+    hits = [t for t in _USER_FLOOD.get(key, []) if now - t < window]
+    hits.append(now)
+    _USER_FLOOD[key] = hits
+    if len(hits) < threshold:
+        return
+    # Threshold tripped: don't re-flag (and re-write Firestore) on every further
+    # hit — at most once per window per (user, bucket).
+    if now - _USER_FLOOD_FLAGGED.get(key, 0.0) < window:
+        return
+    _USER_FLOOD_FLAGGED[key] = now
+    asyncio.create_task(flag_suspicion(
+        gid, uid, username, reason="request_flood",
+        details=(f"User sent **{len(hits)}** `{bucket}` requests in under "
+                 f"{int(window)}s — far above normal play. Likely a scripted "
+                 f"client hammering reward/AI endpoints."),
+        severity="medium"))
+
+
 # ── Attestation (challenge-response anti-tamper) ──────────────────────────────
 #
 # A static self-reported DLL hash (X-Mod-Hash) is trivially spoofed by hardcoding
@@ -739,7 +812,11 @@ async def attest_challenge(user: dict = Depends(get_user_token_only)):
         return AttestChallenge(enabled=False)   # nothing stored → can't verify, skip
     h, data = info
     n = len(data)
-    length = min(n, 16384)
+    # Hash a random ~10% slice (min 16 KB) of the DLL: keeping it a random window
+    # defeats precomputed answers, while ~10% coverage roughly doubles the chance a
+    # single check lands on modified bytes vs. the old fixed 16 KB (~5% of a 323 KB
+    # DLL). The client already reads the whole DLL to hash any window, so it's free.
+    length = min(n, max(16384, n // 10))
     offset = secrets.randbelow(n - length + 1) if n > length else 0
     nonce = secrets.token_hex(16)
     attest_id = secrets.token_urlsafe(18)
@@ -767,13 +844,21 @@ async def attest_respond(req: AttestRespondRequest, request: Request,
         return AttestResult(ok=False)
     if secrets.compare_digest(ch["expected"], (req.digest or "").strip().lower()):
         return AttestResult(ok=True)
+    # Server-observed forensics: the client IP (seen at the socket, not self-reported)
+    # and the bound device id. Both are meaningful here precisely because they don't
+    # come from the tampered client's payload, unlike MAC/KSP.log (those are only
+    # collected via the consented device-report flow, where the uploader is trusted).
+    client_ip = _client_ip(request)
+    device_id = request.headers.get("x-device-id", "") or "unknown"
     await flag_suspicion(
         int(user["guild_id"]), int(user["user_id"]), user.get("username", ""),
         reason="dll_tamper",
         details=("The client failed challenge-response attestation: SHA256 of its "
                  "DLL window + server nonce did not match the published build. This "
                  "usually means the GeneKerman.dll on this account has been modified "
-                 "or replaced from the official release."),
+                 "or replaced from the official release.\n\n"
+                 f"**Client IP:** `{client_ip}`\n"
+                 f"**Device id:** `{device_id}`"),
         severity="high")
     return AttestResult(ok=False)
 
@@ -1666,8 +1751,7 @@ async def resolve_dispute(contract_id: str, req: ContractDisputeRequest,
 
     # ── Sue ── escalate to the moderator channel for review.
     if action == "sue":
-        mod_ch_id = settings.CONTRACT_MOD_CHANNEL_ID
-        if not mod_ch_id:
+        if not guild_config.get_channel_id(gid, "contract_mod"):
             return ContractAcceptResponse(success=False, message="Moderator review is not configured.")
         cdb.update_contract(gid, contract_id, status=cdb.MOD_REVIEW)
         c["status"] = cdb.MOD_REVIEW
@@ -1676,7 +1760,9 @@ async def resolve_dispute(contract_id: str, req: ContractDisputeRequest,
                 import discord
                 from i18n import t
                 from cogs.contract_views import ModReviewView, _embed
-                ch = _bot_instance.get_channel(mod_ch_id) or await _bot_instance.fetch_channel(mod_ch_id)
+                ch = guild_config.resolve_channel(_bot_instance, gid, "contract_mod")
+                if ch is None:
+                    return ContractAcceptResponse(success=False, message="Moderator review is not configured.")
                 e = _embed(c, gid)
                 e.title = f"⚖️ {t(gid, 'ct.mod_review')}"
                 e.color = discord.Color.purple()
@@ -2005,8 +2091,8 @@ async def create_auction_from_ksp(req: AuctionCreateRequest, user: dict = Depend
     gid = int(user["guild_id"])
     uid = int(user["user_id"])
 
-    if not settings.AUCTION_CHANNEL_ID:
-        return ContractAcceptResponse(success=False, message="Auctions are not configured on this server.")
+    if _bot_instance is None or not guild_config.any_channel_configured(_bot_instance, "auction"):
+        return ContractAcceptResponse(success=False, message="Auctions are not available right now.")
     if not (settings.AUCTION_MIN_DURATION_HOURS <= req.duration_hours <= settings.AUCTION_MAX_DURATION_HOURS):
         return ContractAcceptResponse(
             success=False,
@@ -2346,6 +2432,7 @@ async def submit_contract(
     gid = int(user["guild_id"])
     uid = int(user["user_id"])
     bot_uid = _get_bot_user_id()
+    _note_user_action(gid, uid, user.get("username", ""), "submit", *settings.FLOOD_SUBMIT)
 
     c = cdb.get_contract(gid, contract_id)
     if not c:
@@ -2475,7 +2562,9 @@ async def submit_contract(
     all_screenshots = [s for s in (screenshot1, screenshot2, screenshot3) if s]
     all_screenshots += [s for s in (screenshots or []) if s]
     for ss in all_screenshots:
-        data = await _read_upload(ss)
+        # Blueprints/renders are a fixed, scale-derived size — cap them well below
+        # the generic 25 MB limit so a tampered client can't spray padded uploads.
+        data = await _read_upload(ss, MAX_BLUEPRINT_BYTES)
         try:
             url = await cdb.upload_to_storage(
                 contract_id, ss.filename, data,
@@ -2714,9 +2803,12 @@ async def _auto_accept_contract(
         u = store.get_user(gid, uid)
         await store.set_xp(gid, uid, u["xp"] + xp)
 
-    # KSP level award
+    # KSP level award — record globally (cross-server) and keep the per-guild
+    # mirror for backward compatibility.
     if ksp_level > 0:
         await store.add_unlocked_level(gid, uid, ksp_level)
+        from data import achievements
+        achievements.add_unlocked(uid, ksp_level)
 
     _create_notification(gid, uid, "review_result",
                          "✅ Mission Approved!",
@@ -3108,12 +3200,14 @@ async def craft_send_to_friend(
 async def marketplace_list_craft(
     craft_file: UploadFile = File(...),
     blueprint: Optional[UploadFile] = File(None),
+    thumbnail: Optional[UploadFile] = File(None),
     craft_name: str = Form(...),
     craft_type: str = Form("VAB"),
     part_count: int = Form(0),
     mass: float = Form(0.0),
     cost: float = Form(0.0),
     price: int = Form(...),
+    mods: str = Form(""),
     user: dict = Depends(get_current_user),
 ):
     """List a craft (.craft blueprint) for sale on the marketplace.
@@ -3124,7 +3218,7 @@ async def marketplace_list_craft(
     """
     import gzip
 
-    if not settings.MARKETPLACE_CHANNEL_ID:
+    if _bot_instance is None or not guild_config.any_channel_configured(_bot_instance, "marketplace"):
         return MarketplaceListResult(success=False, message="The marketplace is not available right now.")
 
     if price < settings.MARKETPLACE_MIN_PRICE or price > settings.MARKETPLACE_MAX_PRICE:
@@ -3148,11 +3242,16 @@ async def marketplace_list_craft(
     if not filename.lower().endswith(".craft"):
         filename += ".craft"
 
+    # mods: client sends a comma-separated list of distinct GameData folders the
+    # craft's parts come from. Dedup + drop blanks; stock-only crafts send nothing.
+    mod_list = sorted({m.strip() for m in mods.split(",") if m.strip()})
+
     listing = mkt.create_listing(
         gid, uid, user["username"],
         craft_name=craft_name, craft_type=craft_type, part_count=part_count,
         mass=mass, cost=cost, price=price,
         craft_url="", craft_filename=filename,
+        mods=mod_list,
     )
 
     try:
@@ -3177,10 +3276,24 @@ async def marketplace_list_craft(
         except Exception as exc:
             log.error("Marketplace blueprint upload failed: %s", exc)
 
-    # Post the listing to the Discord marketplace channel (runs on the bot loop).
+    # Square NW-view thumbnail — the website's listing-card image. Optional; the
+    # site falls back to the full blueprint when a listing has none.
+    if thumbnail is not None:
+        try:
+            thumb_data = await _read_upload(thumbnail)
+            thumb_url = await mkt.upload_thumbnail(
+                listing["listing_id"], thumb_data, thumbnail.content_type or "image/png"
+            )
+            mkt.update_listing(gid, listing["listing_id"], thumbnail_url=thumb_url)
+            listing["thumbnail_url"] = thumb_url
+        except Exception as exc:
+            log.error("Marketplace thumbnail upload failed: %s", exc)
+
+    # Mirror the listing into every server's marketplace channel (bot loop).
     try:
         from cogs.marketplace import post_listing
-        await post_listing(_bot_instance, gid, listing)
+        listing = mkt.get_listing(gid, listing["listing_id"]) or listing
+        await post_listing(_bot_instance, listing)
     except Exception as exc:
         log.error("Failed to post marketplace listing %s: %s", listing["listing_id"], exc)
 
@@ -3232,19 +3345,366 @@ async def marketplace_delist(listing_id: str, user: dict = Depends(get_current_u
         mkt.update_listing(gid, listing_id, status=mkt.DELISTED)
         listing["status"] = mkt.DELISTED
 
-    # Disable the channel message buttons if we can find it.
-    msg_id = listing.get("channel_msg_id")
-    if msg_id and settings.MARKETPLACE_CHANNEL_ID and _bot_instance is not None:
+    # Update every mirrored marketplace message across servers.
+    if _bot_instance is not None:
         try:
-            from cogs.marketplace import listing_embed
-            channel = _bot_instance.get_channel(settings.MARKETPLACE_CHANNEL_ID)
-            if channel:
-                msg = await channel.fetch_message(int(msg_id))
-                await msg.edit(embed=listing_embed(listing), view=None)
+            from cogs.marketplace import edit_all_mirrors
+            await edit_all_mirrors(_bot_instance, listing)
         except Exception as exc:
-            log.warning("Could not update delisted message for %s: %s", listing_id, exc)
+            log.warning("Could not update delisted mirrors for %s: %s", listing_id, exc)
 
     return MarketplaceListResult(success=True, message="Craft delisted.", listing_id=listing_id)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Website API (/api/v1/web/...)
+#
+#  A second client of this same API: the public marketplace website. It is a
+#  browser, so it has no GeneKerman.dll and no device id — the mod-version gate
+#  and device binding don't apply. These endpoints therefore use token-only auth
+#  (get_user_token_only) and a link flow that skips enforce_mod_version. The
+#  website never talks to Firestore directly; everything (balance, buy, delist)
+#  goes through here so the bot stays the single source of truth.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _listing_to_model(l: dict) -> MarketplaceListing:
+    """Map a raw Firestore listing dict to the API model (used by the web grid)."""
+    return MarketplaceListing(
+        listing_id=l["listing_id"],
+        seller_id=l["seller_id"],
+        seller_name=l.get("seller_name", ""),
+        craft_name=l.get("craft_name", ""),
+        craft_type=l.get("craft_type", ""),
+        part_count=l.get("part_count", 0),
+        mass=l.get("mass", 0.0),
+        cost=l.get("cost", 0.0),
+        price=l.get("price", 0),
+        sales_count=l.get("sales_count", 0),
+        created_at=l.get("created_at"),
+        mods=l.get("mods", []) or [],
+        thumbnail_url=l.get("thumbnail_url") or None,
+        blueprint_url=l.get("blueprint_url") or None,
+        craft_url=l.get("craft_url") or None,
+        craft_filename=l.get("craft_filename") or None,
+        status=l.get("status", mkt.ACTIVE),
+    )
+
+
+WEB_PAGE_SIZE = 25
+
+
+@app.post("/api/v1/web/auth/link", response_model=LinkResponse)
+async def web_auth_link(req: LinkRequest, request: Request,
+                        x_device_id: str = Header(default="", alias="X-Device-Id")):
+    """Website link: exchange a 6-digit code for a session token (or a login-
+    approval challenge). Identical to /auth/link but WITHOUT the mod-version gate,
+    since a browser has no DLL to hash."""
+    _guard_link_attempt(request)
+
+    result = validate_link_code(req.code)
+    if result is None:
+        raise HTTPException(status_code=400, detail="Invalid or expired link code")
+
+    if not cfg.KSP_2FA_ENABLED:
+        return _issue_link_token(result, x_device_id)
+
+    client_ip = _client_ip(request)
+    challenge_id = create_approval_challenge(
+        result["guild_id"], result["user_id"], result["username"], client_ip)
+    sent = await _dm_login_approval(int(result["user_id"]), challenge_id, client_ip)
+    if not sent:
+        raise HTTPException(
+            status_code=502,
+            detail="Couldn't DM your login approval. Enable DMs from server "
+                   "members in Discord, then request a new link code.",
+        )
+    log.info("WEB: login-approval challenge issued for %s", result["username"])
+    return LinkResponse(status="approval_required", challenge_id=challenge_id)
+
+
+@app.post("/api/v1/web/auth/link/poll", response_model=LinkResponse)
+async def web_auth_link_poll(req: PollRequest, request: Request,
+                             x_device_id: str = Header(default="", alias="X-Device-Id")):
+    """Poll a website login-approval challenge until the user presses Log-in."""
+    _rate_limit(f"webpoll:{_client_ip(request)}", max_hits=120, window=60.0)
+    state = poll_approval(req.challenge_id)
+    if state["state"] == "pending":
+        return LinkResponse(status="pending")
+    if state["state"] == "approved":
+        log.info("WEB: login approved, linking %s", state["username"])
+        return _issue_link_token(state, x_device_id)
+    if state["state"] == "denied":
+        raise HTTPException(status_code=403, detail="Login request was denied.")
+    raise HTTPException(status_code=400, detail="Login request expired. Request a new link code.")
+
+
+@app.get("/api/v1/web/profile", response_model=UserProfile)
+async def web_profile(user: dict = Depends(get_user_token_only)):
+    """The logged-in website user's profile (balance, XP, level). Token-only auth."""
+    gid = int(user["guild_id"])
+    uid = int(user["user_id"])
+    u = store.get_user(gid, uid)
+    return UserProfile(
+        user_id=user["user_id"],
+        username=user["username"],
+        guild_id=user["guild_id"],
+        xp=u.get("xp", 0),
+        level=u.get("level", 0),
+        balance=u.get("balance", 0),
+        messages=u.get("messages", 0),
+        unlocked_levels=u.get("unlocked_levels", []),
+        currency_name=settings.CURRENCY_NAME,
+    )
+
+
+@app.get("/api/v1/web/marketplace/listings", response_model=MarketplaceListingsPage)
+async def web_marketplace_listings(
+    page: int = 1,
+    sort: str = "new",
+    price_min: int | None = None,
+    price_max: int | None = None,
+    craft_type: str | None = None,
+    parts_max: int | None = None,
+    mass_max: float | None = None,
+    mods: list[str] = Query(default=[]),
+    mod_mode: str = "required",
+    q: str | None = None,
+):
+    """Paginated, filterable, sortable marketplace grid for the website (25/page).
+
+    Public (no auth): the catalog is already mirrored to public Discord channels,
+    so browsing needs no login — only buying / managing uploads does.
+
+    Filtering/sorting is done in Python over all active listings: the shared market
+    is small enough that this is simpler and cheaper than maintaining Firestore
+    composite indexes for every filter combination. Revisit if it ever grows large.
+    """
+    items = mkt.list_active(0)
+
+    # available_mods is computed from the *unfiltered* active set so the facet shows
+    # every mod a user could filter by, not just those left after the current filter.
+    available_mods = sorted({m for l in items for m in (l.get("mods") or [])})
+
+    def _keep(l: dict) -> bool:
+        if price_min is not None and l.get("price", 0) < price_min:
+            return False
+        if price_max is not None and l.get("price", 0) > price_max:
+            return False
+        if craft_type and l.get("craft_type", "").upper() != craft_type.upper():
+            return False
+        if parts_max is not None and l.get("part_count", 0) > parts_max:
+            return False
+        if mass_max is not None and l.get("mass", 0.0) > mass_max:
+            return False
+        if mods:
+            lm = set(l.get("mods") or [])
+            sel = set(mods)
+            if mod_mode == "allowed":
+                # craft may only use mods from the selection (nothing outside it)
+                if not lm.issubset(sel):
+                    return False
+            elif mod_mode == "restricted":
+                # craft must not use any of the selected mods
+                if not sel.isdisjoint(lm):
+                    return False
+            else:  # "required" — craft must include every selected mod
+                if not sel.issubset(lm):
+                    return False
+        if q:
+            ql = q.lower()
+            if ql not in l.get("craft_name", "").lower() and ql not in l.get("seller_name", "").lower():
+                return False
+        return True
+
+    items = [l for l in items if _keep(l)]
+
+    if sort == "price_asc":
+        items.sort(key=lambda l: l.get("price", 0))
+    elif sort == "price_desc":
+        items.sort(key=lambda l: l.get("price", 0), reverse=True)
+    elif sort == "sales":
+        items.sort(key=lambda l: l.get("sales_count", 0), reverse=True)
+    else:  # "new"
+        items.sort(key=lambda l: l.get("created_at") or "", reverse=True)
+
+    total = len(items)
+    pages = max(1, (total + WEB_PAGE_SIZE - 1) // WEB_PAGE_SIZE)
+    page = max(1, min(page, pages))
+    start = (page - 1) * WEB_PAGE_SIZE
+    window = items[start:start + WEB_PAGE_SIZE]
+
+    return MarketplaceListingsPage(
+        listings=[_listing_to_model(l) for l in window],
+        total=total,
+        page=page,
+        pages=pages,
+        available_mods=available_mods,
+    )
+
+
+@app.post("/api/v1/web/marketplace/{listing_id}/buy", response_model=WebBuyResult)
+async def web_marketplace_buy(listing_id: str, user: dict = Depends(get_user_token_only)):
+    """Buy a craft from the website. Mirrors the Discord Buy button: atomically
+    debits the buyer, credits the seller, queues the craft for KSP auto-import AND
+    returns a direct .craft download URL. Re-buying a craft you already own is a
+    free re-delivery (no charge)."""
+    gid = int(user["guild_id"])
+    uid = int(user["user_id"])
+
+    listing = mkt.get_listing(gid, listing_id)
+    if not listing or listing.get("status") != mkt.ACTIVE:
+        raise HTTPException(status_code=404, detail="This craft is no longer for sale.")
+
+    seller_id = int(listing["seller_id"])
+    if uid == seller_id:
+        raise HTTPException(status_code=400, detail="You can't buy your own listing.")
+
+    price = int(listing["price"])
+    already_owned = str(uid) in (listing.get("buyers") or [])
+
+    if not already_owned:
+        # Atomic check-and-deduct so a double-submit can't pay twice / overdraw.
+        if not await store.try_debit(gid, uid, price):
+            bal = store.get_user(gid, uid).get("balance", 0)
+            return WebBuyResult(
+                success=False, balance=bal,
+                message=f"You need {price:,} {settings.CURRENCY_NAME} but only have {bal:,}.",
+            )
+        await store.add_balance(gid, seller_id, price)
+
+    # Queue for KSP auto-import (idempotent on source+ref_id) and offer direct download.
+    imp.enqueue(
+        gid, uid, "market", listing_id, listing.get("craft_name", "Craft"),
+        craft_url=listing.get("craft_url"), craft_filename=listing.get("craft_filename"),
+    )
+
+    if not already_owned:
+        mkt.record_purchase(gid, listing_id, uid)
+        # Refresh the Discord listing embeds' sale counts, best-effort.
+        if _bot_instance is not None:
+            try:
+                from cogs.marketplace import edit_all_mirrors
+                await edit_all_mirrors(_bot_instance, mkt.get_listing(gid, listing_id) or listing)
+            except Exception as exc:
+                log.warning("web buy: could not refresh mirrors for %s: %s", listing_id, exc)
+            # Notify the seller, best-effort.
+            try:
+                seller = await _bot_instance.fetch_user(seller_id)
+                await seller.send(
+                    f"💰 **{user['username']}** bought your craft **{listing.get('craft_name')}** "
+                    f"for **{price:,}** {settings.CURRENCY_SYMBOL} on the website."
+                )
+            except Exception:
+                pass
+
+    bal = store.get_user(gid, uid).get("balance", 0)
+    log.info("WEB: %s bought listing %s for %d%s", user["username"], listing_id, price,
+             " (already owned, free)" if already_owned else "")
+    return WebBuyResult(
+        success=True,
+        message=("Re-downloaded (you already own this craft)." if already_owned
+                 else f"Purchased for {price:,} {settings.CURRENCY_NAME}. Queued for KSP import."),
+        balance=bal,
+        craft_url=listing.get("craft_url") or None,
+        craft_filename=listing.get("craft_filename") or None,
+        already_owned=already_owned,
+    )
+
+
+@app.get("/api/v1/web/marketplace/mine", response_model=MarketplaceListingsResponse)
+async def web_marketplace_mine(user: dict = Depends(get_user_token_only)):
+    """The caller's own listings (active + delisted) — the "My Uploads" view."""
+    uid = int(user["user_id"])
+    items = sorted(mkt.list_by_seller(uid), key=lambda l: l.get("created_at") or "", reverse=True)
+    return MarketplaceListingsResponse(listings=[_listing_to_model(l) for l in items])
+
+
+@app.get("/api/v1/web/marketplace/purchases", response_model=MarketplaceListingsResponse)
+async def web_marketplace_purchases(user: dict = Depends(get_user_token_only)):
+    """Crafts the caller has bought — the "My Purchases" view (free re-download)."""
+    uid = int(user["user_id"])
+    items = sorted(mkt.list_by_buyer(uid), key=lambda l: l.get("created_at") or "", reverse=True)
+    return MarketplaceListingsResponse(listings=[_listing_to_model(l) for l in items])
+
+
+@app.post("/api/v1/web/marketplace/{listing_id}/delist", response_model=MarketplaceListResult)
+async def web_marketplace_delist(listing_id: str, user: dict = Depends(get_user_token_only)):
+    """Delist a craft the caller owns (the website "My Uploads" delete action).
+    Uploads stay mod-only; this only flips an existing listing to delisted."""
+    gid = int(user["guild_id"])
+    uid = int(user["user_id"])
+
+    listing = mkt.get_listing(gid, listing_id)
+    if not listing:
+        raise HTTPException(status_code=404, detail="Listing not found")
+    if listing.get("seller_id") != str(uid):
+        raise HTTPException(status_code=403, detail="Not your listing")
+
+    if listing.get("status") == mkt.ACTIVE:
+        mkt.update_listing(gid, listing_id, status=mkt.DELISTED)
+        listing["status"] = mkt.DELISTED
+
+    if _bot_instance is not None:
+        try:
+            from cogs.marketplace import edit_all_mirrors
+            await edit_all_mirrors(_bot_instance, listing)
+        except Exception as exc:
+            log.warning("web delist: could not update mirrors for %s: %s", listing_id, exc)
+
+    return MarketplaceListResult(success=True, message="Craft delisted.", listing_id=listing_id)
+
+
+@app.post("/api/v1/web/marketplace/{listing_id}/relist", response_model=MarketplaceListResult)
+async def web_marketplace_relist(listing_id: str, user: dict = Depends(get_user_token_only)):
+    """Re-activate a delisted craft the caller owns (puts it back up for sale)."""
+    gid = int(user["guild_id"])
+    uid = int(user["user_id"])
+
+    listing = mkt.get_listing(gid, listing_id)
+    if not listing:
+        raise HTTPException(status_code=404, detail="Listing not found")
+    if listing.get("seller_id") != str(uid):
+        raise HTTPException(status_code=403, detail="Not your listing")
+
+    if listing.get("status") != mkt.ACTIVE:
+        mkt.update_listing(gid, listing_id, status=mkt.ACTIVE)
+        listing["status"] = mkt.ACTIVE
+
+    # Restore the Buy view on every mirrored message across servers.
+    if _bot_instance is not None:
+        try:
+            from cogs.marketplace import edit_all_mirrors
+            await edit_all_mirrors(_bot_instance, listing)
+        except Exception as exc:
+            log.warning("web relist: could not update mirrors for %s: %s", listing_id, exc)
+
+    return MarketplaceListResult(success=True, message="Craft relisted.", listing_id=listing_id)
+
+
+@app.post("/api/v1/web/marketplace/{listing_id}/delete", response_model=MarketplaceListResult)
+async def web_marketplace_delete(listing_id: str, user: dict = Depends(get_user_token_only)):
+    """Permanently delete a craft the caller owns: removes the Discord mirror messages,
+    the Storage files and the listing document. Irreversible (vs. delist)."""
+    gid = int(user["guild_id"])
+    uid = int(user["user_id"])
+
+    listing = mkt.get_listing(gid, listing_id)
+    if not listing:
+        raise HTTPException(status_code=404, detail="Listing not found")
+    if listing.get("seller_id") != str(uid):
+        raise HTTPException(status_code=403, detail="Not your listing")
+
+    # Drop the Discord mirrors first so a half-deleted listing doesn't leave dangling
+    # Buy buttons; then erase Storage + the document.
+    if _bot_instance is not None:
+        try:
+            from cogs.marketplace import delete_all_mirrors
+            await delete_all_mirrors(_bot_instance, listing)
+        except Exception as exc:
+            log.warning("web delete: could not remove mirrors for %s: %s", listing_id, exc)
+
+    mkt.delete_listing(listing_id)
+    return MarketplaceListResult(success=True, message="Craft permanently deleted.", listing_id=listing_id)
 
 
 # ── Checkpoint Hero Shots ─────────────────────────────────────────────────────
@@ -3277,20 +3737,15 @@ async def checkpoint_photo(
     if not settings.CHECKPOINT_PHOTOS_ENABLED:
         return SubmissionResult(success=False, message="Checkpoint photos are disabled on this server.")
 
-    if not settings.CHECKPOINT_PHOTOS_CHANNEL_ID:
+    if not guild_config.get_channel_id(int(user["guild_id"]), "checkpoint_photos"):
         return SubmissionResult(success=False, message="Checkpoint photos are not enabled on this server.")
 
     if _bot_instance is None:
         return SubmissionResult(success=False, message="Bot is not ready.")
 
-    channel = _bot_instance.get_channel(settings.CHECKPOINT_PHOTOS_CHANNEL_ID)
+    channel = guild_config.resolve_channel(_bot_instance, int(user["guild_id"]), "checkpoint_photos")
     if channel is None:
-        try:
-            channel = await _bot_instance.fetch_channel(settings.CHECKPOINT_PHOTOS_CHANNEL_ID)
-        except Exception as exc:
-            log.error("Checkpoint channel %s unavailable: %s",
-                      settings.CHECKPOINT_PHOTOS_CHANNEL_ID, exc)
-            return SubmissionResult(success=False, message="The checkpoint photo channel is unavailable.")
+        return SubmissionResult(success=False, message="The checkpoint photo channel is unavailable.")
 
     data = await _read_upload(photo)
     if not data:
@@ -3345,6 +3800,191 @@ async def checkpoint_photo(
     return SubmissionResult(success=True, message="Photo shared!")
 
 
+# At most one AI review + reward per user per minute. Extra captures inside the
+# window are still shared to the channel, just not analysed or rewarded.
+_ACHIEVEMENT_REVIEW_COOLDOWN = 60.0
+_achievement_last_review: dict[int, float] = {}
+
+
+async def _post_achievement_capture(
+    data: bytes, gid: int, uid: int, username: str, vessel_name: str, body: str,
+    result: dict | None = None, qualifies: bool = False, is_new: bool = False,
+    title_desc: str | None = None,
+) -> None:
+    """Best-effort post of a capture to the community channel. Never raises — a
+    posting failure must not block the role/reward flow. Logs WHY it skipped so a
+    misconfigured channel is diagnosable instead of silently dropping the image."""
+    if _bot_instance is None:
+        log.warning("achievement photo: bot not ready, cannot post for %s", uid)
+        return
+    channel = guild_config.resolve_channel(_bot_instance, gid, "checkpoint_photos")
+    if channel is None:
+        log.warning(
+            "achievement photo: no resolvable checkpoint_photos channel for guild %s "
+            "(configured id=%s) — image NOT posted",
+            gid, guild_config.get_channel_id(gid, "checkpoint_photos"),
+        )
+        return
+
+    import discord
+
+    celestial = situation = None
+    desc_text = ""
+    if result:
+        loc = result.get("location", {}) or {}
+        celestial = loc.get("celestial_body")
+        situation = loc.get("situation")
+        desc_text = (result.get("description") or "").strip()
+
+    lines = []
+    if is_new:
+        lines.append("🆕 **New title unlocked!**")
+    if vessel_name:
+        lines.append(f"**Vessel:** {vessel_name}")
+    loc_bits = " · ".join(x for x in [celestial or body or None, situation] if x)
+    if loc_bits:
+        lines.append(f"**Location:** {loc_bits}")
+    if desc_text:
+        lines.append(desc_text[:300])
+
+    embed = discord.Embed(
+        title=f"🏅 {title_desc}" if qualifies else "📸 KSP Capture",
+        description="\n".join(lines) if lines else None,
+        color=0xF1C40F if qualifies else 0x3498DB,
+        timestamp=datetime.now(timezone.utc),
+    )
+    discord_user = _bot_instance.get_user(uid)
+    if discord_user is None:
+        try:
+            discord_user = await _bot_instance.fetch_user(uid)
+        except Exception:
+            discord_user = None
+    author_icon = discord_user.display_avatar.url if discord_user else None
+    embed.set_author(name=username or "Kerbonaut", icon_url=author_icon)
+    embed.set_image(url="attachment://achievement.png")
+    try:
+        file = discord.File(io.BytesIO(data), filename="achievement.png")
+        await channel.send(embed=embed, file=file)
+    except Exception as exc:
+        log.warning("Could not post achievement shot for %s: %s", uid, exc)
+
+
+@app.post("/api/v1/achievement-photo", response_model=SubmissionResult)
+async def achievement_photo(
+    photo: UploadFile = File(...),
+    vessel_name: str = Form(""),
+    body: str = Form(""),
+    vessel_id: str = Form(""),
+    situation: str = Form(""),
+    review: bool = Form(True),
+    user: dict = Depends(get_current_user),
+):
+    """Receive a player-composed achievement hero shot from the KSP mod, verify it
+    with the Gemini analyst, award the matching KSP title role if it qualifies, and
+    grant XP/KCoins like `/analyze`.
+
+    Two paths:
+      * Full review (`review=true`, not rate-limited): Gemini analysis → role +
+        XP/KCoins, embed posted to the channel.
+      * Post-only (`review=false`, or rate-limited to 1/min): the mod flags a repeat
+        of an already-rewarded vessel+position, so the shot is just shared to the
+        channel — no analysis, no reward.
+
+    Role/title ROLES are granted only through this verified capture path; the Discord
+    `/analyze` command still grants XP/KCoins but no longer awards roles.
+    """
+    gid = int(user["guild_id"])
+    uid = int(user["user_id"])
+    username = user.get("username") or "Kerbonaut"
+    _note_user_action(gid, uid, username, "achievement", *settings.FLOOD_ACHIEVEMENT)
+
+    data = await _read_upload(photo)
+    if not data:
+        return SubmissionResult(success=False, message="Empty image.")
+
+    # Rate-limit AI reviews: collapse a burst (multiple captures within a minute)
+    # into channel-only shares so one mission can't be farmed for repeat rewards.
+    now = time.monotonic()
+    last = _achievement_last_review.get(uid, 0.0)
+    review_requested = bool(review)
+    if review_requested and (now - last) < _ACHIEVEMENT_REVIEW_COOLDOWN:
+        review_requested = False
+
+    # ── Post-only path (mod-flagged repeat, or rate-limited) ─────────────────
+    if not review_requested:
+        await _post_achievement_capture(data, gid, uid, username, vessel_name, body)
+        log.info("KSP: %s achievement photo shared (no review: repeat/rate-limited)", uid)
+        return SubmissionResult(success=True, message="📸 Shared to the channel.")
+
+    # ── Full review path ─────────────────────────────────────────────────────
+    from cogs.screenshots import _run_gemini, _grant_rewards, active_client
+
+    if active_client() is None:
+        return SubmissionResult(
+            success=False,
+            message="Achievement checking is unavailable right now. Try again later.",
+        )
+
+    try:
+        result = await _run_gemini([data], gid)
+    except Exception as exc:
+        log.error("Achievement photo analysis failed for %s: %s", uid, exc, exc_info=True)
+        return SubmissionResult(success=False, message="Couldn't analyze the shot — try again.")
+
+    if not result.get("approved", False):
+        # Not a KSP shot — don't pour arbitrary images into the community channel.
+        return SubmissionResult(
+            success=True,
+            message="That doesn't look like a KSP shot. Frame your craft and try again.",
+        )
+
+    # Count this as a real review for the rate-limiter only once it passed Gemini.
+    _achievement_last_review[uid] = now
+
+    # Does it map to a title role?
+    try:
+        ksp_level = int(result.get("ksp_level", 0))
+    except (ValueError, TypeError):
+        ksp_level = 0
+    qualifies = ksp_level > 0 and ksp_level in settings.LEVEL_ROLES
+    title_desc = settings.LEVEL_ROLES[ksp_level][2] if qualifies else None
+
+    # Grant the role on a FIRST-TIME unlock only (idempotent for repeats).
+    is_new = False
+    if qualifies and _bot_instance is not None:
+        from cogs.roles import check_and_award_level
+        is_new = await check_and_award_level(_bot_instance, gid, uid, ksp_level)
+
+    # Grant XP + KCoins from the difficulty rating, same as the /analyze command.
+    try:
+        rating = int(result.get("difficulty_rating", 0) or 0)
+    except (ValueError, TypeError):
+        rating = 0
+    xp_r = coin_r = 0
+    if rating > 0:
+        xp_r, coin_r = await _grant_rewards(gid, uid, rating)
+    reward_suffix = f" (+{xp_r} XP, +{coin_r} KC)" if (xp_r or coin_r) else ""
+
+    # In-game popup message.
+    if qualifies and is_new:
+        message = f"🏅 {title_desc} — unlocked! Check your Discord DMs to equip the title.{reward_suffix}"
+    elif qualifies:
+        message = f"✅ Verified: {title_desc}. You already hold this title — shot shared!{reward_suffix}"
+    else:
+        message = f"📸 Shot shared! It doesn't match a title role.{reward_suffix}"
+
+    await _post_achievement_capture(
+        data, gid, uid, username, vessel_name, body,
+        result=result, qualifies=qualifies, is_new=is_new, title_desc=title_desc,
+    )
+
+    log.info(
+        "KSP: %s achievement photo → level %d (%s) qualifies=%s new=%s reward=+%dXP/+%dKC",
+        uid, ksp_level, title_desc or "—", qualifies, is_new, xp_r, coin_r,
+    )
+    return SubmissionResult(success=True, message=message)
+
+
 # ── Health ───────────────────────────────────────────────────────────────────
 
 @app.get("/api/v1/health")
@@ -3395,10 +4035,9 @@ async def _deliver_craft_to_corp(gid: int, builder_id: int, contract_id: str):
             log.info("Corp delivery skipped for %s: builder %d has no corp channel", contract_id, builder_id)
             return
 
-        guild = _bot_instance.get_guild(gid)
-        if guild is None:
-            return
-        channel = guild.get_channel(int(corp["channel_id"]))
+        # The corp may live in another server (one corp per user globally), so
+        # resolve its channel by id at the bot level rather than within `gid`.
+        channel = _bot_instance.get_channel(int(corp["channel_id"]))
         if channel is None:
             return
 
@@ -3441,17 +4080,13 @@ async def _discord_notify_issuer(
         from cogs.corps import _get_corp
         from cogs.contract_views import ContractReviewView
 
-        # Find issuer's corp channel
+        # Find issuer's corp channel (may be in another server — resolve globally).
         corp = _get_corp(gid, issuer_id)
         if not corp or not corp.get("channel_id"):
             log.warning("No corp channel for issuer %d — cannot notify", issuer_id)
             return
 
-        guild = _bot_instance.get_guild(gid)
-        if guild is None:
-            return
-
-        channel = guild.get_channel(int(corp["channel_id"]))
+        channel = _bot_instance.get_channel(int(corp["channel_id"]))
         if channel is None:
             return
 

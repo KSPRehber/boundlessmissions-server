@@ -30,19 +30,46 @@ def is_owner_user(interaction: discord.Interaction) -> bool:
 
 
 def is_admin_user(interaction: discord.Interaction) -> bool:
-    """True if the real invoker is the bot owner or a guild administrator."""
-    u = real_user(interaction)
-    if getattr(u, "id", None) == cfg.OWNER_ID:
-        return True
-    return isinstance(u, discord.Member) and u.guild_permissions.administrator
+    """True only if the real invoker is the single configured admin (cfg.OWNER_ID).
+
+    The admin is intentionally ONE person, set via BOT_OWNER_ID in .env and not
+    changeable in-bot. Guild administrators are NOT auto-admins: server admins
+    manage their server through the moderator role, while bot-wide admin commands
+    (/admin …) are reserved for the owner across every guild."""
+    return getattr(real_user(interaction), "id", None) == cfg.OWNER_ID
 
 
 def is_mod_user(interaction: discord.Interaction) -> bool:
-    """True if the real invoker is a moderator (MOD_ROLE_ID, kick, or admin)."""
-    import settings
+    """True if the real invoker is a moderator: the bot owner, the guild's mapped
+    mod role (per-guild via guild_config, falling back to settings.MOD_ROLE_ID),
+    or a member with kick/administrator permission."""
+    from data import guild_config
     u = real_user(interaction)
+    if getattr(u, "id", None) == cfg.OWNER_ID:
+        return True
     if not isinstance(u, discord.Member):
         return False
-    if settings.MOD_ROLE_ID and u.get_role(settings.MOD_ROLE_ID):
+    mod_role = guild_config.resolve_role(u.guild, "mod")
+    if mod_role and u.get_role(mod_role.id):
         return True
     return u.guild_permissions.kick_members or u.guild_permissions.administrator
+
+
+async def block_if_mod_only(interaction: discord.Interaction) -> bool:
+    """Gate for gameplay commands the in-game KSP mod can perform itself.
+
+    When `settings.MOD_ONLY_GAMEPLAY` is enabled these commands are disabled on
+    Discord so the action can only be triggered from inside the game. Returns
+    True (after replying ephemerally) when the command should abort; False when
+    it may proceed. Call this BEFORE deferring, while the interaction response
+    is still unused.
+    """
+    import settings
+    from i18n import tp
+    if not settings.MOD_ONLY_GAMEPLAY:
+        return False
+    await interaction.response.send_message(
+        tp(interaction.guild_id, interaction.user.id, "common.mod_only"),
+        ephemeral=True,
+    )
+    return True

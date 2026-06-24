@@ -18,6 +18,7 @@ from discord.ext import commands, tasks
 
 import settings
 from data.store import _db, store
+from data import guild_config
 from data.mission_templates import TEMPLATES
 from i18n import t, S
 from cogs.corps import _get_corp
@@ -414,6 +415,9 @@ class WeeklyMissions(commands.Cog, name="WeeklyMissions"):
         self.bot = bot
         self._current_week = ""
         self._missions: list[dict] = []
+        # guild_id -> week_key already posted/refreshed this run, so the 30-min
+        # loop doesn't re-hit Firestore for every guild once the board is up.
+        self._ensured: dict[int, str] = {}
 
     async def cog_load(self):
         self.refresh_loop.start()
@@ -445,54 +449,55 @@ class WeeklyMissions(commands.Cog, name="WeeklyMissions"):
             log.error("Failed to cleanup old missions: %s", e)
 
     async def _ensure_embed(self):
-        ch_id = settings.WEEKLY_MISSIONS_CHANNEL_ID
-        if not ch_id:
-            return
-
-        channel = self.bot.get_channel(ch_id)
-        if not channel:
-            try:
-                channel = await self.bot.fetch_channel(ch_id)
-            except Exception:
-                log.error("Weekly missions channel %d not found", ch_id)
-                return
-
-        guild_id = channel.guild.id
+        # Post/refresh the weekly board in EVERY guild that has a weekly_missions
+        # channel configured (multi-server). Missions are generated once per week
+        # (deterministic from the week key) and stored per guild.
         week_key = _week_key()
+        for guild in self.bot.guilds:
+            channel = guild_config.resolve_channel(self.bot, guild.id, "weekly_missions")
+            if channel is None:
+                continue
+            guild_id = guild.id
 
-        if week_key == self._current_week and self._missions:
-            return  # Already up to date
+            if self._ensured.get(guild_id) == week_key:
+                continue  # already posted/refreshed this guild for this week
 
-        # Check Firestore for existing missions this week
-        missions, msg_id = _load_missions(guild_id, week_key)
+            # Check Firestore for existing missions this week (per guild)
+            missions, msg_id = _load_missions(guild_id, week_key)
+            if not missions:
+                missions = _generate_missions(week_key, settings.WEEKLY_MISSIONS_COUNT)
+                log.info("Generated %d weekly missions for %s (guild %s)",
+                         len(missions), week_key, guild_id)
 
-        if not missions:
-            # Generate new missions
-            missions = _generate_missions(week_key, settings.WEEKLY_MISSIONS_COUNT)
-            log.info("Generated %d weekly missions for %s", len(missions), week_key)
+            self._missions = missions
+            self._current_week = week_key
 
-        self._missions = missions
-        self._current_week = week_key
+            embed = _build_embed(guild_id, missions, week_key)
+            view = MissionSelectView(week_key, guild_id, missions)
 
-        embed = _build_embed(guild_id, missions, week_key)
-        view = MissionSelectView(week_key, guild_id, missions)
+            # Try to edit existing message (no re-ping on edits)
+            if msg_id:
+                try:
+                    msg = await channel.fetch_message(msg_id)
+                    await msg.edit(embed=embed, view=view)
+                    log.info("Updated weekly missions embed (msg %d, guild %s)", msg_id, guild_id)
+                    await self._cleanup_old_missions(channel, current_msg_id=msg_id)
+                    self._ensured[guild_id] = week_key
+                    continue
+                except discord.NotFound:
+                    pass
 
-        # Try to edit existing message
-        if msg_id:
-            try:
-                msg = await channel.fetch_message(msg_id)
-                await msg.edit(embed=embed, view=view)
-                log.info("Updated weekly missions embed (msg %d)", msg_id)
-                await self._cleanup_old_missions(channel, current_msg_id=msg_id)
-                return
-            except discord.NotFound:
-                pass
-
-        # Post new message
-        msg = await channel.send(embed=embed, view=view)
-        _save_missions(guild_id, week_key, missions, msg.id)
-        log.info("Posted weekly missions embed (msg %d)", msg.id)
-        await self._cleanup_old_missions(channel, current_msg_id=msg.id)
+            # Post new message — ping the guild's notification role if mapped.
+            notif = guild_config.resolve_role(guild, "notifications")
+            content = notif.mention if notif else None
+            msg = await channel.send(
+                content=content, embed=embed, view=view,
+                allowed_mentions=discord.AllowedMentions(roles=True),
+            )
+            _save_missions(guild_id, week_key, missions, msg.id)
+            log.info("Posted weekly missions embed (msg %d, guild %s)", msg.id, guild_id)
+            await self._cleanup_old_missions(channel, current_msg_id=msg.id)
+            self._ensured[guild_id] = week_key
 
     @app_commands.command(name="add_custom_mission", description="Add an additional custom mission (Mod Only)")
     @app_commands.default_permissions(kick_members=True)
@@ -534,10 +539,14 @@ class WeeklyMissions(commands.Cog, name="WeeklyMissions"):
         embed.set_footer(text=f"duration_days:{duration_days}|expires:{int(expires_at.timestamp())}")
 
         view = CustomMissionAcceptView()
-        
-        ch_id = settings.WEEKLY_MISSIONS_CHANNEL_ID
-        channel = interaction.client.get_channel(ch_id) or await interaction.client.fetch_channel(ch_id)
-        
+
+        channel = guild_config.resolve_channel(interaction.client, interaction.guild_id, "weekly_missions")
+        if channel is None:
+            await interaction.response.send_message(
+                "❌ No weekly-missions channel is configured for this server. "
+                "Set one with `/admin setchannel`.", ephemeral=True)
+            return
+
         await channel.send(embed=embed, view=view)
         await interaction.response.send_message("✅ Custom mission posted to mission-control.", ephemeral=True)
 

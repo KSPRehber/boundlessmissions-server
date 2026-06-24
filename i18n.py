@@ -12,8 +12,8 @@ from data.store import _db, store
 log = logging.getLogger(__name__)
 
 # In-memory caches
-_guild_langs: dict[str, str] = {}            # guild_id -> lang
-_user_langs: dict[tuple[str, str], str] = {} # (guild_id, user_id) -> lang
+_guild_langs: dict[str, str] = {}   # guild_id -> lang
+_user_langs: dict[str, str] = {}    # user_id -> lang (global; the wallet is global)
 
 DEFAULT_LANG = "en"
 SUPPORTED_LANGS = ("en",)
@@ -110,6 +110,7 @@ S: dict[str, dict[str, str]] = {
     "common.amount_positive":       {"en": "❌ Amount must be positive."},
     "common.amount_negative":       {"en": "❌ Balance can't be negative."},
     "common.server_only":           {"en": "❌ This command can only be used in a server."},
+    "common.mod_only":              {"en": "🔒 This action is only available in-game. Use the GeneKerman mod inside KSP to do this."},
     "common.issued_by":             {"en": "Issued by {name}"},
 }
 
@@ -145,21 +146,20 @@ def set_server_lang(guild_id: int, lang: str) -> None:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def get_user_lang(guild_id: int | None, user_id: int | None) -> str:
-    """Get user's personal language. Falls back to server lang, then default."""
-    if guild_id is not None and user_id is not None:
-        key = (str(guild_id), str(user_id))
-        lang = _user_langs.get(key)
+    """Get user's personal language (global). Falls back to server lang, then default."""
+    if user_id is not None:
+        lang = _user_langs.get(str(user_id))
         if lang:
             return lang
     return get_server_lang(guild_id)
 
 
 def set_user_lang(guild_id: int, user_id: int, lang: str) -> None:
-    """Set user's personal language. Persists to Firestore user doc."""
+    """Set user's personal language (global). Persists to the global user doc."""
     lang = lang.lower()
     if lang not in SUPPORTED_LANGS:
         return
-    _user_langs[(str(guild_id), str(user_id))] = lang
+    _user_langs[str(user_id)] = lang
     # Save in the user's data record
     try:
         user = store.get_user(guild_id, user_id)
@@ -184,13 +184,12 @@ def load_all_langs() -> None:
     except Exception as exc:
         log.error("Failed to load server language prefs: %s", exc)
 
-    # Load user languages from already-loaded store data
+    # Load user languages from the already-loaded global store
     user_count = 0
-    for guild_id, users in store._data.items():
-        for user_id, data in users.items():
-            if "language" in data and data["language"]:
-                _user_langs[(guild_id, user_id)] = data["language"]
-                user_count += 1
+    for user_id, data in store._users.items():
+        if data.get("language"):
+            _user_langs[user_id] = data["language"]
+            user_count += 1
 
     log.info("Loaded language prefs: %d guild(s), %d user(s)", len(_guild_langs), user_count)
 

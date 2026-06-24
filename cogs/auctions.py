@@ -21,6 +21,7 @@ import settings
 from data.store import store
 from data import auctions as adb
 from data import contracts as cdb
+from data import guild_config
 from i18n import t, tp, S
 from cogs.contract_views import ContractWorkView, _embed
 
@@ -124,16 +125,51 @@ def _auction_embed(a: dict, gid: int) -> discord.Embed:
     return e
 
 
-async def _edit_auction_message(bot, a: dict, gid: int, view) -> None:
-    """Re-render the public auction message (best-effort)."""
-    if not a.get("channel_id") or not a.get("message_id"):
-        return
-    try:
-        ch = bot.get_channel(int(a["channel_id"])) or await bot.fetch_channel(int(a["channel_id"]))
-        msg = await ch.fetch_message(int(a["message_id"]))
-        await msg.edit(embed=_auction_embed(a, gid), view=view)
-    except Exception as exc:
-        log.warning("Could not edit auction message %s: %s", a.get("auction_id"), exc)
+async def _edit_auction_message(bot, a: dict, gid: int, *, live: bool) -> None:
+    """Re-render EVERY mirrored copy of the auction message (best-effort). When
+    `live` the Bid/End buttons are reattached; otherwise the message is read-only."""
+    aid = a.get("auction_id", "")
+    for m in a.get("mirrors", []) or []:
+        try:
+            ch = bot.get_channel(int(m["channel_id"])) or await bot.fetch_channel(int(m["channel_id"]))
+            msg = await ch.fetch_message(int(m["message_id"]))
+            view = AuctionLiveView(aid, int(m["guild_id"])) if live else None
+            await msg.edit(embed=_auction_embed(a, gid), view=view)
+        except Exception as exc:
+            log.warning("Could not edit auction mirror %s in guild %s: %s",
+                        aid, m.get("guild_id"), exc)
+
+
+async def backfill_guild(bot, guild_id: int) -> int:
+    """Mirror every still-open auction into `guild_id`'s auction channel — used when
+    a server configures its auction channel after auctions already exist. Idempotent:
+    skips auctions already mirrored in this guild. Returns count posted."""
+    channel = guild_config.resolve_channel(bot, guild_id, "auction")
+    if channel is None:
+        return 0
+    now = datetime.utcnow().isoformat()
+    posted = 0
+    for a in adb.list_open(0):
+        if a.get("ends_at") and a["ends_at"] <= now:
+            continue  # about to be closed by the loop — don't mirror a dead auction
+        aid = a["auction_id"]
+        mirrors = a.get("mirrors", []) or []
+        if any(str(m.get("guild_id")) == str(guild_id) for m in mirrors):
+            continue
+        try:
+            msg = await channel.send(
+                embed=_auction_embed(a, int(a.get("guild_id") or guild_id)),
+                view=AuctionLiveView(aid, guild_id))
+        except Exception as exc:
+            log.warning("Backfill: could not mirror auction %s into guild %s: %s", aid, guild_id, exc)
+            continue
+        mirrors.append({"guild_id": str(guild_id), "channel_id": str(channel.id),
+                        "message_id": str(msg.id)})
+        adb.update_auction(0, aid, mirrors=mirrors)
+        posted += 1
+    if posted:
+        log.info("Backfilled %d open auctions into guild %s", posted, guild_id)
+    return posted
 
 
 async def open_auction(bot, gid: int, issuer_id: int, issuer_name: str, mission: str,
@@ -142,8 +178,8 @@ async def open_auction(bot, gid: int, issuer_id: int, issuer_name: str, mission:
     """Escrow `start_value`, create the auction doc, and post it to the auction
     channel. Returns the auction doc. Raises (after refunding the escrow) if the
     post fails. Callers must pre-validate balance / limit / date / duration and
-    that settings.AUCTION_CHANNEL_ID is set. Shared by the /auction slash command
-    and the KSP-mod API endpoint.
+    that an auction channel is configured for this guild (guild_config). Shared by
+    the /auction slash command and the KSP-mod API endpoint.
 
     The escrow debit is atomic (try_debit): even though callers pre-validate the
     balance, that check and this debit aren't a single operation, so a concurrent
@@ -157,12 +193,23 @@ async def open_auction(bot, gid: int, issuer_id: int, issuer_name: str, mission:
         modlist=mods, min_decrement=settings.AUCTION_MIN_DECREMENT, mission_type=mission_type,
     )
     try:
-        ch = (bot.get_channel(settings.AUCTION_CHANNEL_ID)
-              or await bot.fetch_channel(settings.AUCTION_CHANNEL_ID))
-        msg = await ch.send(embed=_auction_embed(a, gid),
-                            view=AuctionLiveView(a["auction_id"], gid))
-        adb.update_auction(gid, a["auction_id"], channel_id=str(ch.id), message_id=str(msg.id))
-        a["channel_id"], a["message_id"] = str(ch.id), str(msg.id)
+        aid = a["auction_id"]
+        mirrors: list[dict] = []
+        for guild in bot.guilds:
+            ch = guild_config.resolve_channel(bot, guild.id, "auction")
+            if ch is None:
+                continue
+            try:
+                msg = await ch.send(embed=_auction_embed(a, gid),
+                                    view=AuctionLiveView(aid, guild.id))
+                mirrors.append({"guild_id": str(guild.id), "channel_id": str(ch.id),
+                                "message_id": str(msg.id)})
+            except Exception as exc:
+                log.warning("Could not mirror auction %s into guild %s: %s", aid, guild.id, exc)
+        if not mirrors:
+            raise RuntimeError("no auction channel configured in any server")
+        adb.update_auction(gid, aid, mirrors=mirrors)
+        a["mirrors"] = mirrors
     except Exception:
         await store.add_balance(gid, issuer_id, start_value)  # refund escrow
         adb.update_auction(gid, a["auction_id"], status=adb.CANCELLED)
@@ -176,45 +223,48 @@ async def close_auction(bot, gid: int, auction_id: str, *, ended_by: str = "time
     a = adb.get_auction(gid, auction_id)
     if not a or a["status"] != adb.OPEN:
         return
+    # The winner's contract inherits the auction's ORIGIN guild (for channel routing
+    # like the "sue" escalation), regardless of which server's mirror triggered close.
+    origin_gid = int(a.get("guild_id") or gid)
     sym = settings.CURRENCY_SYMBOL
     winner_id = a.get("current_bidder_id")
 
     if winner_id:
         final = a["current_bid"]
         c = cdb.create_contract(
-            gid, int(a["issuer_id"]), a["issuer_name"],
+            origin_gid, int(a["issuer_id"]), a["issuer_name"],
             int(winner_id), a["current_bidder_name"],
             a["mission"], final, a["fine"], a["due_date"],
             modlist=a.get("modlist"),
             mission_type=a.get("mission_type"),
         )
-        cdb.update_contract(gid, c["contract_id"], status=cdb.ACTIVE)
+        cdb.update_contract(origin_gid, c["contract_id"], status=cdb.ACTIVE)
         c["status"] = cdb.ACTIVE
         # Refund the part of the escrow above the winning bid.
         refund = a["start_value"] - final
         if refund > 0:
-            await store.add_balance(gid, int(a["issuer_id"]), refund)
+            await store.add_balance(origin_gid, int(a["issuer_id"]), refund)
         a["status"] = adb.CLOSED
-        adb.update_auction(gid, auction_id, status=adb.CLOSED, result_contract_id=c["contract_id"])
+        adb.update_auction(origin_gid, auction_id, status=adb.CLOSED, result_contract_id=c["contract_id"])
         log.info("Auction %s closed (%s) → contract %s, winner %s for %d",
                  auction_id, ended_by, c["contract_id"], a["current_bidder_name"], final)
         # DM the winner their active contract with the work view.
         try:
             winner = await bot.fetch_user(int(winner_id))
-            e = _embed(c, gid)
-            e.description = t(gid, "auc.won_dm", price=final, sym=sym)
-            dm = await winner.send(embed=e, view=ContractWorkView(c["contract_id"], gid))
-            cdb.update_contract(gid, c["contract_id"], dm_message_id=str(dm.id))
+            e = _embed(c, origin_gid)
+            e.description = t(origin_gid, "auc.won_dm", price=final, sym=sym)
+            dm = await winner.send(embed=e, view=ContractWorkView(c["contract_id"], origin_gid))
+            cdb.update_contract(origin_gid, c["contract_id"], dm_message_id=str(dm.id))
         except Exception as exc:
             log.warning("Could not DM auction winner %s: %s", winner_id, exc)
     else:
         # No bids — refund the full escrow and cancel.
-        await store.add_balance(gid, int(a["issuer_id"]), a["start_value"])
+        await store.add_balance(origin_gid, int(a["issuer_id"]), a["start_value"])
         a["status"] = adb.CANCELLED
-        adb.update_auction(gid, auction_id, status=adb.CANCELLED)
+        adb.update_auction(origin_gid, auction_id, status=adb.CANCELLED)
         log.info("Auction %s closed (%s) with no bids — escrow refunded", auction_id, ended_by)
 
-    await _edit_auction_message(bot, a, gid, view=None)
+    await _edit_auction_message(bot, a, origin_gid, live=False)
 
 
 # ── Buttons / Modal ──────────────────────────────────────────────────────────
@@ -283,7 +333,7 @@ class BidModal(discord.ui.Modal):
         adb.update_auction(gid, self.aid, **fields)
         a.update(fields)
 
-        await _edit_auction_message(interaction.client, a, gid, view=AuctionLiveView(self.aid, gid))
+        await _edit_auction_message(interaction.client, a, int(a.get("guild_id") or gid), live=True)
         await interaction.followup.send(
             tp(gid, uid, "auc.bid_ok", amount=amount, sym=sym), ephemeral=True)
 
@@ -373,7 +423,7 @@ class Auctions(commands.Cog, name="Auctions"):
         gid, uid = interaction.guild_id, interaction.user.id
         sym = settings.CURRENCY_SYMBOL
 
-        if not settings.AUCTION_CHANNEL_ID:
+        if not guild_config.any_channel_configured(self.bot, "auction"):
             await interaction.response.send_message(tp(gid, uid, "auc.err_disabled"), ephemeral=True)
             return
         if start_value <= 0:
@@ -417,20 +467,23 @@ class Auctions(commands.Cog, name="Auctions"):
             await interaction.followup.send(tp(gid, uid, "auc.err_post"), ephemeral=True)
             return
 
+        first = (a.get("mirrors") or [{}])[0]
+        chan_ref = f"<#{first['channel_id']}>" if first.get("channel_id") else "the auction channels"
         await interaction.followup.send(
-            tp(gid, uid, "auc.created", channel=f"<#{a['channel_id']}>"), ephemeral=True)
+            tp(gid, uid, "auc.created", channel=chan_ref), ephemeral=True)
 
     # ── Background: close auctions whose timer has elapsed ────────────────────
     @tasks.loop(seconds=30)
     async def close_loop(self):
         now = datetime.utcnow().isoformat()
-        for guild in list(self.bot.guilds):
-            try:
-                for a in adb.list_open(guild.id):
-                    if a.get("ends_at") and a["ends_at"] <= now:
-                        await close_auction(self.bot, guild.id, a["auction_id"], ended_by="time")
-            except Exception as exc:
-                log.error("Auction close_loop error in guild %s: %s", guild.id, exc)
+        try:
+            # Auctions are global now — iterate the global open set once.
+            for a in adb.list_open(0):
+                if a.get("ends_at") and a["ends_at"] <= now:
+                    await close_auction(self.bot, int(a.get("guild_id") or 0),
+                                        a["auction_id"], ended_by="time")
+        except Exception as exc:
+            log.error("Auction close_loop error: %s", exc)
 
     @close_loop.before_loop
     async def _wait_ready(self):

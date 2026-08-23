@@ -423,14 +423,16 @@ class Corps(commands.Cog, name="Corps"):
         self._swept = True
 
         # Everyone who owns a corp anywhere.
-        owners = {doc.id for doc in _db.collection("corp_owners").stream()}
+        owner_docs = await asyncio.to_thread(
+            lambda: list(_db.collection("corp_owners").stream()))
+        owners = {doc.id for doc in owner_docs}
 
         for guild in self.bot.guilds:
             covered = set(owners)
             privatized = created = 0
 
             col = _db.collection("guilds").document(str(guild.id)).collection("corps")
-            for doc in col.stream():
+            for doc in await asyncio.to_thread(lambda: list(col.stream())):
                 d = doc.to_dict() or {}
                 d.setdefault("owner_id", doc.id)
                 # Non-owner corp members have a corp channel already; they must
@@ -541,7 +543,7 @@ class Corps(commands.Cog, name="Corps"):
 
         updated, failed, missing = [], [], []
         col = _db.collection("guilds").document(str(guild.id)).collection("corps")
-        for doc in col.stream():
+        for doc in await asyncio.to_thread(lambda: list(col.stream())):
             d = doc.to_dict() or {}
             d.setdefault("owner_id", doc.id)
             name = d.get("name", doc.id)

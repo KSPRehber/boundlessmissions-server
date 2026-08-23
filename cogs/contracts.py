@@ -79,7 +79,7 @@ class Contracts(commands.Cog, name="Contracts"):
         cancelled = 0
         refunded = 0
 
-        for c in cdb.iter_user_contracts(gid, user.id):
+        for c in await asyncio.to_thread(cdb.iter_user_contracts, gid, user.id):
             if c.get("status") in active_statuses:
                 cdb.update_contract(gid, c["contract_id"], status=cdb.CANCELLED)
                 # Refund escrow to issuer (if issuer is not the bot)
@@ -98,7 +98,7 @@ class Contracts(commands.Cog, name="Contracts"):
         # Also clear weekly mission selections for this user
         sel_col = _db.collection("guilds").document(str(gid)).collection("weekly_selections")
         selections_cleared = 0
-        for doc in sel_col.stream():
+        for doc in await asyncio.to_thread(lambda: list(sel_col.stream())):
             d = doc.to_dict()
             if d.get("user_id") == str(user.id):
                 doc.reference.delete()

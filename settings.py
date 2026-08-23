@@ -349,6 +349,21 @@ MARKETPLACE_UPLOAD_REWARD_MIN_PARTS = 20
 # craft the same day still lists normally, it just doesn't pay again.
 MARKETPLACE_UPLOAD_REWARD_COOLDOWN = 24 * 60 * 60
 
+# Community rating. A listing carries ONE number — its score, likes minus dislikes,
+# the way SCP wiki rates a page — and the separate tallies exist only so the score
+# can be derived and moderators can see the split behind it.
+#
+# At or below MARKETPLACE_AUTO_DELIST_SCORE the community has buried the craft and
+# it comes off the grid by itself. Set it to 0 (or None) to switch that off entirely
+# and let the score be nothing but a display.
+MARKETPLACE_AUTO_DELIST_SCORE = -20
+# What "comes off the grid" means. False delists: the document, the Storage files
+# and every buyer's re-download survive, the seller still sees the craft under My
+# Uploads, and a moderator can put it back. True deletes it outright, which nothing
+# undoes — so it is off by default, and a rating alone should probably never be
+# what erases someone's work.
+MARKETPLACE_AUTO_DELIST_DELETE = False
+
 
 # ── Weekly Missions ──────────────────────────────────────────────────────────
 

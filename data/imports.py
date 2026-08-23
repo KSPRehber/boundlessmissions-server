@@ -93,12 +93,14 @@ def enqueue(
     decline can notify them, and a `blueprint_url` preview when the sender's
     client managed to render one.
 
-    `vessel_pid` (gift_vessel only) is the vessel's pid in the SENDER's save. A
-    quicksent live vessel is a hand-over — the sender's client removes it on
-    send — so the pid rides both the offer (the accept notification echoes it,
-    letting the sender's client re-queue a removal a quickload rolled back) and
-    the decline-return entry (the sender's client uses it to cancel a removal
-    that hasn't run yet instead of spawning a duplicate).
+    `vessel_pid` (gift_vessel and the rescue-cancel restore) is the vessel's pid
+    in the SENDER's save. A quicksent live vessel is a hand-over — the sender's
+    client removes it on send — so the pid rides both the offer (the accept
+    notification echoes it, letting the sender's client re-queue a removal a
+    quickload rolled back) and the decline-return entry (the sender's client
+    uses it to cancel a removal that hasn't run yet instead of spawning a
+    duplicate). A cancelled rescue's restore is the same return in contract
+    shape, so it carries the issuer-save pid (`rescue_pid`) for the same check.
     """
     for doc in _col(guild_id, user_id).stream():
         d = doc.to_dict()

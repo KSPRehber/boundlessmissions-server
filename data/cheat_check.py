@@ -8,8 +8,12 @@ at the target, so its telemetry is perfectly consistent and telemetry_check can
 see nothing wrong — that check catches forged claims, this one catches cheated
 truths. The mod's watchdog (KSP side: CheatDetection.cs) taints a vessel when
 its flight state breaks physics continuity or a cheat tool/toggle is seen acting
-on it, and the submission carries a `cheat_report` JSON covering exactly the
-vessels submitted.
+on it — and likewise when the flight is a *simulation* (RP-1/KCT's "Simulate",
+KRASH): a simulated launch is free, instant and reverted when it ends, so a
+submission from inside one claims a flight that never happened. The client
+refuses those outright before upload; the taint arriving here is the backstop
+for a client that missed the memo. The submission carries a `cheat_report`
+JSON covering exactly the vessels submitted.
 
 Three shapes of report, three meanings — the distinction is the point:
   - report says tainted → disqualify (when the env gate is on)

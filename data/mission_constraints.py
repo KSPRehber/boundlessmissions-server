@@ -1076,9 +1076,17 @@ def verify_used_parts(constraints: dict | None, used_parts: list[dict],
           "name":               "radialLiquidEngine1-2",  # internal part name
           "title":              "Mk-55 \"Thud\" Liquid Fuel Engine",
           "propellants":        ["LiquidFuel", "Oxidizer"],
+          "resources":          ["LiquidFuel", "Oxidizer"],
           "engine_categories":  ["chemical"],
           "part_categories":    ["engine"],
         }
+
+    "propellants" is what the part's engines burn; "resources" is what it is
+    actually carrying. The two are not the same question, and a forbidden
+    propellant is broken by either — a monopropellant tank has no engine and no
+    RCS module, so it reports no propellant at all while being the whole of the
+    violation for "no monopropellant aboard". Clients older than that key send no
+    "resources" at all, which reads as an empty set and checks exactly as before.
 
     `delta_v` is the craft's stock-calculated vacuum Δv (m/s) as reported by the
     client; the bot can't recompute it, so a min/max-Δv limit is only checked
@@ -1098,6 +1106,7 @@ def verify_used_parts(constraints: dict | None, used_parts: list[dict],
         return scalar_violations + _missing_required(constraints, [])
 
     props = _flatten(used_parts, "propellants")
+    carried = _flatten(used_parts, "resources")
     eng = _flatten(used_parts, "engine_categories")
     cats = _flatten(used_parts, "part_categories")
 
@@ -1119,6 +1128,8 @@ def verify_used_parts(constraints: dict | None, used_parts: list[dict],
     for bad in constraints.get("forbidden_propellants", []):
         if bad.lower() in props:
             violations.append(f"Craft has an engine powered by forbidden fuel: {bad}.")
+        elif bad.lower() in carried:
+            violations.append(f"Craft carries a forbidden resource: {bad}.")
 
     for bad in constraints.get("forbidden_engine_categories", []):
         if bad.lower() in eng:
@@ -1136,6 +1147,7 @@ def _missing_required(constraints: dict, used_parts: list[dict]) -> list[str]:
     titles = [(p.get("title") or "").lower() for p in used_parts]
     used_names = {(p.get("name") or "").lower() for p in used_parts}
     props = _flatten(used_parts, "propellants")
+    carried = _flatten(used_parts, "resources")
     eng = _flatten(used_parts, "engine_categories")
     cats = _flatten(used_parts, "part_categories")
     out: list[str] = []

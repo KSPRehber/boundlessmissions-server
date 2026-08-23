@@ -440,15 +440,21 @@ class MarketplaceListing(BaseModel):
     life_support: str = "none"
     ls_endurance_days: float = 0.0
     ls_crew_capacity: int = 0
-    # Whether the craft carries a Textures Unlimited paint job — the website's
-    # "Modded Textures Available" tag. Sent by the KSP client at list-time; for a
-    # listing made before the flag existed it is inferred from the mod row instead
-    # (see _listing_to_model).
+    # Whether the craft carries a custom paint job — Textures Unlimited or Reforged
+    # Materials Redux — the website's "Modded Textures Available" tag. Sent by the KSP
+    # client at list-time; for a listing made before the flag existed it is inferred
+    # from the mod row instead (see _has_custom_textures).
     custom_textures: bool = False
-    # Community vote tallies. Public (they're on every card); *who* voted is not —
-    # the caller learns only their own vote, from /web/marketplace/votes.
+    # Community rating. `score` is likes minus dislikes and is the number the site
+    # actually shows — one signed value per craft, SCP-wiki style; the two tallies
+    # ride along for the admin console, which wants the split behind it. All three
+    # are public (they're on every card); *who* voted is not — the caller learns
+    # only their own vote, from /web/marketplace/votes.
+    score: int = 0
     likes: int = 0
     dislikes: int = 0
+    # The score, not the seller, is why this listing is delisted.
+    auto_delisted: bool = False
 
 class MarketplaceListingsResponse(BaseModel):
     listings: list[MarketplaceListing]
@@ -507,9 +513,17 @@ class VoteRequest(BaseModel):
 
 class VoteResult(BaseModel):
     success: bool
+    score: int = 0
     likes: int = 0
     dislikes: int = 0
     my_vote: int = 0
+    # Set when this very vote pushed the listing to the auto-delist floor. The
+    # voter is told, because the craft disappearing from the grid the instant they
+    # pressed a button otherwise reads as the site breaking.
+    listing_removed: bool = False
+    # "delisted" or "deleted" when listing_removed — which of the two the server is
+    # configured to do (settings.MARKETPLACE_AUTO_DELIST_DELETE).
+    removal_kind: str = ""
 
 class MyVotesResponse(BaseModel):
     """Every vote the caller has cast, {listing_id: 1 | -1}. One read serves the

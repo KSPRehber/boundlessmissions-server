@@ -95,12 +95,15 @@ def create_listing(
         "life_support": life_support or "none",
         "ls_endurance_days": float(ls_endurance_days or 0.0),
         "ls_crew_capacity": int(ls_crew_capacity or 0),
-        # Whether the craft carries a Textures Unlimited paint job, sent by the KSP
-        # client at list-time (TextureTransfer.CraftHasCustomTextures) — the website's
+        # Whether the craft carries a custom paint job, sent by the KSP client at
+        # list-time (TextureTransfer.CraftHasCustomTextures for Textures Unlimited,
+        # ReforgedTransfer.CraftHasPaint for Reforged Materials Redux) — the website's
         # "Modded Textures Available" tag. A flag of its own rather than a read of
         # `mods`: a texture set the seller can't resolve either contributes no folder
-        # while the paint job is still on the craft. False for listings made before the
-        # flag existed; those fall back to the mod row (see _listing_to_model).
+        # while the paint job is still on the craft, and Reforged's own folder is only
+        # added once the client has judged the craft actually painted. False for listings
+        # made before the flag existed; those fall back to the mod row
+        # (see _has_custom_textures).
         "custom_textures": bool(custom_textures),
         "status": ACTIVE,
         "created_at": now,
@@ -113,6 +116,10 @@ def create_listing(
         # per listing — see record_report). Never shown publicly; it exists so the
         # owner console can sort by "most complained about".
         "report_count": 0,
+        # Set when the community rating buried this listing (see claim_auto_delist).
+        # Kept apart from `status` because "the seller took it down" and "the score
+        # took it down" are the same status and two different things to say.
+        "auto_delisted": False,
         # Dead field, kept so a listing written now has the same shape as one written
         # before Discord stopped mirroring listings: [{guild_id, channel_id, message_id}].
         # Nothing writes it and nothing reads it any more.
@@ -289,6 +296,65 @@ def set_vote(listing_id: str, user_id: int | str, vote: int) -> tuple[int, int] 
         raise
 
     return max(0, likes + d_like), max(0, dislikes + d_dislike)
+
+
+def net_score(listing: ListingData) -> int:
+    """A listing's rating: likes minus dislikes, one signed number.
+
+    This is what the website shows and what the "highest rated" sort ranks by; the
+    two tallies behind it are storage detail. Derived rather than stored because a
+    third counter is a third thing that can drift out of step with the votes."""
+    return (max(0, int(listing.get("likes", 0) or 0))
+            - max(0, int(listing.get("dislikes", 0) or 0)))
+
+
+def claim_auto_delist(listing_id: str, score: int) -> bool:
+    """Take a listing off the grid because its score reached the floor.
+
+    Returns True only for the call that actually did it — a still-active listing
+    flipped to delisted here and now. Two downvotes landing together both see an
+    active listing, so the flip runs in a transaction and the loser gets False:
+    the removal is idempotent either way, but the seller must not be told twice
+    that their craft was removed once.
+
+    The marker is written alongside the status so the seller's My Uploads view can
+    say *why* the craft is down — a listing that delisted itself while they were
+    offline is otherwise indistinguishable from one they delisted themselves.
+    """
+    ref = _col().document(listing_id)
+    transaction = _db.transaction()
+
+    @firestore.transactional
+    def _claim(txn) -> bool:
+        snap = ref.get(transaction=txn)
+        if not snap.exists or (snap.to_dict() or {}).get("status") != ACTIVE:
+            return False
+        txn.update(ref, {
+            "status": DELISTED,
+            "auto_delisted": True,
+            "auto_delisted_at": datetime.utcnow().isoformat(),
+            "auto_delisted_score": int(score),
+        })
+        return True
+
+    claimed = bool(_claim(transaction))
+    if claimed:
+        log.info("Listing %s auto-delisted at score %d", listing_id, score)
+    return claimed
+
+
+def clear_auto_delisted(listing_id: str) -> None:
+    """Drop the auto-delist marker (a moderator put the listing back up).
+
+    The marker is only ever a note about the past, so it must not outlive the state
+    it describes — left behind it would keep telling a seller their live listing was
+    removed. Whether the craft can be buried *again* is decided from the live score,
+    not from this flag."""
+    _col().document(listing_id).update({
+        "auto_delisted": False,
+        "auto_delisted_at": firestore.DELETE_FIELD,
+        "auto_delisted_score": firestore.DELETE_FIELD,
+    })
 
 
 # ── Reports ──────────────────────────────────────────────────────────────────

@@ -1955,7 +1955,7 @@ async def get_active_contracts(user: dict = Depends(get_current_user)):
     active_statuses = {cdb.PENDING, cdb.ACTIVE, cdb.SUBMITTED, cdb.DISPUTED, cdb.COMPLETED}
     contracts = []
 
-    for c in cdb.iter_user_contracts(gid, uid):
+    for c in await asyncio.to_thread(cdb.iter_user_contracts, gid, uid):
         if c.get("status") in active_statuses:
             # Auto-classify if missing (human-issued or old contracts)
             mission_type = c.get("mission_type")
@@ -2061,7 +2061,12 @@ async def get_incoming_contracts(user: dict = Depends(get_current_user)):
     col = cdb._col(gid)
     contracts = []
 
-    for doc in col.where("contractor_id", "==", uid).stream():
+    # Materialised in a worker thread: the loop below is pure local work, but the
+    # scan feeding it is a blocking gRPC call and must not run on the event loop.
+    docs = await asyncio.to_thread(
+        lambda: list(col.where("contractor_id", "==", uid).stream())
+    )
+    for doc in docs:
         c = doc.to_dict()
         if c.get("status") != cdb.PENDING:
             continue
@@ -2305,7 +2310,10 @@ async def list_corps(user: dict = Depends(get_current_user)):
 
     corps_col = _db.collection("guilds").document(str(gid)).collection("corps")
     corps = []
-    for doc in corps_col.stream():
+    # Only the scan moves off-loop: the loop body reads discord.py's member cache,
+    # which belongs to the event loop thread.
+    docs = await asyncio.to_thread(lambda: list(corps_col.stream()))
+    for doc in docs:
         d = doc.to_dict()
         if not d:
             continue
@@ -2928,8 +2936,15 @@ async def _restore_issuer_vessel(gid: int, contract_id: str, c: dict):
         log.warning("Rescue %s failed but has no stored wreck node to restore.", contract_id)
         return
     issuer_id = int(c["issuer_id"])
+    # rescue_pid = the vessel's pid in the ISSUER's save, pinned at creation. It rides
+    # the return so their client can tell "never actually left" (removal deferred while
+    # flying it, or lost with the scenario) from "gone — respawn it": spawning the
+    # snapshot next to a still-present original duplicates hull and crew. Contracts
+    # from before the field was stored send None and the client falls through to the
+    # unconditional spawn, same as today.
     imp.enqueue(gid, issuer_id, "rescue_delivery", contract_id, "Stranded Vessel",
-                vessel_node_url=url, owner_name=c.get("issuer_name", ""))
+                vessel_node_url=url, owner_name=c.get("issuer_name", ""),
+                vessel_pid=c.get("rescue_pid"))
     cdb.update_contract(gid, contract_id, issuer_vessel_removed=False)
     _create_notification(
         gid, issuer_id, "rescue_failed", "↩️ Rescue Cancelled",
@@ -3569,25 +3584,43 @@ async def notifications_ws(websocket: WebSocket):
         _hub.disconnect(gid, uid, websocket)
 
 
+def _recent_notifications_sync(gid: int, uid: int) -> list[Notification]:
+    """Blocking: the notification feed read, run off the event loop.
+
+    Every Firestore call here is synchronous (firebase-admin over gRPC), so a scan
+    left on the loop parks discord.py's heartbeat for however long the query takes.
+    Under memory pressure that was tens of seconds, which Discord reads as a dead
+    shard — hence the to_thread hop in the caller.
+    """
+    col = _notifications_col(gid, uid)
+    # Single-field order_by is auto-indexed — no composite index needed.
+    return [
+        Notification(**doc.to_dict())
+        for doc in col.order_by(
+            "timestamp", direction=firestore.Query.DESCENDING
+        ).limit(50).stream()
+    ]
+
+
 @app.get("/api/v1/user/notifications", response_model=NotificationsResponse)
 async def get_notifications(user: dict = Depends(get_current_user)):
     """Get recent notifications (read + unread) for the current user, newest first."""
     gid = int(user["guild_id"])
     uid = int(user["user_id"])
 
-    col = _notifications_col(gid, uid)
-    notifs = []
-
-    # Single-field order_by is auto-indexed — no composite index needed.
-    for doc in col.order_by(
-        "timestamp", direction=firestore.Query.DESCENDING
-    ).limit(50).stream():
-        notifs.append(Notification(**doc.to_dict()))
+    notifs = await asyncio.to_thread(_recent_notifications_sync, gid, uid)
 
     return NotificationsResponse(
         notifications=notifs,
         unread_count=sum(1 for n in notifs if not n.read),
     )
+
+
+def _mark_all_read_sync(gid: int, uid: int) -> None:
+    """Blocking: scan + per-document write. Off-loop, see _recent_notifications_sync."""
+    col = _notifications_col(gid, uid)
+    for doc in col.where("read", "==", False).stream():
+        doc.reference.update({"read": True})
 
 
 @app.post("/api/v1/user/notifications/mark_read")
@@ -3596,9 +3629,7 @@ async def mark_notifications_read(user: dict = Depends(get_current_user)):
     gid = int(user["guild_id"])
     uid = int(user["user_id"])
 
-    col = _notifications_col(gid, uid)
-    for doc in col.where("read", "==", False).stream():
-        doc.reference.update({"read": True})
+    await asyncio.to_thread(_mark_all_read_sync, gid, uid)
 
     return {"success": True}
 
@@ -3612,21 +3643,8 @@ async def mark_notification_read(notif_id: str, user: dict = Depends(get_current
     return {"success": True}
 
 
-@app.delete("/api/v1/user/notifications/read")
-async def dismiss_read_notifications(user: dict = Depends(get_current_user)):
-    """Delete every notification this player has already read.
-
-    Declared *before* the `{notif_id}` route below on purpose: FastAPI matches in
-    declaration order, so the other way round this path would arrive as a dismiss
-    of a notification whose id is the literal string "read".
-
-    Batched rather than deleted one at a time — clearing a feed is the one place
-    where the count is unbounded (the fetch caps at 50, the collection does not),
-    and one round trip per document is what makes that expensive.
-    """
-    gid = int(user["guild_id"])
-    uid = int(user["user_id"])
-
+def _dismiss_read_sync(gid: int, uid: int) -> int:
+    """Blocking: scan + batched deletes. Off-loop, see _recent_notifications_sync."""
     col = _notifications_col(gid, uid)
     batch = _db.batch()
     count = 0
@@ -3644,6 +3662,26 @@ async def dismiss_read_notifications(user: dict = Depends(get_current_user)):
 
     if count > 0:
         batch.commit()
+
+    return deleted
+
+
+@app.delete("/api/v1/user/notifications/read")
+async def dismiss_read_notifications(user: dict = Depends(get_current_user)):
+    """Delete every notification this player has already read.
+
+    Declared *before* the `{notif_id}` route below on purpose: FastAPI matches in
+    declaration order, so the other way round this path would arrive as a dismiss
+    of a notification whose id is the literal string "read".
+
+    Batched rather than deleted one at a time — clearing a feed is the one place
+    where the count is unbounded (the fetch caps at 50, the collection does not),
+    and one round trip per document is what makes that expensive.
+    """
+    gid = int(user["guild_id"])
+    uid = int(user["user_id"])
+
+    deleted = await asyncio.to_thread(_dismiss_read_sync, gid, uid)
 
     return {"success": True, "deleted": deleted}
 
@@ -3784,7 +3822,7 @@ async def craft_imports_pending(user: dict = Depends(get_current_user)):
     uid = int(user["user_id"])
 
     imports = []
-    for e in imp.list_pending(gid, uid):
+    for e in await asyncio.to_thread(imp.list_pending, gid, uid):
         # A friend quicksend awaiting the recipient's accept/decline is not in the
         # auto-import queue yet — it only joins once accepted (status → "queued").
         # Entries written before the status field existed have none and auto-import
@@ -3826,7 +3864,8 @@ async def craft_gifts_pending(user: dict = Depends(get_current_user)):
     """Quicksent crafts awaiting this player's accept/decline decision."""
     gid = int(user["guild_id"])
     uid = int(user["user_id"])
-    gifts = [_sign_import_entry(e) for e in imp.list_pending(gid, uid)
+    entries = await asyncio.to_thread(imp.list_pending, gid, uid)
+    gifts = [_sign_import_entry(e) for e in entries
              if (e.get("status") or "queued") == "offered"]
     gifts.sort(key=lambda x: x.get("created_at") or "")
     return {"gifts": gifts}
@@ -4212,8 +4251,9 @@ async def marketplace_listings(user: dict = Depends(get_current_user)):
             price=l.get("price", 0),
             sales_count=l.get("sales_count", 0),
             created_at=l.get("created_at"),
+            score=mkt.net_score(l),
         )
-        for l in mkt.list_active(gid)
+        for l in await asyncio.to_thread(mkt.list_active, gid)
     ]
     return MarketplaceListingsResponse(listings=listings)
 
@@ -4248,21 +4288,33 @@ async def marketplace_delist(listing_id: str, user: dict = Depends(get_current_u
 #  goes through here so the bot stays the single source of truth.
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Recolour mods whose presence in a listing's mod row means the craft is painted.
+# Both add zero parts, so neither can reach that row through the part walk — only
+# through the paint-job scan that put it there (TexturePackFoldersForCraft /
+# PaintFoldersForCraft), which is what makes the row usable as a stand-in at all.
+# Normalized (letters+digits, lowercased) because a folder name is not stable:
+# TU installs as both "TexturesUnlimited" and "000_TexturesUnlimited". TUFX —
+# scene-wide post-processing, nothing per-craft — does not match either and must not.
+_PAINT_MOD_MARKERS = ("texturesunlimited", "reforgedredux")
+
+
 def _has_custom_textures(l: dict) -> bool:
-    """Whether a listing's craft carries a Textures Unlimited paint job.
+    """Whether a listing's craft carries a custom paint job (Textures Unlimited or
+    Reforged Materials Redux).
 
     The KSP client sends this as its own flag at list-time, which is the answer to
     trust. A listing made before that flag existed carries no field, and for those the
-    mod row is a sound stand-in: TU adds zero parts, so its folder can only have got
-    into `mods` through the paint-job scan that put it there (TexturePackFoldersForCraft),
-    never through the part walk. Matched on a normalized substring because TU is
-    installed under more than one folder name ("TexturesUnlimited", "000_TexturesUnlimited");
-    TUFX — scene-wide post-processing, nothing per-craft — does not match it and must not.
+    mod row is the stand-in — see `_PAINT_MOD_MARKERS`. The Reforged marker is only ever
+    a *fallback* signal: unlike TU, Reforged's module rides on every part of every craft
+    saved on a Reforged install, so "painted" is a comparison against defaults that only
+    the client can make, and its folder reaches the mod row only when that comparison
+    already said yes.
     """
     if "custom_textures" in l:
         return bool(l.get("custom_textures"))
     for m in l.get("mods", []) or []:
-        if "texturesunlimited" in "".join(c for c in str(m).lower() if c.isalnum()):
+        norm = "".join(c for c in str(m).lower() if c.isalnum())
+        if any(marker in norm for marker in _PAINT_MOD_MARKERS):
             return True
     return False
 
@@ -4298,8 +4350,10 @@ def _listing_to_model(l: dict, include_download: bool = False) -> MarketplaceLis
         ls_endurance_days=l.get("ls_endurance_days", 0.0) or 0.0,
         ls_crew_capacity=l.get("ls_crew_capacity", 0) or 0,
         custom_textures=_has_custom_textures(l),
+        score=mkt.net_score(l),
         likes=int(l.get("likes", 0) or 0),
         dislikes=int(l.get("dislikes", 0) or 0),
+        auto_delisted=bool(l.get("auto_delisted", False)),
     )
 
 
@@ -4323,18 +4377,14 @@ def _listing_age_days(l: dict, now: datetime) -> float:
         return float(RECOMMENDED_WINDOW_DAYS * 100)
 
 
-def _net_likes(l: dict) -> int:
-    return int(l.get("likes", 0) or 0) - int(l.get("dislikes", 0) or 0)
-
-
 def _recommend_rate(l: dict, now: datetime) -> float:
-    """Net likes per day of existence, damped by a day.
+    """Score per day of existence, damped by a day.
 
     The +1 is what stops an hours-old listing with a single like from sitting at the
     top of the page forever: without it, dividing by a near-zero age makes the first
     vote worth more than every later one put together.
     """
-    return _net_likes(l) / (_listing_age_days(l, now) + 1.0)
+    return mkt.net_score(l) / (_listing_age_days(l, now) + 1.0)
 
 
 @app.post("/api/v1/web/auth/link", response_model=LinkResponse)
@@ -4425,7 +4475,7 @@ async def web_marketplace_listings(
     is small enough that this is simpler and cheaper than maintaining Firestore
     composite indexes for every filter combination. Revisit if it ever grows large.
     """
-    items = mkt.list_active(0)
+    items = await asyncio.to_thread(mkt.list_active, 0)
 
     # available_mods is computed from the *unfiltered* active set so the facet shows
     # every mod a user could filter by, not just those left after the current filter.
@@ -4471,7 +4521,7 @@ async def web_marketplace_listings(
     elif sort == "sales":
         items.sort(key=lambda l: l.get("sales_count", 0), reverse=True)
     elif sort == "likes":
-        items.sort(key=lambda l: (_net_likes(l), int(l.get("likes", 0) or 0),
+        items.sort(key=lambda l: (mkt.net_score(l), int(l.get("likes", 0) or 0),
                                   l.get("created_at") or ""), reverse=True)
     elif sort == "recommended":
         # Fresh crafts (< RECOMMENDED_WINDOW_DAYS old) ranked by how fast they are
@@ -4484,7 +4534,7 @@ async def web_marketplace_listings(
         rest = [l for l in items if _listing_age_days(l, now) > RECOMMENDED_WINDOW_DAYS]
         fresh.sort(key=lambda l: (_recommend_rate(l, now), l.get("created_at") or ""),
                    reverse=True)
-        rest.sort(key=lambda l: (_net_likes(l), l.get("created_at") or ""), reverse=True)
+        rest.sort(key=lambda l: (mkt.net_score(l), l.get("created_at") or ""), reverse=True)
         items = fresh + rest
     else:  # "new"
         items.sort(key=lambda l: l.get("created_at") or "", reverse=True)
@@ -4604,11 +4654,100 @@ async def web_marketplace_compatibility(listing_id: str,
 _REPORT_REASON_MAX = 1500
 
 
+# The rating floor. A craft the community has voted down to
+# settings.MARKETPLACE_AUTO_DELIST_SCORE comes off the grid without a moderator
+# having to be awake for it.
+#
+# Enforcement lives here, at the one moment a score can change, rather than in a
+# sweep: a vote is the only thing that moves the number, so a listing that is above
+# the floor stays above it until somebody presses a button. The consequence worth
+# knowing is that *lowering* the threshold later does not retroactively bury the
+# listings it would now cover — they are judged on their next vote.
+
+
+def _auto_delist_floor() -> int | None:
+    """The configured floor, or None when the feature is off (0/None/positive).
+
+    A positive floor is treated as "off" rather than obeyed: it would delist every
+    listing that has not yet earned that many likes, including brand new ones with
+    a score of zero, which is the opposite of what the setting is for."""
+    floor = getattr(settings, "MARKETPLACE_AUTO_DELIST_SCORE", None)
+    if floor is None:
+        return None
+    floor = int(floor)
+    return floor if floor < 0 else None
+
+
+def _enforce_rating_floor(listing: dict, likes: int, dislikes: int) -> str:
+    """Apply the rating floor to a listing whose score just changed.
+
+    Returns "delisted", "deleted" or "" (nothing done). Never raises: a vote that
+    was recorded must be reported as recorded even if the removal that follows it
+    fails, or the voter is told their vote failed and casts it again.
+    """
+    floor = _auto_delist_floor()
+    if floor is None:
+        return ""
+    score = max(0, likes) - max(0, dislikes)
+    if score > floor:
+        return ""
+    # Cheap pre-check on the copy we already have: a delisted craft cannot be
+    # delisted harder. The claim below is the one that actually decides.
+    if listing.get("status") != mkt.ACTIVE:
+        return ""
+
+    listing_id = listing["listing_id"]
+    delete = bool(getattr(settings, "MARKETPLACE_AUTO_DELIST_DELETE", False))
+    try:
+        # Whoever wins the flip owns the removal — and, more to the point, owns the
+        # one notification the seller should get about it.
+        if not mkt.claim_auto_delist(listing_id, score):
+            return ""
+        if delete:
+            # Deliberately after the claim, not instead of it: the flip is what
+            # makes the removal happen exactly once, and a listing that is briefly
+            # delisted before it is erased is in no worse a state than one that is
+            # only delisted.
+            mkt.delete_listing(listing_id)
+    except Exception as exc:
+        log.error("Rating floor: could not remove listing %s at score %d: %s",
+                  listing_id, score, exc)
+        return ""
+
+    listing["status"] = mkt.DELISTED
+    listing["auto_delisted"] = True
+    kind = "deleted" if delete else "delisted"
+    log.info("Rating floor: listing %s (%s) %s at score %d (floor %d)",
+             listing_id, listing.get("craft_name", ""), kind, score, floor)
+
+    # Tell the seller, in their own origin guild's notification feed. Best-effort:
+    # the removal is the point, the notice is the courtesy.
+    try:
+        seller_id = int(listing.get("seller_id") or 0)
+        origin_gid = int(listing.get("guild_id") or 0)
+        if seller_id and origin_gid:
+            craft = listing.get("craft_name", "your craft")
+            _create_notification(
+                origin_gid, seller_id, "marketplace_rating",
+                "📉 Craft removed from the marketplace",
+                (f"'{craft}' reached a community rating of {score} and was "
+                 + ("permanently removed." if delete else
+                    "taken off the marketplace. It is still under My Uploads on the "
+                    "website, and a moderator can put it back.")),
+                {"listing_id": listing_id, "score": score, "removal": kind},
+            )
+    except Exception as exc:
+        log.warning("Rating floor: could not notify seller of %s: %s", listing_id, exc)
+
+    return kind
+
+
 @app.get("/api/v1/web/marketplace/votes", response_model=MyVotesResponse)
 async def web_marketplace_my_votes(user: dict = Depends(get_user_token_only)):
     """Every vote the caller has cast, so the grid can show which crafts they've
     already voted on. One document read for the whole marketplace."""
-    return MyVotesResponse(votes=mkt.get_user_votes(int(user["user_id"])))
+    votes = await asyncio.to_thread(mkt.get_user_votes, int(user["user_id"]))
+    return MyVotesResponse(votes=votes)
 
 
 @app.post("/api/v1/web/marketplace/{listing_id}/vote", response_model=VoteResult)
@@ -4632,7 +4771,10 @@ async def web_marketplace_vote(listing_id: str, req: VoteRequest,
         raise HTTPException(status_code=404, detail="No such listing.")
     likes, dislikes = result
     my_vote = mkt.VOTE_UP if req.vote > 0 else (mkt.VOTE_DOWN if req.vote < 0 else mkt.VOTE_NONE)
-    return VoteResult(success=True, likes=likes, dislikes=dislikes, my_vote=my_vote)
+    removal = await asyncio.to_thread(_enforce_rating_floor, listing, likes, dislikes)
+    return VoteResult(success=True, score=max(0, likes) - max(0, dislikes),
+                      likes=likes, dislikes=dislikes, my_vote=my_vote,
+                      listing_removed=bool(removal), removal_kind=removal)
 
 
 @app.post("/api/v1/web/marketplace/{listing_id}/report", response_model=ReportResult)
@@ -4793,8 +4935,9 @@ async def web_contracts(user: dict = Depends(get_user_token_only)):
 
     open_statuses = {cdb.PENDING, cdb.ACTIVE, cdb.SUBMITTED, cdb.DISPUTED,
                      cdb.MOD_REVIEW, cdb.COMPLETED}
+    rows = await asyncio.to_thread(cdb.iter_user_contracts, gid, uid)
     contracts = [_web_contract_summary(c, uid, bot_uid)
-                 for c in cdb.iter_user_contracts(gid, uid)
+                 for c in rows
                  if c.get("status") in open_statuses]
     contracts.sort(key=lambda x: x.created_at or "", reverse=True)
     return ContractListResponse(contracts=contracts)
@@ -5057,7 +5200,8 @@ async def web_game_command(req: GameCommandRequest, request: Request,
 async def web_marketplace_mine(user: dict = Depends(get_user_token_only)):
     """The caller's own listings (active + delisted) — the "My Uploads" view."""
     uid = int(user["user_id"])
-    items = sorted(mkt.list_by_seller(uid), key=lambda l: l.get("created_at") or "", reverse=True)
+    rows = await asyncio.to_thread(mkt.list_by_seller, uid)
+    items = sorted(rows, key=lambda l: l.get("created_at") or "", reverse=True)
     # Owner of these listings → entitled to the download link.
     return MarketplaceListingsResponse(
         listings=[_listing_to_model(l, include_download=True) for l in items])
@@ -5067,7 +5211,8 @@ async def web_marketplace_mine(user: dict = Depends(get_user_token_only)):
 async def web_marketplace_purchases(user: dict = Depends(get_user_token_only)):
     """Crafts the caller has bought — the "My Purchases" view (free re-download)."""
     uid = int(user["user_id"])
-    items = sorted(mkt.list_by_buyer(uid), key=lambda l: l.get("created_at") or "", reverse=True)
+    rows = await asyncio.to_thread(mkt.list_by_buyer, uid)
+    items = sorted(rows, key=lambda l: l.get("created_at") or "", reverse=True)
     # Buyer of these crafts → entitled to re-download.
     return MarketplaceListingsResponse(
         listings=[_listing_to_model(l, include_download=True) for l in items])
@@ -5095,7 +5240,13 @@ async def web_marketplace_delist(listing_id: str, user: dict = Depends(get_user_
 
 @app.post("/api/v1/web/marketplace/{listing_id}/relist", response_model=MarketplaceListResult)
 async def web_marketplace_relist(listing_id: str, user: dict = Depends(get_user_token_only)):
-    """Re-activate a delisted craft the caller owns (puts it back up for sale)."""
+    """Re-activate a delisted craft the caller owns (puts it back up for sale).
+
+    Refused while the craft is still at or below the rating floor: an auto-delist a
+    seller can undo with one click is not a removal, it is a message. Only a
+    moderator (the admin console's status edit) can override that, and the score is
+    checked live rather than from the auto-delist marker, so a craft voted back up
+    goes back up by itself."""
     gid = int(user["guild_id"])
     uid = int(user["user_id"])
 
@@ -5105,9 +5256,20 @@ async def web_marketplace_relist(listing_id: str, user: dict = Depends(get_user_
     if listing.get("seller_id") != str(uid):
         raise HTTPException(status_code=403, detail="Not your listing")
 
+    floor = _auto_delist_floor()
+    if floor is not None and mkt.net_score(listing) <= floor:
+        raise HTTPException(
+            status_code=403,
+            detail=(f"This craft's community rating ({mkt.net_score(listing)}) is at or "
+                    f"below the marketplace limit of {floor}. It can't go back up until "
+                    f"the rating recovers — contact a moderator if you think that's wrong."))
+
     if listing.get("status") != mkt.ACTIVE:
         mkt.update_listing(gid, listing_id, status=mkt.ACTIVE)
         listing["status"] = mkt.ACTIVE
+        if listing.get("auto_delisted"):
+            mkt.clear_auto_delisted(listing_id)
+            listing["auto_delisted"] = False
 
     return MarketplaceListResult(success=True, message="Craft relisted.", listing_id=listing_id)
 
@@ -5309,8 +5471,8 @@ async def admin_overview(user: dict = Depends(get_admin)):
                 continue
             guilds.append({"id": str(g.id), "name": g.name,
                            "member_count": g.member_count or 0})
-    listings = mkt.list_all()
-    mv = mver.get_config()
+    listings = await asyncio.to_thread(mkt.list_all)
+    mv = await asyncio.to_thread(mver.get_config)
     return {
         "users": len(store.get_all_users(0)),
         "listings_active": sum(1 for l in listings if l.get("status") == mkt.ACTIVE),
@@ -5336,7 +5498,7 @@ async def admin_listings(q: str = "", user: dict = Depends(get_admin)):
     """Every listing, any seller, any status — newest first. A guild admin sees
     only listings that originated from a guild they admin (the market is one
     shared grid, but moderation authority follows the community it came from)."""
-    items = mkt.list_all()
+    items = await asyncio.to_thread(mkt.list_all)
     if not user["is_owner"]:
         items = [l for l in items if _admin_can_guild(user, l.get("guild_id", ""))]
     if q.strip():
@@ -5383,6 +5545,11 @@ async def admin_edit_listing(listing_id: str, req: AdminListingEdit,
 
     mkt.update_listing(0, listing_id, **fields)
     listing.update(fields)
+    # A moderator overriding the rating floor is the one path back up for a buried
+    # craft, so the marker explaining why it was down must not survive it.
+    if fields.get("status") == mkt.ACTIVE and listing.get("auto_delisted"):
+        mkt.clear_auto_delisted(listing_id)
+        listing["auto_delisted"] = False
     _admin_audit(user, "edit-listing", f"{listing_id} {fields}")
     return {"success": True, "listing": _listing_to_model(listing, include_download=True).model_dump()}
 

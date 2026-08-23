@@ -9,6 +9,7 @@ Auctions end either when their timer elapses (a background loop closes them) or
 when the issuer presses "End now". Bid/End buttons are DynamicItems, so they keep
 working across restarts; the loop makes timed closes restart-safe too.
 """
+import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 
@@ -169,7 +170,7 @@ async def backfill_guild(bot, guild_id: int) -> int:
         return 0
     now = datetime.utcnow().isoformat()
     posted = 0
-    for a in adb.list_open(0):
+    for a in await asyncio.to_thread(adb.list_open, 0):
         if a.get("ends_at") and a["ends_at"] <= now:
             continue  # about to be closed by the loop — don't mirror a dead auction
         aid = a["auction_id"]
@@ -439,7 +440,10 @@ class Auctions(commands.Cog, name="Auctions"):
         now = datetime.utcnow().isoformat()
         try:
             # Auctions are global now — iterate the global open set once.
-            for a in adb.list_open(0):
+            # to_thread, not a bare call: this is a 30-second timer and list_open is
+            # a blocking Firestore scan. On the event loop it stalls the gateway
+            # heartbeat for as long as the query takes.
+            for a in await asyncio.to_thread(adb.list_open, 0):
                 if a.get("ends_at") and a["ends_at"] <= now:
                     await close_auction(self.bot, int(a.get("guild_id") or 0),
                                         a["auction_id"], ended_by="time")

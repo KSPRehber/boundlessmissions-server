@@ -112,7 +112,7 @@ class LinkApprovalView(View):
 
 async def _post_device_base_ticket(client: discord.Client, data: dict, challenge_id: str):
     """Open a private ticket the moment a user reports an unrecognized device.
-    Diagnostics (MAC + KSP.log) arrive as a follow-up once the offending client
+    Diagnostics (KSP.log) arrive as a follow-up once the offending client
     next checks in (see api_server.device_report) — posted into this same ticket.
 
     Falls back to CONTRACT_MOD_CHANNEL_ID if the ticket system is unconfigured."""
@@ -121,7 +121,7 @@ async def _post_device_base_ticket(client: discord.Client, data: dict, challenge
         f"**Unrecognized device:** `{data.get('device_id')}`\n"
         f"**IP:** `{data.get('client_ip') or 'unknown'}`\n\n"
         "The user reports this device isn't theirs. Awaiting the client's "
-        "diagnostics (MAC address + KSP.log)…"
+        "diagnostics (KSP.log)…"
     )
     guild = None
     gid = data.get("guild_id")
@@ -392,7 +392,7 @@ class KSPBridge(commands.Cog, name="KSPBridge"):
                 "**AI:** screenshots and mission text may be processed by Google's "
                 "Gemini to provide features.\n"
                 "**Moderation report:** only if *you* file one, it collects that "
-                "device's IP, MAC, and KSP.log for moderators.\n\n"
+                "device's IP and KSP.log for moderators.\n\n"
                 "**Your controls:**\n"
                 "• Delete everything → **`deletemydata`**\n"
                 "• Log out every device → in-game logout"

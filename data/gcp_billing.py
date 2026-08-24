@@ -144,7 +144,7 @@ class _BillingClient:
         if not matches:
             # Standard state for the first few hours after enabling the export.
             raise RuntimeError(
-                "no gcp_billing_export_v1_* table in the dataset yet — the export "
+                "no gcp_billing_export_v1_* table in the dataset yet: the export "
                 "was probably enabled recently; the first load takes a few hours "
                 f"(saw: {', '.join(names) or 'no tables at all'})"
             )
@@ -194,7 +194,7 @@ class _BillingClient:
             msg = str(exc)
             if "Access Denied" in msg or "PERMISSION_DENIED" in msg or "403" in msg:
                 self._disabled_reason = (
-                    "BigQuery denied access — grant the service account "
+                    "BigQuery denied access: grant the service account "
                     "roles/bigquery.dataViewer on the dataset and "
                     "roles/bigquery.jobUser on the project"
                 )

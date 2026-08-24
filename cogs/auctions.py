@@ -35,9 +35,9 @@ S.update({
     "auc.title_flag_open": {"en": "🚩 Flag Design Auction"},
     "auc.mission":         {"en": "📋 Mission"},
     "auc.work":            {"en": "🛠️ Work"},
-    "auc.work_craft":      {"en": "Craft build — submit a blueprint from the VAB/SPH"},
-    "auc.work_active":     {"en": "Active mission — fly a craft to the target"},
-    "auc.work_flag":       {"en": "Flag design — submitted and reviewed here in Discord"},
+    "auc.work_craft":      {"en": "Craft build: submit a blueprint from the VAB/SPH"},
+    "auc.work_active":     {"en": "Active mission: fly a craft to the target"},
+    "auc.work_flag":       {"en": "Flag design: submitted and reviewed here in Discord"},
     "auc.issuer":          {"en": "👤 Issuer"},
     "auc.start":           {"en": "🏷️ Starting Price"},
     "auc.current":         {"en": "📉 Lowest Bid"},
@@ -287,7 +287,7 @@ async def close_auction(bot, gid: int, auction_id: str, *, ended_by: str = "time
         await store.add_balance(origin_gid, int(a["issuer_id"]), a["start_value"])
         a["status"] = adb.CANCELLED
         adb.update_auction(origin_gid, auction_id, status=adb.CANCELLED)
-        log.info("Auction %s closed (%s) with no bids — escrow refunded", auction_id, ended_by)
+        log.info("Auction %s closed (%s) with no bids, escrow refunded", auction_id, ended_by)
 
     await _edit_auction_message(bot, a, origin_gid, live=False)
 

@@ -797,17 +797,17 @@ class Admin(commands.Cog, name="Admin"):
 
         level = snap["level"]
         color, state = {
-            "normal": (discord.Color.green(), "🟢 normal — everything running"),
-            "warning": (discord.Color.gold(), "🟡 warning — past halfway"),
-            "degraded": (discord.Color.orange(), "🟠 degraded — uploads paused"),
-            "frozen": (discord.Color.red(), "🔴 frozen — Firebase paused"),
+            "normal": (discord.Color.green(), "🟢 normal: everything running"),
+            "warning": (discord.Color.gold(), "🟡 warning: past halfway"),
+            "degraded": (discord.Color.orange(), "🟠 degraded: uploads paused"),
+            "frozen": (discord.Color.red(), "🔴 frozen: Firebase paused"),
         }.get(level, (discord.Color.greyple(), level))
 
         # Where the numbers come from matters as much as the numbers: an estimate
         # that cannot see direct-download egress reads low, and saying so is the
         # difference between a figure and a guess presented as a figure.
         if not m["enabled"]:
-            source = "⚪ Local estimate only — Cloud Monitoring polling is switched off."
+            source = "⚪ Local estimate only. Cloud Monitoring polling is switched off."
         elif m["ok"]:
             when = f"<t:{int(m['fetched_at'])}:R>" if m["fetched_at"] else "just now"
             drift = m["drift"].get("egress_bytes", 0)
@@ -815,7 +815,7 @@ class Admin(commands.Cog, name="Admin"):
                       + (f"\n  ↳ {human_bytes(drift)} of egress the bot cannot see itself "
                          f"({m['signed_urls']:,} direct-download links issued)." if drift > 0 else ""))
         else:
-            source = (f"⚠️ Local estimate only — Cloud Monitoring unavailable:\n"
+            source = (f"⚠️ Local estimate only. Cloud Monitoring unavailable:\n"
                       f"  `{(m['error'] or 'unknown')[:150]}`\n"
                       "  Figures will read **low**: direct-download egress and bytes "
                       "at rest are invisible without it.")
@@ -834,13 +834,13 @@ class Admin(commands.Cog, name="Admin"):
                 invoice += "\n" + "\n".join(
                     f"• {s['service']}: **{s['net']:.4f}**" for s in top)
             elif billed.get("services"):
-                invoice += " — every service fully covered by free-tier credits."
+                invoice += ": every service fully covered by free-tier credits."
 
         storage = snap["storage"]
         at_rest = ""
         if storage["stored_bytes"]:
             at_rest = (f"\n\n**💾 Stored** {human_bytes(storage['stored_bytes'])} "
-                       f"(first {storage['free_gb']:.0f} GB free) — "
+                       f"(first {storage['free_gb']:.0f} GB free), "
                        f"**${storage['projected_month_usd']:.4f}**/month at this size. "
                        "No brake can stop this one; it needs a lifecycle rule.")
 

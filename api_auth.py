@@ -203,7 +203,7 @@ def resolve_approval(challenge_id: str, acting_user_id: str, approve: bool) -> b
 
     data = snap.to_dict()
     if str(data.get("user_id")) != str(acting_user_id):
-        log.warning("Approval %s: acting user %s is not owner %s — ignored",
+        log.warning("Approval %s: acting user %s is not owner %s, ignored",
                     challenge_id, acting_user_id, data.get("user_id"))
         return False
     if data.get("status") != "pending" or time.time() > data.get("expires_at", 0):
@@ -258,9 +258,10 @@ def poll_approval(challenge_id: str) -> dict:
 # account later (e.g. a copied session token) is hard-blocked until the user
 # approves it from a Discord DM ("✅ Yes, it's me") or rejects it ("🚫 No — report").
 #
-# The id is a random GUID — not a MAC — so it stores no personal data and survives
-# MAC rotation. The real MAC / IP / KSP.log are gathered only into a user-filed
-# moderation report, never into the binding itself.
+# The id is a random GUID read from no hardware property at all, so it stores no
+# personal data and survives a NIC swap or a re-imaged network stack. IP and
+# KSP.log are gathered only into a user-filed moderation report, never into the
+# binding itself; no hardware identifier is collected anywhere.
 
 _ALLOWED_DEV_TTL = 30  # seconds — cache trusted-device sets to keep checks cheap
 _allowed_devices: dict[str, tuple[set, float]] = {}  # user_id -> (devices, fetched_at)
@@ -431,7 +432,7 @@ def resolve_device_challenge(challenge_id: str, acting_user_id: str,
         return None
     data = snap.to_dict()
     if str(data.get("user_id")) != str(acting_user_id):
-        log.warning("Device challenge %s: acting user %s is not owner %s — ignored",
+        log.warning("Device challenge %s: acting user %s is not owner %s, ignored",
                     challenge_id, acting_user_id, data.get("user_id"))
         return None
     if data.get("status") != "pending":
@@ -472,7 +473,7 @@ def request_device_ping(challenge_id: str, acting_user_id: str) -> bool:
 
 def set_device_ticket_channel(challenge_id: str, channel_id: int | str) -> None:
     """Remember which ticket channel a device report opened, so the diagnostics
-    follow-up (MAC + KSP.log) lands in the same ticket rather than a shared channel."""
+    follow-up (KSP.log) lands in the same ticket rather than a shared channel."""
     try:
         _device_chal_col().document(challenge_id).update(
             {"ticket_channel_id": str(channel_id)})
@@ -717,6 +718,26 @@ def logout_all_devices(user_id: str) -> int:
 
     log.info("User %s logged out of all devices (token version → %d)", user_id, new_version)
     return new_version
+
+
+def linked_user_ids() -> set:
+    """Every user id that has ever completed a link and not logged out everywhere.
+
+    One stream of `ksp_sessions` rather than a read per user, because the caller
+    (`/admin corpsgenerate`) asks the question once for a whole guild's member
+    list. Expiry is deliberately not consulted: a session that lapsed still
+    happened, and the fact this answers is "has this player accepted the in-mod
+    terms", which does not expire with a token.
+    """
+    ids = set()
+    try:
+        for doc in _sessions_col().stream():
+            d = doc.to_dict() or {}
+            if d.get("active"):
+                ids.add(str(d.get("user_id") or doc.id))
+    except Exception as exc:
+        log.warning("Could not list linked users: %s", exc)
+    return ids
 
 
 def get_linked_guild(user_id: str) -> str | None:

@@ -56,7 +56,8 @@ from api_models import (
     VersionCheckResponse,
     AttestChallenge, AttestRespondRequest, AttestResult,
 )
-from data.store import store, _db, _storage_bucket, sign_stored, SIGNED_URL_MAX_TTL
+from data.store import (store, _db, _storage_bucket, sign_stored,
+                        is_storage_path, SIGNED_URL_MAX_TTL)
 from data import contracts as cdb
 from data import guild_config
 from data import mod_version as mver
@@ -65,6 +66,7 @@ from data import suspensions
 from data import suspicion as susp
 from data import telemetry_check as tcheck
 from data import cheat_check
+from data import craft_bans as cbans
 from data import mission_constraints as mc
 from data import orbit_constraints as oc
 from data import part_resolver as pr
@@ -215,6 +217,49 @@ def _safe_gunzip(raw: bytes, limit: int = MAX_DECOMPRESSED_BYTES) -> bytes:
     if len(out) > limit:
         raise HTTPException(status_code=413, detail="Decompressed payload is too large.")
     return out
+
+
+def _craft_text_bytes(raw: bytes) -> bytes:
+    """An uploaded craft as its plain ConfigNode bytes. The mod gzips crafts on
+    every upload path, but not every client/path always has — so this is the same
+    "decompress, or take it as it came" the storage code already does, in one
+    place, because a fingerprint taken over gzip bytes would differ for the same
+    craft compressed at a different level."""
+    try:
+        return _safe_gunzip(raw)
+    except (OSError, EOFError):
+        return raw
+
+
+async def _craft_ban_refusal(raw: bytes, uid, username: str = "",
+                             where: str = "", fp: Optional[dict] = None) -> Optional[str]:
+    """The message to refuse a banned craft with, or None to let it through.
+
+    Every path that accepts a craft from a client calls this before storing it —
+    listing, quicksend, contract submission, rescue issue — because a ban that
+    only covered the marketplace would just move the same file onto the other
+    three. It runs off the event loop: the ban list is cached in-process for a
+    minute, but the read that fills that cache is a synchronous Firestore call
+    and the whole bot waits behind it.
+
+    Fails **open** on any error, matching data/craft_bans.check: a craft ban is
+    nuisance control, and no failure of it is worth refusing every upload in the
+    game over."""
+    try:
+        rec = await asyncio.to_thread(
+            cbans.check, None if fp is not None else _craft_text_bytes(raw), fp)
+    except HTTPException:
+        raise            # a decompression bomb is a 413, not a pass
+    except Exception as exc:
+        log.warning("Craft ban check failed (letting it through): %s", exc)
+        return None
+    if not rec:
+        return None
+    await asyncio.to_thread(cbans.record_hit, rec)
+    log.warning("Blocked banned craft on %s: %s ban %s (%s) from %s (%s)",
+                where or "upload", rec.get("kind"), (rec.get("hash") or "")[:12],
+                rec.get("label") or "", username, uid)
+    return cbans.refusal_message(rec)
 
 
 # ── WebSocket Notification Hub ───────────────────────────────────────────────
@@ -460,7 +505,7 @@ def _note_failed_link_guess() -> None:
     if len(_FAILED_LINK_GUESSES) >= _LINK_SWEEP_MAX_FAILURES:
         _FAILED_LINK_GUESSES.clear()
         n = purge_all_link_codes()
-        log.warning("Link-code sweep suspected (%d failed guesses in %.0fs) — "
+        log.warning("Link-code sweep suspected (%d failed guesses in %.0fs), "
                     "purged %d outstanding link codes",
                     _LINK_SWEEP_MAX_FAILURES, _LINK_SWEEP_WINDOW, n)
 
@@ -600,6 +645,36 @@ def _issue_link_token(result: dict, device_id: str = "") -> LinkResponse:
     )
 
 
+async def _issue_ksp_link_token(result: dict, device_id: str = "") -> LinkResponse:
+    """`_issue_link_token` for the KSP client, plus the corporation that comes with it.
+
+    This is the one place the server can be sure a player has accepted the terms
+    and privacy policy: the mod transmits nothing at all until they do
+    (`Consent.Accepted` / `ApiClient.TransmissionBlocked`), so a link code arriving
+    from a KSP client is proof of consent in a way joining the Discord server never
+    was — which is why `cogs/corps` no longer creates one on `on_member_join`.
+
+    The corp is awaited only briefly. The token is already minted at that point, so
+    a slow `create_text_channel` (Discord rate-limits channel creation hard) must
+    never hold the link response long enough for the client to time out and read a
+    completed link as a failure — past the deadline the creation carries on in the
+    background and the player finds their channel a moment later.
+    """
+    resp = _issue_link_token(result, device_id)
+    if _bot_instance:
+        from cogs.corps import ensure_corp_for_linked_user
+        task = asyncio.ensure_future(ensure_corp_for_linked_user(
+            _bot_instance, result["guild_id"], result["user_id"]))
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
+        except asyncio.TimeoutError:
+            log.info("Corp creation for %s still running; link returning now",
+                     result.get("username"))
+        except Exception as exc:  # pragma: no cover - helper already swallows its own
+            log.warning("Corp creation on link failed for %s: %s", result.get("username"), exc)
+    return resp
+
+
 async def _dm_login_approval(user_id: int, challenge_id: str, client_ip: str) -> bool:
     """DM the user a login-approval prompt with Log-in / Not-me buttons.
     Returns False if it couldn't be sent."""
@@ -646,7 +721,7 @@ async def auth_link(req: LinkRequest, request: Request,
 
     # Approval off → link immediately (trusting the linking device).
     if not cfg.KSP_2FA_ENABLED:
-        return _issue_link_token(result, x_device_id)
+        return await _issue_ksp_link_token(result, x_device_id)
 
     # Approval on → DM the user a Log-in button and wait for them to poll. The link
     # code is already consumed, so a failed DM means this attempt can't proceed.
@@ -679,7 +754,7 @@ async def auth_link_poll(req: PollRequest, request: Request,
         return LinkResponse(status="pending")
     if state["state"] == "approved":
         log.info("KSP: login approved, linking %s", state["username"])
-        return _issue_link_token(state, x_device_id)
+        return await _issue_ksp_link_token(state, x_device_id)
     if state["state"] == "denied":
         raise HTTPException(status_code=403, detail="Login request was denied.")
     raise HTTPException(status_code=400, detail="Login request expired. Request a new link code.")
@@ -722,10 +797,17 @@ async def _dm_device_approval(user_id: int, challenge_id: str,
         return False
 
 
-async def _post_device_report(target: dict, mac: str, log_bytes: bytes | None):
-    """Post the enriched moderation ticket (MAC + KSP.log) for a reported device.
+async def _post_device_report(target: dict, log_bytes: bytes | None, note: str = ""):
+    """Post the enriched moderation ticket (KSP.log) for a reported device.
     The base ticket was already posted when the user pressed 'report'; this adds
-    the diagnostics the offending client uploaded."""
+    the diagnostics the offending client uploaded.
+
+    Deliberately no hardware identifier. This used to carry the client's MAC
+    address, which was rendered into this embed and nowhere else — never stored,
+    never compared against another report — so it could not do the one job a MAC
+    would be worth keeping for, while being self-reported by the very client under
+    suspicion. The IP below is seen at the socket and the device id is the bound
+    one, so both mean something a tampered client cannot fake away."""
     if not _bot_instance:
         return
     # Prefer the ticket the base report opened, so all the diagnostics land there;
@@ -747,8 +829,7 @@ async def _post_device_report(target: dict, mac: str, log_bytes: bytes | None):
             description=(
                 f"**User:** {target.get('username')} (`{target.get('user_id')}`)\n"
                 f"**Device id:** `{target.get('device_id')}`\n"
-                f"**IP:** `{target.get('client_ip') or 'unknown'}`\n"
-                f"**MAC:** `{mac or 'not provided'}`"
+                f"**IP:** `{target.get('client_ip') or 'unknown'}`"
             ),
             color=discord.Color.red(),
         )
@@ -756,7 +837,10 @@ async def _post_device_report(target: dict, mac: str, log_bytes: bytes | None):
         if log_bytes:
             files.append(discord.File(io.BytesIO(log_bytes), filename="KSP.log"))
         else:
-            e.add_field(name="KSP.log", value="⚠️ not provided by the client", inline=False)
+            e.add_field(name="KSP.log",
+                        value=f"⚠️ not provided by the client\n{note}" if note
+                              else "⚠️ not provided by the client",
+                        inline=False)
         await ch.send(embed=e, files=files)
         log.info("Posted device-report diagnostics for user %s (log=%d bytes)",
                  target.get("user_id"), len(log_bytes) if log_bytes else 0)
@@ -777,11 +861,17 @@ async def auth_device_poll(req: PollRequest, request: Request,
 
 @app.post("/api/v1/device/report/{report_id}")
 async def device_report(report_id: str,
-                        mac: str = Form(default=""),
+                        note: str = Form(default=""),
                         ksp_log: UploadFile = File(default=None),
                         user: dict = Depends(get_user_token_only)):
-    """Receive the offending device's diagnostics (MAC + KSP.log) for a report the
-    user opened, and append them to the moderation ticket."""
+    """Receive the offending device's diagnostics (KSP.log) for a report the
+    user opened, and append them to the moderation ticket.
+
+    Clients from before the MAC removal still put a `mac` field in this multipart
+    body. Nothing declares it any more, and FastAPI simply ignores an undeclared
+    form field rather than rejecting the request, so those clients keep delivering
+    their KSP.log while the address they send is parsed into a value nothing reads,
+    rendered nowhere, and written to neither the log line nor Firestore."""
     target = get_report_target(report_id)
     if not target:
         log.warning("Device report %s: no pending report target found", report_id)
@@ -795,10 +885,10 @@ async def device_report(report_id: str,
                     report_id, user.get("user_id"), target.get("user_id"))
         raise HTTPException(status_code=404, detail="No pending report for this id")
     log_bytes = await _read_upload(ksp_log, MAX_LOG_BYTES) if ksp_log is not None else None
-    log.info("Device report %s received from user %s (mac=%s, log=%d bytes)",
-             report_id, user.get("user_id"), "yes" if mac else "no",
+    log.info("Device report %s received from user %s (log=%d bytes)",
+             report_id, user.get("user_id"),
              len(log_bytes) if log_bytes else 0)
-    await _post_device_report(target, mac, _trim_log(log_bytes))
+    await _post_device_report(target, _trim_log(log_bytes), note)
     mark_report_done(target["_doc_id"])
     return {"success": True}
 
@@ -919,7 +1009,7 @@ async def bug_report(summary: str = Form(...),
     )
     if channel is None:
         return {"success": False,
-                "message": "Couldn't open a ticket — the server's ticket system isn't set up."}
+                "message": "Couldn't open a ticket; the server's ticket system isn't set up."}
     return {"success": True,
             "message": f"Reported. A private ticket (#{channel.name}) is open in Discord."}
 
@@ -1171,8 +1261,8 @@ async def attest_respond(req: AttestRespondRequest, request: Request,
         return AttestResult(ok=True)
     # Server-observed forensics: the client IP (seen at the socket, not self-reported)
     # and the bound device id. Both are meaningful here precisely because they don't
-    # come from the tampered client's payload, unlike MAC/KSP.log (those are only
-    # collected via the consented device-report flow, where the uploader is trusted).
+    # come from the tampered client's payload, unlike KSP.log (collected only via the
+    # consented device-report flow, and worth reading rather than trusting).
     client_ip = _client_ip(request)
     device_id = request.headers.get("x-device-id", "") or "unknown"
     await flag_suspicion(
@@ -1300,7 +1390,7 @@ async def _classify_missions(missions: list[dict], week_key: str) -> list[dict]:
         "- 'dock' missions: required_situation = 'ORBITING' (docking happens in orbit)\n"
         "- If no specific body/situation, set to null\n\n"
         f"Missions:\n{mission_list}\n\n"
-        "Return ONLY valid JSON — an array of objects:\n"
+        "Return ONLY valid JSON, an array of objects:\n"
         '[{"id": 1, "mission_type": "...", "required_situation": "...", "required_body": "..."}]'
     )
 
@@ -1520,7 +1610,7 @@ def _craft_compatibility(gid: int, uid: int, listing: dict) -> CraftCompatibilit
         reason = "You have every part this craft uses."
     elif not blocking:
         reason = (f"{len(substitutable)} part(s) aren't installed under that name, but you "
-                  "have an equivalent — the mod swaps them in when the craft arrives.")
+                  "have an equivalent; the mod swaps them in when the craft arrives.")
     else:
         reason = (f"You're missing {len(blocking)} part(s) this craft needs; it won't load "
                   "until you install what provides them.")
@@ -1652,7 +1742,7 @@ async def _classify_single_contract(gid: int, contract_id: str, mission_text: st
             "min_crew 3 and max_crew 3; 'at least 2 kerbals' => min_crew 2; "
             "'2-4 crew' => min_crew 2, max_crew 4; 'send one kerbal' => min_crew 1 and "
             "max_crew 1. An uncrewed mission ('unmanned/uncrewed probe', 'no crew aboard') "
-            "=> max_crew 0 — 0 is a real limit here, not 'no limit', so use null (never 0) "
+            "=> max_crew 0; 0 is a real limit here, not 'no limit', so use null (never 0) "
             "when the text says nothing about crew. A crewed mission with no number "
             "('a crewed flyby') => min_crew 1. Kerbals to be *rescued or returned* are not "
             "crew limits: 'rescue 2 stranded kerbals' sets neither bound.\n"
@@ -1677,7 +1767,7 @@ async def _classify_single_contract(gid: int, contract_id: str, mission_text: st
             "- 'heatshield-less / no heat shield' => forbidden_part_categories ['heatshield'].\n"
             "- 'Lqd He3 / helium-3 powered' => required_propellants ['LqdHe3'].\n"
             "- When the text names a specific part (e.g. 'Vector', 'Mainsail', 'Thud'), copy that "
-            "name VERBATIM into required_parts/forbidden_parts — never translate it to a real-world "
+            "name VERBATIM into required_parts/forbidden_parts; never translate it to a real-world "
             "or 'equivalent' name (do NOT turn 'Vector' into 'SSME', or 'Mainsail' into 'RS-68'), and "
             "do NOT also add an engine category for that named part. Only set an engine category when "
             "the text names a general *kind* of engine (e.g. 'nuclear engine', 'any ion thruster'). "
@@ -2266,7 +2356,7 @@ async def reimport_submission(contract_id: str, user: dict = Depends(get_current
     log.info("Rescue %s: queued submitted-craft restore for contractor %d", contract_id, uid)
     return ContractAcceptResponse(
         success=True,
-        message="Craft restore queued — it spawns where it was when you submitted, "
+        message="Craft restore queued; it spawns where it was when you submitted, "
                 "on your next Space Center visit.")
 
 
@@ -2292,6 +2382,132 @@ async def give_up_contract(contract_id: str, user: dict = Depends(get_current_us
     return ContractAcceptResponse(success=r.ok, message=r.message)
 
 
+# ── Contract reports ─────────────────────────────────────────────────────────
+#
+# The marketplace's report system (see web_marketplace_report) pointed at the other
+# party of a deal. Same shape — one keyed (contract, reporter) record, one private
+# ticket in the reporter's guild, the subject named but not given access — and for
+# the same reason: a complaint about a person needs a channel where a moderator can
+# ask a follow-up question, and a counter that survives the ticket being closed.
+#
+# Two rules make it a *contract* report rather than a copy of the listing one.
+# **Only the two parties may file one**: a listing is public and anyone browsing can
+# report it, while a contract is private, so a stranger asking about one is told 404
+# rather than that it exists. And a **bot-issued** contract is refused: a weekly
+# mission has no human on the other side, so there is nobody for a moderator to talk
+# to — that is a bug report, and the Tools tab already files those.
+#
+# One filing path, reached from three clients (mod, in-game browser UI, website), so
+# the rules cannot drift between them.
+
+_CONTRACT_REPORT_REASON_MAX = 1500
+
+
+async def _file_contract_report(user: dict, contract_id: str, reason: str) -> ReportResult:
+    """Open a moderation ticket about the caller's counterparty on this contract."""
+    uid = int(user["user_id"])
+    gid = int(user["guild_id"])
+    # A report costs a channel and a moderator's attention. Three an hour is far more
+    # than anyone files in good faith; per account, since a ticket is attributable.
+    _rate_limit(f"ctreport:{uid}", max_hits=3, window=3600.0)
+
+    reason = (reason or "").strip()[:_CONTRACT_REPORT_REASON_MAX]
+    if not reason:
+        raise HTTPException(status_code=400, detail="Say what went wrong with this contract.")
+
+    contract = await asyncio.to_thread(cdb.get_contract, gid, contract_id)
+    # 404 rather than 403 for a non-party: a contract is private to its two sides, so
+    # someone guessing ids must not learn which ones exist.
+    if not contract or str(uid) not in (str(contract.get("issuer_id", "")),
+                                        str(contract.get("contractor_id", ""))):
+        raise HTTPException(status_code=404, detail="Contract not found.")
+
+    is_issuer = str(uid) == str(contract.get("issuer_id", ""))
+    subject_id = str(contract.get("contractor_id" if is_issuer else "issuer_id", ""))
+    subject_name = contract.get("contractor_name" if is_issuer else "issuer_name", "Unknown")
+    if subject_id == str(_get_bot_user_id()):
+        raise HTTPException(
+            status_code=400,
+            detail=("This contract was issued by the bot, so there's nobody to report. "
+                    "If something about it is broken, file a bug report from the Tools tab."))
+    if await asyncio.to_thread(cdb.get_report, contract_id, uid):
+        raise HTTPException(status_code=409,
+                            detail="You've already reported this contract; the mods have it.")
+
+    if not _bot_instance:
+        raise HTTPException(status_code=503, detail="The bot is not available right now.")
+    guild = _bot_instance.get_guild(gid)
+    if guild is None:
+        raise HTTPException(status_code=503,
+                            detail="Your Discord server is not reachable right now.")
+
+    import discord
+    from cogs.tickets import create_ticket
+
+    mission = (contract.get("mission", "") or "").strip()
+    if len(mission) > 900:
+        mission = mission[:900] + "…"
+    origin_gid = str(contract.get("guild_id", "") or "")
+    origin = _bot_instance.get_guild(int(origin_gid)) if origin_gid.isdigit() else None
+    origin_name = origin.name if origin else f"server `{origin_gid or 'unknown'}`"
+    issuer_id = str(contract.get("issuer_id", ""))
+    contractor_id = str(contract.get("contractor_id", ""))
+    e = discord.Embed(
+        title="📋 Reported contract",
+        description=(
+            f"**Contract ID:** `{contract_id}`\n"
+            f"**Status:** {contract.get('status', 'unknown')} · "
+            f"{contract.get('mission_type') or 'active_vessel'}\n"
+            f"**Payment / fine:** {int(contract.get('payment', 0)):,} / "
+            f"{int(contract.get('fine', 0)):,} {settings.CURRENCY_SYMBOL}\n"
+            f"**Due:** {contract.get('due_date', 'unknown')}\n"
+            f"**Issuer:** {contract.get('issuer_name', 'Unknown')} "
+            f"(<@{issuer_id}>, `{issuer_id}`)\n"
+            f"**Contractor:** {contract.get('contractor_name', 'Unknown')} "
+            f"(<@{contractor_id}>, `{contractor_id}`)\n"
+            f"**Agreed in:** {origin_name}\n"
+            f"**Reported by:** {user.get('username', 'Unknown')} (<@{uid}>, `{uid}`) — "
+            f"the {'issuer' if is_issuer else 'contractor'}, reporting "
+            f"**{subject_name}**"
+        ),
+        color=discord.Color.orange(),
+    )
+    if mission:
+        e.add_field(name="Mission", value=mission, inline=False)
+
+    channel = await create_ticket(
+        _bot_instance, guild,
+        opener_id=uid,
+        subject_user_id=int(subject_id) if subject_id.isdigit() else None,
+        kind="user",
+        title="Contract report",
+        description=f"**What went wrong**\n{reason}",
+        color=discord.Color.orange(),
+        extra_embeds=[e],
+    )
+    if channel is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Couldn't open a ticket; this server's ticket system isn't set up.")
+
+    await asyncio.to_thread(
+        cdb.record_report, contract, uid, user.get("username", ""), reason,
+        gid, channel.id,
+    )
+    log.info("%s reported contract %s (subject %s)",
+             user.get("username"), contract_id, subject_id)
+    return ReportResult(
+        success=True,
+        message=f"Reported. A private ticket (#{channel.name}) is open in Discord.")
+
+
+@app.post("/api/v1/contracts/{contract_id}/report", response_model=ReportResult)
+async def report_contract(contract_id: str, req: ReportRequest,
+                          user: dict = Depends(get_current_user)):
+    """Report the other party of a contract, from the KSP mod."""
+    return await _file_contract_report(user, contract_id, req.reason)
+
+
 # ── Corporations ─────────────────────────────────────────────────────────────
 
 @app.get("/api/v1/corps/list", response_model=CorpListResponse)
@@ -2304,6 +2520,14 @@ async def list_corps(user: dict = Depends(get_current_user)):
     endpoint is one round trip per picker open, and N members * one Discord fetch each
     would turn that into a multi-second stall on a large guild. A member missing from
     the cache simply comes back without an avatar, which the client renders as initials.
+
+    owner_name is resolved the same way, and for a second reason as well as staleness:
+    a picker is a list of *people*, so it must show the name they are known by here —
+    nick, then global name, then handle, which is exactly discord.py's display_name.
+    That is the name every other surface uses (a link code is issued under it, so is a
+    weekly mission's contractor), and the picker was the one place still printing raw
+    account handles. The stored value is the fallback for anyone the cache has no
+    member for — someone who has left, or a shard that has not filled yet.
     """
     gid = int(user["guild_id"])
     guild = _bot_instance.get_guild(gid) if _bot_instance else None
@@ -2320,10 +2544,12 @@ async def list_corps(user: dict = Depends(get_current_user)):
 
         avatar_url = None
         level = 0
+        owner_name = d.get("owner_name", d.get("name", "Unknown"))
         try:
             uid = int(doc.id)
             member = guild.get_member(uid) if guild else None
             if member is not None:
+                owner_name = member.display_name or owner_name
                 asset = member.display_avatar
                 # 64px because these draw at ~40px in a list and every one is proxied
                 # through the mod's image route, and PNG because Nitro members have
@@ -2340,7 +2566,7 @@ async def list_corps(user: dict = Depends(get_current_user)):
 
         corps.append(CorpInfo(
             owner_id=doc.id,
-            owner_name=d.get("owner_name", d.get("name", "Unknown")),
+            owner_name=owner_name,
             corp_name=d.get("name", "Unknown Corp"),
             avatar_url=avatar_url,
             level=level,
@@ -2469,7 +2695,7 @@ async def _open_auction_checked(gid: int, uid: int, username: str,
     if req.start_value < settings.AUCTION_MIN_START_VALUE:
         return ContractAcceptResponse(
             success=False,
-            message=(f"Starting price must be at least {settings.AUCTION_MIN_START_VALUE} KCoins — "
+            message=(f"Starting price must be at least {settings.AUCTION_MIN_START_VALUE} KCoins; "
                      f"a bid has to undercut it by {settings.AUCTION_MIN_DECREMENT} and stay above "
                      "zero, so anything lower leaves no bid anyone could place."),
         )
@@ -2551,6 +2777,12 @@ async def create_rescue_contract(
     modlist: Optional[str] = Form(None),
     body: str = Form(...),
     mode: str = Form("orbit"),
+    # The target itself, and optional in both modes: no ap/pe means any orbit of the
+    # body, no lat/lon means anywhere on it. Absent is the answer, never a zero — 0°,0°
+    # is a real place and an Ap of 0 is a real (impossible) orbit, so a client that
+    # doesn't want a target leaves the fields off rather than sending them empty. The
+    # mode's situation is still required either way, and the inclination / regime
+    # constraints below stand on their own.
     ap: Optional[float] = Form(None),
     pe: Optional[float] = Form(None),
     lat: Optional[float] = Form(None),
@@ -2664,7 +2896,7 @@ async def create_rescue_contract(
             return ContractAcceptResponse(
                 success=False,
                 message=f"Orbit types '{oc.label(_bad[0])}' and '{oc.label(_bad[1])}' "
-                        "contradict each other — no orbit can be both.")
+                        "contradict each other; no orbit can be both.")
         if inc is not None:
             if not math.isfinite(inc) or not 0.0 <= inc <= 180.0:
                 return ContractAcceptResponse(
@@ -3007,8 +3239,29 @@ async def submit_contract(
         return SubmissionResult(success=False, message="Contract is not active.")
 
     # Read the vessel node once (used by both the rescue check below and the
-    # Storage upload further down). UploadFile.read() can only be consumed once.
+    # Storage upload further down). UploadFile.read() can only be consumed once —
+    # which is also why the craft is read here rather than at its upload, now
+    # that the ban gate below has to see it first.
     vn_data = await _read_upload(vessel_node) if vessel_node else None
+    craft_data = await _read_upload(craft_file) if craft_file else None
+
+    # Craft bans. A submission is a delivery: the craft ends up in the issuer's
+    # save, so a banned one must not travel this way either. Both halves are
+    # checked — a blueprint submission carries the .craft, a flight submission
+    # carries the vessel node, and the fingerprint reads both dialects — except
+    # the vessel node of a RESCUE, which is the wreck being brought home rather
+    # than a design being handed out. Blocking that would strand a rescue at the
+    # last step over a craft the issuer already owns.
+    ban_payloads = [(craft_data, "submitted craft")]
+    if c.get("mission_type") != cdb.RESCUE:
+        ban_payloads.append((vn_data, "submitted vessel"))
+    for payload, what in ban_payloads:
+        if not payload:
+            continue
+        refusal = await _craft_ban_refusal(payload, uid, user.get("username", ""),
+                                           f"contract submission ({what})")
+        if refusal:
+            return SubmissionResult(success=False, message=refusal)
 
     # Rescue: server-side defense-in-depth before accepting the submission — the
     # rescue craft must be at the target body/situation and carry every stranded
@@ -3063,7 +3316,7 @@ async def submit_contract(
     cheat_verdict = cheat_check.evaluate(
         cheat_report, enabled=cfg.KSP_CHEAT_DISQUALIFY_ENABLED)
     if cheat_verdict.reject:
-        log.info("Submission rejected for contract %s: cheats detected — %s",
+        log.info("Submission rejected for contract %s: cheats detected (%s)",
                  contract_id, cheat_verdict.detail)
         return SubmissionResult(success=False, message=cheat_verdict.reject_message)
 
@@ -3186,11 +3439,10 @@ async def submit_contract(
     # craft is private to the two parties, so it's reachable only through a signed
     # URL minted at download time (see download_craft / sign_stored). Screenshots
     # below stay public — they're shown in Discord embeds and the web review.
-    if craft_file:
-        data = await _read_upload(craft_file)
+    if craft_file and craft_data is not None:
         try:
             url = await cdb.upload_private_to_storage(
-                contract_id, craft_file.filename, data,
+                contract_id, craft_file.filename, craft_data,
                 craft_file.content_type or "application/octet-stream"
             )
             stored_files.append({"filename": craft_file.filename, "url": url,
@@ -3389,6 +3641,8 @@ async def _ai_review_submission(
         f"6. Eve Landing | 7. Asteroid Redirect | 8. RSS Moon Landing | 9. Jool 5 | 10. Interstellar\n"
         f"11. RSS Mars | 12. RSS Venus Landing | 13. RSS Gas Giant | 14. Kerbol Grand Tour | 15. RSS Interstellar\n"
         f"If none clearly apply, set ksp_level to 0.\n\n"
+        f"Write the reason in plain prose. Do not use em dashes; use commas, "
+        f"semicolons or full stops instead.\n"
         f"Return ONLY valid JSON:\n"
         f'{{\n  "approved": true/false,\n  "reason": "brief explanation",\n  "ksp_level": integer\n}}'
     )
@@ -4019,6 +4273,12 @@ async def craft_send_to_friend(
     except (OSError, EOFError):
         payload = raw  # fall back if it wasn't compressed
 
+    # Gated here as well as on the marketplace: a craft nobody may sell is not a
+    # craft two people may pass between themselves instead.
+    refusal = await _craft_ban_refusal(payload, uid, user["username"], f"quicksend ({kind})")
+    if refusal:
+        return {"success": False, "message": refusal}
+
     iid = uuid.uuid4().hex[:12]
     if kind == "vessel":
         filename = "vessel.cfg"
@@ -4063,7 +4323,7 @@ async def craft_send_to_friend(
         gid, rid, "craft_gift",
         "🎁 Craft Offered",
         f"{user['username']} sent you {kind_label}: {craft_name}. "
-        f"Accept or decline it in KSP (any scene with the sidebar — Space Center, "
+        f"Accept or decline it in KSP (any scene with the sidebar: Space Center, "
         f"VAB/SPH or flight).",
         {"craft_name": craft_name},
     )
@@ -4138,6 +4398,15 @@ async def marketplace_list_craft(
     except (OSError, EOFError):
         craft_bytes = raw
 
+    # A banned craft is refused before anything is stored or charged for — the
+    # listing document, the Storage objects and the complexity reward all hang off
+    # this call succeeding.
+    craft_fp = await asyncio.to_thread(cbans.fingerprint, craft_bytes)
+    refusal = await _craft_ban_refusal(craft_bytes, uid, user["username"],
+                                       "marketplace listing", fp=craft_fp)
+    if refusal:
+        return MarketplaceListResult(success=False, message=refusal)
+
     filename = craft_file.filename or "craft.craft"
     if not filename.lower().endswith(".craft"):
         filename += ".craft"
@@ -4164,6 +4433,11 @@ async def marketplace_list_craft(
         ls_endurance_days=ls_endurance_days,
         ls_crew_capacity=ls_crew_capacity,
         custom_textures=has_custom_textures,
+        # The craft's fingerprints, stored as "kind:hash" strings so "which
+        # listings are this craft?" is one array-contains query. Recorded on
+        # every listing rather than computed when a ban is issued: at ban time
+        # the alternative is downloading every craft in the market to hash it.
+        craft_hashes=cbans.hash_list(craft_fp),
     )
 
     try:
@@ -4220,7 +4494,7 @@ async def marketplace_list_craft(
             log.info("KSP: %s earned %d KCoins for listing '%s' (%d distinct parts)",
                      user["username"], reward, craft_name, len(part_list))
         else:
-            reward_note = ("Complexity bonus already claimed today — "
+            reward_note = ("Complexity bonus already claimed today; "
                            f"the next one is in {_fmt_wait(wait)}.")
 
     log.info("KSP: %s listed craft '%s' for %d (listing %s)",
@@ -4808,7 +5082,7 @@ async def web_marketplace_report(listing_id: str, req: ReportRequest,
         raise HTTPException(status_code=400, detail="That's your own craft.")
     if await asyncio.to_thread(mkt.get_report, listing_id, uid):
         raise HTTPException(status_code=409,
-                            detail="You've already reported this craft — the mods have it.")
+                            detail="You've already reported this craft; the mods have it.")
 
     if not _bot_instance:
         raise HTTPException(status_code=503, detail="The bot is not available right now.")
@@ -4854,7 +5128,7 @@ async def web_marketplace_report(listing_id: str, req: ReportRequest,
     if channel is None:
         raise HTTPException(
             status_code=503,
-            detail="Couldn't open a ticket — this server's ticket system isn't set up.")
+            detail="Couldn't open a ticket; this server's ticket system isn't set up.")
 
     await asyncio.to_thread(
         mkt.record_report, listing, uid, user.get("username", ""), reason,
@@ -5015,6 +5289,17 @@ async def web_contract_more_time_response(contract_id: str, req: ContractRequest
                                                    actor_name=name, approve=bool(req.approve)))
 
 
+@app.post("/api/v1/web/contracts/{contract_id}/report", response_model=ReportResult)
+async def web_contract_report(contract_id: str, req: ReportRequest,
+                              user: dict = Depends(get_user_token_only)):
+    """Report the other party of a contract, from the website.
+
+    Deliberately not wrapped in `_web_actor`: reporting is not a contract transition
+    and must not share the 30-a-minute action budget that accept/cancel/dispute do —
+    `_file_contract_report` applies its own, far tighter, per-hour limit."""
+    return await _file_contract_report(user, contract_id, req.reason)
+
+
 # ── Web auctions ─────────────────────────────────────────────────────────────
 #
 # The website's window onto the same global reverse auctions that run in Discord.
@@ -5084,7 +5369,7 @@ async def web_auction_bid(auction_id: str, req: WebAuctionBidRequest, request: R
         ceiling, step = res["ceiling"], res["step"]
         return ContractAcceptResponse(
             success=False,
-            message=f"Bid must be at most {ceiling} — undercut the current lowest by at least {step}.",
+            message=f"Bid must be at most {ceiling}; undercut the current lowest by at least {step}.",
         )
 
     a = res["auction"]
@@ -5262,7 +5547,14 @@ async def web_marketplace_relist(listing_id: str, user: dict = Depends(get_user_
             status_code=403,
             detail=(f"This craft's community rating ({mkt.net_score(listing)}) is at or "
                     f"below the marketplace limit of {floor}. It can't go back up until "
-                    f"the rating recovers — contact a moderator if you think that's wrong."))
+                    f"the rating recovers; contact a moderator if you think that's wrong."))
+
+    # A banned craft stays down. Answered from the fingerprint stored on the
+    # listing, so this costs no download: the ban sweep already delisted it, and
+    # without this the seller could put it straight back with one click.
+    banned = await asyncio.to_thread(cbans.check_hashes, listing.get("craft_hashes"))
+    if banned:
+        raise HTTPException(status_code=403, detail=cbans.refusal_message(banned))
 
     if listing.get("status") != mkt.ACTIVE:
         mkt.update_listing(gid, listing_id, status=mkt.ACTIVE)
@@ -5394,6 +5686,22 @@ class AdminListingEdit(BaseModel):
     seller_name: Optional[str] = None
     status: Optional[str] = None  # "active" | "delisted"
 
+class AdminCraftBan(BaseModel):
+    # Either a bare hash (pasted from another moderator) or a listing to take one
+    # from. `kind` picks which of that listing's three fingerprints is banned.
+    hash: Optional[str] = None
+    listing_id: Optional[str] = None
+    kind: str = "design"   # "exact" | "design" | "parts"
+    reason: str = ""      # shown to the player whose upload is refused
+    note: str = ""        # internal
+    label: str = ""       # what the craft was called, for the ban list
+    # What to do about listings that are already up and match. "delist" is the
+    # default because a delist keeps the document, the Storage files, the seller's
+    # My Uploads copy and every buyer's re-download — deleting is for the case
+    # where the file itself must not stay on the bucket.
+    sweep: str = "delist"  # "delist" | "delete" | "none"
+
+
 class AdminUserAdjust(BaseModel):
     balance_delta: Optional[int] = None
     balance_set: Optional[int] = None
@@ -5523,7 +5831,9 @@ async def admin_edit_listing(listing_id: str, req: AdminListingEdit,
     """Edit any listing's name / price / status regardless of who owns it.
     Guild admins can only touch listings from their own guilds — out-of-scope
     ones 404 exactly like nonexistent ones, so scope can't be probed."""
-    listing = mkt.get_listing(0, listing_id)
+    # Off the loop, like admin_listings above: firebase-admin is synchronous, and a
+    # console action that blocks the event loop stalls the Discord bot with it.
+    listing = await asyncio.to_thread(mkt.get_listing, 0, listing_id)
     if not listing or not _admin_can_guild(user, listing.get("guild_id", "")):
         raise HTTPException(status_code=404, detail="Listing not found")
 
@@ -5539,16 +5849,28 @@ async def admin_edit_listing(listing_id: str, req: AdminListingEdit,
     if req.status is not None:
         if req.status not in (mkt.ACTIVE, mkt.DELISTED):
             raise HTTPException(status_code=422, detail="Status must be 'active' or 'delisted'.")
+        # Re-activating a craft that is under a hash ban would leave the two
+        # moderation records saying opposite things, and the ban would win the
+        # next time the seller re-uploaded it anyway. Lift the ban first — that
+        # is one deliberate act instead of a status flip that looks like nothing.
+        if req.status == mkt.ACTIVE:
+            banned = await asyncio.to_thread(cbans.check_hashes, listing.get("craft_hashes"))
+            if banned:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(f"This craft is under a {banned.get('kind')} ban "
+                            f"({(banned.get('hash') or '')[:12]}…). Revoke the ban in "
+                            f"Craft Bans first, then re-activate the listing."))
         fields["status"] = req.status
     if not fields:
         raise HTTPException(status_code=422, detail="Nothing to change.")
 
-    mkt.update_listing(0, listing_id, **fields)
+    await asyncio.to_thread(mkt.update_listing, 0, listing_id, **fields)
     listing.update(fields)
     # A moderator overriding the rating floor is the one path back up for a buried
     # craft, so the marker explaining why it was down must not survive it.
     if fields.get("status") == mkt.ACTIVE and listing.get("auto_delisted"):
-        mkt.clear_auto_delisted(listing_id)
+        await asyncio.to_thread(mkt.clear_auto_delisted, listing_id)
         listing["auto_delisted"] = False
     _admin_audit(user, "edit-listing", f"{listing_id} {fields}")
     return {"success": True, "listing": _listing_to_model(listing, include_download=True).model_dump()}
@@ -5558,12 +5880,252 @@ async def admin_edit_listing(listing_id: str, req: AdminListingEdit,
 async def admin_delete_listing(listing_id: str, user: dict = Depends(get_admin)):
     """Permanently delete any listing: Storage files and the document. Same
     guild scoping as the edit — out-of-scope listings 404."""
-    listing = mkt.get_listing(0, listing_id)
+    listing = await asyncio.to_thread(mkt.get_listing, 0, listing_id)
     if not listing or not _admin_can_guild(user, listing.get("guild_id", "")):
         raise HTTPException(status_code=404, detail="Listing not found")
-    mkt.delete_listing(listing_id)
+    # The slowest call in the console: it lists and deletes every Storage object
+    # under marketplace/{id}/ before the document goes. On the event loop that is
+    # the whole bot held still for as long as the bucket takes to answer, and long
+    # enough to be cut off by a proxy timeout — which is a delete that reports
+    # failure after having half happened.
+    await asyncio.to_thread(mkt.delete_listing, listing_id)
     _admin_audit(user, "delete-listing", f"{listing_id} ({listing.get('craft_name')})")
     return {"success": True}
+
+
+# ── Craft bans ────────────────────────────────────────────────────────────────
+#
+# Owner-only, unlike the rest of the listings surface. A craft ban is bot-wide by
+# construction — the hash is the same hash in every guild — so it sits with the
+# other bot-wide levers rather than with the guild-scoped moderation a mapped
+# admin role reaches. A guild admin who wants a craft banned delists it in their
+# own guild and asks; that is the same line drawn everywhere else here.
+
+def _listing_craft_bytes(listing: dict) -> bytes:
+    """The stored .craft of a listing, straight off the bucket.
+
+    Only the ban console does this. Everything else hands the *client* a signed
+    URL and never touches the bytes — fine for a download, useless for hashing.
+    Blocking, so every caller runs it in a thread."""
+    path = listing.get("craft_url") or ""
+    if not path:
+        raise HTTPException(status_code=409, detail="That listing has no craft file stored.")
+    if not is_storage_path(path):
+        raise HTTPException(
+            status_code=409,
+            detail="That listing's craft is a legacy public URL, not a bucket object; "
+                   "download it and ban its hash by hand.")
+    if _storage_bucket is None:
+        raise HTTPException(status_code=503, detail="Firebase Storage is not configured.")
+    return _storage_bucket.blob(path).download_as_bytes()
+
+
+def _remember_hashes(listing: dict, fp: dict) -> None:
+    """Write a craft's fingerprint onto its listing if it isn't there already.
+
+    Listings record this at upload, but the back catalogue does not — and the one
+    listing that must never be missing from a ban sweep is the one the moderator
+    is looking at while issuing it. So whenever a craft is fetched and hashed for
+    the console, the answer is kept."""
+    lid = listing.get("listing_id")
+    entries = cbans.hash_list(fp)
+    if not lid or not entries or listing.get("craft_hashes") == entries:
+        return
+    try:
+        mkt.update_listing(0, lid, craft_hashes=entries)
+        listing["craft_hashes"] = entries
+    except Exception as exc:
+        log.warning("Could not store craft hashes on listing %s: %s", lid, exc)
+
+
+def _ban_preview(craft: bytes, listing: dict | None = None) -> dict:
+    """Every fingerprint of a craft plus how many live listings each one would
+    take down. The console shows this *before* the ban is issued: `parts` in
+    particular can over-match, and the honest way to say so is a number. The
+    counts are of listings that have been fingerprinted — hence the write-back
+    below, so the listing in front of the moderator is always one of them."""
+    fp = cbans.fingerprint(craft)
+    if listing is not None:
+        _remember_hashes(listing, fp)
+    kinds = []
+    for kind in cbans.KINDS:
+        digest = fp.get(kind)
+        if not digest:
+            continue
+        matches = mkt.list_by_hash(f"{kind}:{digest}")
+        kinds.append({
+            "kind": kind,
+            "hash": digest,
+            "matches": len(matches),
+            "match_names": sorted({m.get("craft_name") or "" for m in matches})[:10],
+            "already_banned": cbans.check_hashes([f"{kind}:{digest}"]) is not None,
+        })
+    return {"kinds": kinds, "part_count": fp["part_count"],
+            "distinct_parts": fp["distinct_parts"]}
+
+
+@app.get("/api/v1/web/admin/craftbans")
+async def admin_craft_bans(user: dict = Depends(get_owner)):
+    """Every craft ban, newest first — revoked ones included, since the record of
+    what was done is half the point of keeping them."""
+    bans = await asyncio.to_thread(cbans.list_bans)
+    return {"bans": bans, "kinds": list(cbans.KINDS)}
+
+
+@app.get("/api/v1/web/admin/craftbans/preview")
+async def admin_craft_ban_preview(listing_id: str, user: dict = Depends(get_owner)):
+    """Fingerprint a listing's craft without banning anything: the three hashes,
+    what each would match, and how big the craft is. The Ban dialog's contents."""
+    listing = await asyncio.to_thread(mkt.get_listing, 0, listing_id)
+    if not listing:
+        raise HTTPException(status_code=404, detail="Listing not found")
+    craft = await asyncio.to_thread(_listing_craft_bytes, listing)
+    preview = await asyncio.to_thread(_ban_preview, _craft_text_bytes(craft), listing)
+    return {"listing_id": listing_id,
+            "craft_name": listing.get("craft_name") or "",
+            "seller_name": listing.get("seller_name") or "",
+            **preview}
+
+
+@app.post("/api/v1/web/admin/craftbans")
+async def admin_add_craft_ban(req: AdminCraftBan, user: dict = Depends(get_owner)):
+    """Ban a craft, and (by default) take down the listings that already are it.
+
+    The hash comes either from `listing_id` — the craft is fetched and
+    fingerprinted here, which is the path the console's "Ban craft" button uses —
+    or verbatim from `hash`, for a moderator who has one from somewhere else.
+    """
+    kind = (req.kind or cbans.DESIGN).strip().lower()
+    if kind not in cbans.KINDS:
+        raise HTTPException(status_code=422,
+                            detail=f"kind must be one of {', '.join(cbans.KINDS)}.")
+    sweep = (req.sweep or "delist").strip().lower()
+    if sweep not in ("delist", "delete", "none"):
+        raise HTTPException(status_code=422, detail="sweep must be 'delist', 'delete' or 'none'.")
+
+    label = (req.label or "").strip()
+    listing_id = (req.listing_id or "").strip()
+    digest = (req.hash or "").strip().lower()
+
+    if not digest:
+        if not listing_id:
+            raise HTTPException(status_code=422, detail="Give either a hash or a listing_id.")
+        listing = await asyncio.to_thread(mkt.get_listing, 0, listing_id)
+        if not listing:
+            raise HTTPException(status_code=404, detail="Listing not found")
+        craft = await asyncio.to_thread(_listing_craft_bytes, listing)
+        fp = await asyncio.to_thread(cbans.fingerprint, _craft_text_bytes(craft))
+        # Before the sweep, not after: an old listing with no stored fingerprint
+        # is invisible to the array-contains query, and it would be the one
+        # listing a ban issued from it failed to take down.
+        await asyncio.to_thread(_remember_hashes, listing, fp)
+        digest = fp.get(kind) or ""
+        if not digest:
+            raise HTTPException(
+                status_code=409,
+                detail=f"No {kind} fingerprint could be taken from that craft "
+                       f"(no parts were readable in it). Ban it by exact hash instead.")
+        label = label or (listing.get("craft_name") or "")
+
+    try:
+        rec = await asyncio.to_thread(
+            cbans.add_ban, digest, kind, req.reason, str(user.get("username") or user["user_id"]),
+            label, req.note, listing_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    # Sweep. Only ever touches listings whose stored fingerprint says they ARE
+    # this craft, so it cannot reach a listing that merely resembles it.
+    swept, deleted = [], []
+    if sweep != "none":
+        matches = await asyncio.to_thread(mkt.list_by_hash, f"{kind}:{digest}")
+        for m in matches:
+            mid = m.get("listing_id")
+            if not mid:
+                continue
+            try:
+                if sweep == "delete":
+                    await asyncio.to_thread(mkt.delete_listing, mid)
+                    deleted.append(mid)
+                elif m.get("status") == mkt.ACTIVE:
+                    await asyncio.to_thread(mkt.update_listing, 0, mid, status=mkt.DELISTED)
+                    swept.append(mid)
+                else:
+                    continue     # already down; nothing happened, so say nothing
+            except Exception as exc:
+                log.error("Craft-ban sweep failed for listing %s: %s", mid, exc)
+                continue
+            # Tell the seller, for the same reason the rating floor does: a craft
+            # that disappears with no explanation reads as the site being broken,
+            # and arrives as a bug report instead of as an appeal. Best-effort —
+            # the removal is the point, the notice is the courtesy.
+            try:
+                seller_id = int(m.get("seller_id") or 0)
+                origin_gid = int(m.get("guild_id") or 0)
+                if seller_id and origin_gid:
+                    _create_notification(
+                        origin_gid, seller_id, "marketplace_banned",
+                        "🚫 Craft removed from the marketplace",
+                        (f"'{m.get('craft_name') or 'Your craft'}' was removed by a "
+                         f"moderator: {cbans.refusal_message(rec)} "
+                         + ("It has been deleted." if sweep == "delete" else
+                            "It can't be listed, sent or submitted again until that "
+                            "is lifted.")),
+                        {"listing_id": mid, "reason": cbans.refusal_message(rec)},
+                    )
+            except Exception as exc:
+                log.warning("Craft ban: could not notify seller of %s: %s", mid, exc)
+
+    _admin_audit(user, "ban-craft",
+                 f"{kind} {digest[:12]} '{label}' sweep={sweep} "
+                 f"delisted={len(swept)} deleted={len(deleted)}")
+    return {"success": True, "ban": rec,
+            "delisted": swept, "deleted": deleted,
+            "matched": len(swept) + len(deleted)}
+
+
+@app.delete("/api/v1/web/admin/craftbans/{craft_hash}")
+async def admin_revoke_craft_ban(craft_hash: str, user: dict = Depends(get_owner)):
+    """Lift a ban. The listings it delisted are NOT put back up: the seller can
+    relist their own craft now that the gate is open, and re-activating someone
+    else's listing on their behalf is a decision nobody asked us to make."""
+    lifted = await asyncio.to_thread(
+        cbans.revoke, craft_hash, str(user.get("username") or user["user_id"]))
+    if not lifted:
+        raise HTTPException(status_code=404, detail="No active ban with that hash.")
+    _admin_audit(user, "unban-craft", craft_hash[:12])
+    return {"success": True}
+
+
+@app.post("/api/v1/web/admin/craftbans/backfill")
+async def admin_craft_ban_backfill(limit: int = 100, user: dict = Depends(get_owner)):
+    """Fingerprint listings uploaded before fingerprinting existed.
+
+    A listing records its own hashes at upload, so this is a one-off for the back
+    catalogue — and it is the expensive call in the console, one Storage download
+    per listing, which is why it is capped, explicit, and reports what is left
+    rather than looping until it is done."""
+    limit = max(1, min(int(limit or 100), 500))
+    listings = await asyncio.to_thread(mkt.list_all)
+    pending = [l for l in listings if not l.get("craft_hashes") and l.get("craft_url")]
+    todo, remaining = pending[:limit], max(0, len(pending) - limit)
+
+    updated = failed = 0
+    for l in todo:
+        lid = l.get("listing_id")
+        try:
+            craft = await asyncio.to_thread(_listing_craft_bytes, l)
+            fp = await asyncio.to_thread(cbans.fingerprint, _craft_text_bytes(craft))
+            await asyncio.to_thread(mkt.update_listing, 0, lid,
+                                    craft_hashes=cbans.hash_list(fp))
+            updated += 1
+        except Exception as exc:
+            failed += 1
+            log.warning("Craft-hash backfill failed for listing %s: %s", lid, exc)
+
+    _admin_audit(user, "craftban-backfill",
+                 f"updated={updated} failed={failed} remaining={remaining}")
+    return {"success": True, "updated": updated, "failed": failed, "remaining": remaining}
 
 
 # ── User accounts ─────────────────────────────────────────────────────────────
@@ -5711,7 +6273,7 @@ async def admin_user_suspend(user_id: str, req: AdminSuspend,
         # Required, because the reason is what the player is shown at the gate and
         # what an appeal is about. A suspension with no stated cause is one the
         # mod team cannot defend a week later either.
-        raise HTTPException(status_code=422, detail="A reason is required — the player is shown it.")
+        raise HTTPException(status_code=422, detail="A reason is required; the player is shown it.")
 
     rec = suspensions.suspend(user_id, req.hours, reason, user.get("username", "owner"))
     _admin_audit(user, "suspend", f"{user_id} {req.hours}h: {reason}")
@@ -5725,7 +6287,7 @@ async def admin_user_suspend(user_id: str, req: AdminSuspend,
              f"suspended for **{_humanise_hours(rec['hours'])}**.\n\n"
              f"**Reason:** {reason}\n\n"
              f"Access returns on its own at <t:{int(rec['until'])}:F> "
-             f"(<t:{int(rec['until'])}:R>). Nothing has been deleted — your balance, "
+             f"(<t:{int(rec['until'])}:R>). Nothing has been deleted; your balance, "
              f"XP, contracts and listings are all still there. Your Discord "
              f"membership is unaffected.\n\n"
              f"If you think this is a mistake, open a ticket in the server."),
@@ -5751,7 +6313,7 @@ async def admin_user_unsuspend(user_id: str, notify: bool = True,
             user_id,
             "▶️ Boundless Missions access restored",
             ("Your suspension has been lifted early. The KSP mod and the website "
-             "work again — restart the mod, or press **Check again** on the notice "
+             "work again; restart the mod, or press **Check again** on the notice "
              "it is showing you."),
             discord.Color.green())
 
@@ -5829,7 +6391,7 @@ async def _announce_via_tickets(bot, guild, role, title: str, content: str, admi
         except Exception as exc:
             log.warning("announce ticket for %s failed: %s", member.id, exc)
         await asyncio.sleep(1.5)  # stay far under the channel-create rate limit
-    log.warning("ADMIN[%s]: announce-tickets done — %d/%d tickets opened for role %s",
+    log.warning("ADMIN[%s]: announce-tickets done: %d/%d tickets opened for role %s",
                 admin_name, opened, len(role.members), role.name)
 
 
@@ -6224,7 +6786,7 @@ async def _post_achievement_capture(
     if channel is None:
         log.warning(
             "achievement photo: no resolvable checkpoint_photos channel for guild %s "
-            "(configured id=%s) — image NOT posted",
+            "(configured id=%s), image NOT posted",
             gid, guild_config.get_channel_id(gid, "checkpoint_photos"),
         )
         return
@@ -6383,7 +6945,7 @@ async def achievement_photo(
 
     log.info(
         "KSP: %s achievement photo → level %d (%s) qualifies=%s new=%s reward=+%dXP/+%dKC",
-        uid, ksp_level, title_desc or "—", qualifies, is_new, xp_r, coin_r,
+        uid, ksp_level, title_desc or "-", qualifies, is_new, xp_r, coin_r,
     )
     return SubmissionResult(success=True, message=message)
 
@@ -6475,7 +7037,7 @@ async def _discord_notify_issuer(
 ):
     """Post a submission notification to the issuer's Discord corp channel."""
     if _bot_instance is None:
-        log.warning("Bot instance not set — cannot send Discord notification")
+        log.warning("Bot instance not set, cannot send Discord notification")
         return
 
     try:
@@ -6486,7 +7048,7 @@ async def _discord_notify_issuer(
         # Find issuer's corp channel (may be in another server — resolve globally).
         corp = _get_corp(gid, issuer_id)
         if not corp or not corp.get("channel_id"):
-            log.warning("No corp channel for issuer %d — cannot notify", issuer_id)
+            log.warning("No corp channel for issuer %d, cannot notify", issuer_id)
             return
 
         channel = _bot_instance.get_channel(int(corp["channel_id"]))

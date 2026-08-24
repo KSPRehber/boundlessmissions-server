@@ -33,7 +33,7 @@ class Moderation(commands.Cog, name="Moderation"):
     async def kick(self, interaction: discord.Interaction, member: discord.Member, reason: str = "No reason provided") -> None:
         await member.kick(reason=reason)
         await interaction.response.send_message(f"👢 **{member}** has been kicked.\n📝 Reason: {reason}")
-        log.info("%s kicked %s — %s", interaction.user, member, reason)
+        log.info("%s kicked %s: %s", interaction.user, member, reason)
 
     @app_commands.command(name="ban", description="Ban a member from the server")
     @app_commands.describe(member="Member to ban", reason="Reason for ban", delete_days="Days of messages to delete (0–7)")
@@ -41,7 +41,7 @@ class Moderation(commands.Cog, name="Moderation"):
     async def ban(self, interaction: discord.Interaction, member: discord.Member, reason: str = "No reason provided", delete_days: app_commands.Range[int, 0, 7] = 0) -> None:
         await member.ban(reason=reason, delete_message_days=delete_days)
         await interaction.response.send_message(f"🔨 **{member}** has been banned.\n📝 Reason: {reason}")
-        log.info("%s banned %s — %s", interaction.user, member, reason)
+        log.info("%s banned %s: %s", interaction.user, member, reason)
 
     @app_commands.command(name="unban", description="Unban a user by ID")
     @app_commands.describe(user_id="Discord user ID to unban", reason="Reason")
@@ -51,7 +51,7 @@ class Moderation(commands.Cog, name="Moderation"):
             user = await self.bot.fetch_user(int(user_id))
             await interaction.guild.unban(user, reason=reason)
             await interaction.response.send_message(f"✅ **{user}** has been unbanned.")
-            log.info("%s unbanned %s — %s", interaction.user, user, reason)
+            log.info("%s unbanned %s: %s", interaction.user, user, reason)
         except discord.NotFound:
             await interaction.response.send_message("❌ User not found or not banned.", ephemeral=True)
         except ValueError:
@@ -63,7 +63,7 @@ class Moderation(commands.Cog, name="Moderation"):
     async def mute(self, interaction: discord.Interaction, member: discord.Member, minutes: app_commands.Range[int, 1, 40320] = 10, reason: str = "No reason provided") -> None:
         await member.timeout(datetime.timedelta(minutes=minutes), reason=reason)
         await interaction.response.send_message(f"🔇 **{member}** muted for **{minutes} min**.\n📝 Reason: {reason}")
-        log.info("%s muted %s for %d min — %s", interaction.user, member, minutes, reason)
+        log.info("%s muted %s for %d min: %s", interaction.user, member, minutes, reason)
 
     @app_commands.command(name="unmute", description="Remove timeout from a member")
     @app_commands.describe(member="Member to unmute")
@@ -94,7 +94,7 @@ class Moderation(commands.Cog, name="Moderation"):
         except discord.Forbidden:
             pass
         await interaction.response.send_message(f"⚠️ **{member}** warned. Total warnings: **{count}**\n📝 Reason: {reason}")
-        log.info("%s warned %s (total %d) — %s", interaction.user, member, count, reason)
+        log.info("%s warned %s (total %d): %s", interaction.user, member, count, reason)
 
     @app_commands.command(name="warnings", description="List all warnings for a member")
     @app_commands.describe(member="Member to check")

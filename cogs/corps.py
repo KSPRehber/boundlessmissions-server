@@ -5,6 +5,18 @@ Users can establish a corporation which creates a dedicated text channel.
 Each user may own one corporation at a time. Data is persisted in Firestore.
 
 Firestore path: guilds/{guild_id}/corps/{user_id}
+
+**A corp is never created just because someone joined the Discord server.** A corp
+channel is a private channel carrying that player's contract traffic, deliveries
+and dispute hand-offs — creating one the moment a member arrives spends a channel
+on everybody who only ever came to read, and it stores their name and avatar in a
+channel topic and a pinned embed before they have agreed to anything. So the
+trigger is the in-mod consent gate instead: the KSP client transmits *nothing*
+until the player accepts the privacy policy and terms (`Consent.Accepted` /
+`ApiClient.TransmissionBlocked`), which makes a completed link the server's proof
+that they did. `ensure_corp_for_linked_user` is called from the link endpoints and
+is the only automatic path left; `/corpsetup` (explicit) and `/admin corpsgenerate`
+(backfill, linked members only) are the others.
 """
 
 import asyncio
@@ -128,7 +140,11 @@ async def _establish_corp(
     _save_corp(guild.id, member.id, {
         "name": name,
         "owner_id": str(member.id),
-        "owner_name": member.name,
+        # display_name, not name: this is what the corp's owner is called
+        # everywhere else (link codes, weekly missions, auction bids), and it is
+        # the fallback the player pickers fall back *to* when the member cache
+        # cannot answer — see list_corps.
+        "owner_name": member.display_name,
         "channel_id": str(channel.id),
         "pin_message_id": str(pin_msg.id),
         "established_at": now.isoformat(),
@@ -141,9 +157,54 @@ async def _establish_corp(
 
 def _auto_corp_name(member: discord.Member) -> str:
     """'{username} Space Agency' — the name auto-generated corps are given.
-    Uses the display name, which is what the member is known as in the guild;
-    the raw account name is kept separately as `owner_name`."""
+    Uses the display name, which is what the member is known as in the guild —
+    the same name `owner_name` records for the owner themselves."""
     return f"{member.display_name} Space Agency"
+
+
+# In-flight corp creations, by user id. Two KSP clients can link the same account
+# seconds apart (running a second game instance is normal), and `find_user_corp`
+# cannot see a channel that is still being created — so without this the second
+# link would sail past the check and mint a duplicate corp.
+_ensuring: set[str] = set()
+
+
+async def ensure_corp_for_linked_user(bot, guild_id, user_id) -> "discord.TextChannel | None":
+    """Give a freshly linked player their corporation, if they haven't got one.
+
+    This is the *only* automatic corp creation left, and the link is what makes it
+    legitimate: the KSP client refuses to transmit anything at all until the player
+    has accepted the privacy policy and terms in-mod, so a link code reaching the
+    server is the server's evidence that they did. Joining the Discord server is
+    not — see the module docstring.
+
+    Returns the new channel, or None if there was nothing to do (already has a corp,
+    not a member of that guild any more, guild unknown) or if creation failed.
+    Never raises: a corp is a convenience, and failing to make one must not cost the
+    player the link they were completing.
+    """
+    uid = str(user_id)
+    if uid in _ensuring:
+        return None
+    _ensuring.add(uid)
+    try:
+        guild = bot.get_guild(int(guild_id)) if bot else None
+        if guild is None:
+            log.warning("Cannot establish corp for %s: guild %s unknown", uid, guild_id)
+            return None
+        member = await _resolve_member(guild, uid)
+        if member is None or member.bot:
+            return None
+        if await asyncio.to_thread(find_user_corp, guild.id, member.id):
+            return None
+        channel = await _establish_corp(guild, member, _auto_corp_name(member))
+        log.info("Established corp for %s on link (consent accepted in-mod)", member)
+        return channel
+    except Exception as exc:
+        log.warning("Could not establish corp for linked user %s: %s", uid, exc)
+        return None
+    finally:
+        _ensuring.discard(uid)
 
 
 async def _resolve_member(guild: discord.Guild, uid) -> discord.Member | None:
@@ -412,33 +473,29 @@ class Corps(commands.Cog, name="Corps"):
     # ── Startup sweep ─────────────────────────────────────────────────────────
     @commands.Cog.listener()
     async def on_ready(self) -> None:
-        """Bring every guild up to date on boot: privatize corp channels created
-        before privacy existed, then create corps for members who joined before
-        auto-generation existed. Idempotent and cheap when there is nothing to
-        do — already-private channels are detected from the local permission
-        cache (zero API calls), and corp ownership is one stream of the global
-        `corp_owners` collection rather than a query per member."""
+        """Bring every guild's existing corp channels up to spec on boot:
+        privatize the ones created before privacy existed and drop the retired
+        `corp-` prefix. Idempotent and cheap when there is nothing to do —
+        an already-private channel is detected from the local permission cache
+        (zero API calls).
+
+        It deliberately creates **nothing**. This sweep used to also mint a corp
+        for every member without one, which is the server-join auto-creation in
+        another shape: on the next boot after a member joined it would create the
+        channel the join listener no longer does. Members who have not linked a
+        KSP client have not consented to anything yet, and the one whose consent
+        arrives later gets a corp from the link itself (`ensure_corp_for_linked_user`).
+        """
         if self._swept:  # on_ready re-fires on every reconnect
             return
         self._swept = True
 
-        # Everyone who owns a corp anywhere.
-        owner_docs = await asyncio.to_thread(
-            lambda: list(_db.collection("corp_owners").stream()))
-        owners = {doc.id for doc in owner_docs}
-
         for guild in self.bot.guilds:
-            covered = set(owners)
-            privatized = created = 0
-
+            privatized = 0
             col = _db.collection("guilds").document(str(guild.id)).collection("corps")
             for doc in await asyncio.to_thread(lambda: list(col.stream())):
                 d = doc.to_dict() or {}
                 d.setdefault("owner_id", doc.id)
-                # Non-owner corp members have a corp channel already; they must
-                # not get a second one of their own.
-                covered.update(str(u) for u in d.get("members", []))
-                covered.add(doc.id)
                 try:
                     if await _apply_corp_privacy(
                             guild, d, reason="Corp privacy startup sweep") == "updated":
@@ -447,49 +504,30 @@ class Corps(commands.Cog, name="Corps"):
                     log.warning("Startup privacy sweep failed for corp %s in %s: %s",
                                 doc.id, guild.id, exc)
 
-            for member in list(guild.members):
-                if member.bot or str(member.id) in covered:
-                    continue
-                try:
-                    await _establish_corp(guild, member, _auto_corp_name(member))
-                    owners.add(str(member.id))
-                    created += 1
-                    await asyncio.sleep(2)  # channel-create rate limit
-                except Exception as exc:
-                    log.warning("Startup corp generation failed for %s in %s: %s",
-                                member, guild.id, exc)
-
-            if privatized or created:
+            if privatized:
                 log.info("Corp startup sweep in %s: %d channel(s) updated "
-                         "(privacy/rename), %d corp(s) created", guild.id, privatized, created)
-
-    # ── Auto-generation ───────────────────────────────────────────────────────
-    @commands.Cog.listener()
-    async def on_member_join(self, member: discord.Member) -> None:
-        """Every human member gets a corporation on arrival, so contract offers,
-        dispute hand-offs and craft deliveries always have a corp channel to land
-        in (rather than the DM fallback). One corp per user globally still holds:
-        someone who already owns one in another server is left alone."""
-        if member.bot:
-            return
-        try:
-            if find_user_corp(member.guild.id, member.id):
-                return
-            await _establish_corp(member.guild, member, _auto_corp_name(member))
-        except Exception as exc:
-            log.warning("Could not auto-establish corp for %s: %s", member, exc)
+                         "(privacy/rename)", guild.id, privatized)
 
     # ── /admin corpsgenerate ──────────────────────────────────────────────────
     @app_commands.command(
         name="corpsgenerate",
-        description="Create a corporation for every member that doesn't have one",
+        description="Create a corporation for every linked member that doesn't have one",
     )
     @app_commands.default_permissions(administrator=True)
     async def corpsgenerate(self, interaction: discord.Interaction) -> None:
-        """Backfill for members who joined before auto-generation existed.
+        """Backfill for players who linked before corps were created on link.
+
+        It covers **linked** members only. Running it over the whole member list
+        would re-introduce the server-join auto-creation by hand: a corp channel
+        publishes a member's name and avatar and carries their contract traffic,
+        and someone who has never accepted the in-mod terms has not asked for
+        either. Unlinked members are counted back so an admin can see the
+        difference rather than wonder why the number is small.
+
         Channel creation is heavily rate-limited by Discord, so this paces
         itself; on a large guild it can take a while. Safe to re-run — members
-        who already have a corp (here or anywhere) are skipped."""
+        who already have a corp (here or anywhere) are skipped.
+        """
         if not interaction.guild:
             await interaction.response.send_message(
                 tp(None, interaction.user.id, "common.server_only"), ephemeral=True)
@@ -497,9 +535,15 @@ class Corps(commands.Cog, name="Corps"):
         guild = interaction.guild
         await interaction.response.defer(ephemeral=True)
 
-        created, failed, skipped = 0, [], 0
+        from api_auth import linked_user_ids
+        linked = await asyncio.to_thread(linked_user_ids)
+
+        created, failed, skipped, unlinked = 0, [], 0, 0
         for member in list(guild.members):
             if member.bot:
+                continue
+            if str(member.id) not in linked:
+                unlinked += 1
                 continue
             try:
                 if find_user_corp(guild.id, member.id):
@@ -513,6 +557,9 @@ class Corps(commands.Cog, name="Corps"):
                 failed.append(member.display_name)
 
         lines = [f"🏢 Created **{created}** corporation(s); {skipped} member(s) already had one."]
+        if unlinked:
+            lines.append(f"⏭️ Skipped **{unlinked}** member(s) who haven't linked KSP yet; "
+                         "they get a corp automatically once they accept the terms in-mod.")
         if failed:
             lines.append(f"⚠️ Failed for: {', '.join(failed[:10])}"
                          + (f" (+{len(failed) - 10} more)" if len(failed) > 10 else ""))
@@ -520,8 +567,8 @@ class Corps(commands.Cog, name="Corps"):
             await interaction.followup.send("\n".join(lines), ephemeral=True)
         except discord.HTTPException:
             # A very large backfill can outlive the interaction token (15 min).
-            log.info("corpsgenerate in %s: %d created, %d skipped, %d failed",
-                     guild.id, created, skipped, len(failed))
+            log.info("corpsgenerate in %s: %d created, %d skipped, %d unlinked, %d failed",
+                     guild.id, created, skipped, unlinked, len(failed))
 
     # ── /admin corpsprivacy ───────────────────────────────────────────────────
     @app_commands.command(
@@ -567,7 +614,7 @@ class Corps(commands.Cog, name="Corps"):
         if missing:
             lines.append(f"👻 Channel gone (skipped): {', '.join(missing[:10])}")
         if guild_config.resolve_role(guild, "mod") is None:
-            lines.append("⚠️ No `mod` role is mapped (`/admin setrole`) — only "
+            lines.append("⚠️ No `mod` role is mapped (`/admin setrole`); only "
                          "administrators can see the channels until one is.")
         await interaction.followup.send("\n".join(lines), ephemeral=True)
         log.info("%s ran corpsprivacy in %s: %d updated, %d failed, %d missing",

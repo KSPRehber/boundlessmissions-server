@@ -138,7 +138,7 @@ async def main():
     r = await ca.cancel(GID, "c1", actor_id=CONTRACTOR, actor_name="Contractor")
     check("contractor may decline a pending offer", r.ok and DB["c1"]["status"] == cdb.CANCELLED)
 
-    print("\ncancel — bot issuer")
+    print("\ncancel: bot issuer")
     _mk(status=cdb.ACTIVE, issuer_id=str(BOT))
     BAL = {}
     await ca.cancel(GID, "c1", actor_id=BOT, actor_name="Bot")
@@ -172,7 +172,7 @@ async def main():
     check("approving twice is refused", not r.ok and r.code == ca.BAD_STATE)
     check("no double payment", BAL[CONTRACTOR] == 100, BAL)
 
-    print("\nreview — rescue delivery")
+    print("\nreview: rescue delivery")
     _mk(status=cdb.SUBMITTED, mission_type=cdb.RESCUE, issuer_vessel_removed=True)
     BAL, EVENTS = {}, []
     await ca.review(GID, "c1", actor_id=ISSUER, actor_name="Issuer", approve=True)
@@ -193,13 +193,13 @@ async def main():
     check("paying the fine twice is refused", not r.ok and r.code == ca.BAD_STATE)
     check("balance unchanged", BAL[CONTRACTOR] == 460, BAL)
 
-    print("\ndispute — rescue is handed back on pay_fine")
+    print("\ndispute: rescue is handed back on pay_fine")
     _mk(status=cdb.DISPUTED, mission_type=cdb.RESCUE, issuer_vessel_removed=True)
     BAL, EVENTS = {CONTRACTOR: 100}, []
     await ca.dispute(GID, "c1", actor_id=CONTRACTOR, actor_name="C", action="pay_fine")
     check("issuer's vessel restored", ("restore_vessel", "c1") in EVENTS, EVENTS)
 
-    print("\ndispute — more_time")
+    print("\ndispute: more_time")
     _mk(status=cdb.DISPUTED)
     r = await ca.dispute(GID, "c1", actor_id=CONTRACTOR, actor_name="C",
                          action="more_time", new_date="not-a-date")
@@ -219,13 +219,13 @@ async def main():
           (DB["c1"].get("pending_request") or {}).get("new_date") == "2099-01-02",
           DB["c1"].get("pending_request"))
 
-    print("\ndispute — more_time on a bot contract self-approves")
+    print("\ndispute: more_time on a bot contract self-approves")
     _mk(status=cdb.DISPUTED, issuer_id=str(BOT))
     r = await ca.dispute(GID, "c1", actor_id=CONTRACTOR, actor_name="C", action="more_time")
     check("bot contract extends itself", r.ok and DB["c1"]["status"] == cdb.ACTIVE, r.message)
     check("a new due date was set", DB["c1"]["due_date"] == r.data["new_date"])
 
-    print("\ndispute — settle on a bot contract")
+    print("\ndispute: settle on a bot contract")
     _mk(status=cdb.DISPUTED, issuer_id=str(BOT))
     r = await ca.dispute(GID, "c1", actor_id=CONTRACTOR, actor_name="C", action="settle")
     check("AI contracts cannot be settled", not r.ok and r.code == ca.BAD_REQUEST)
@@ -253,7 +253,7 @@ async def main():
     check("settling twice is refused", not r.ok and r.code == ca.BAD_STATE)
     check("no second refund", BAL[ISSUER] == 100, BAL)
 
-    print("\nsettle_response — refusing leaves it disputed")
+    print("\nsettle_response: refusing leaves it disputed")
     _mk(status=cdb.DISPUTED)
     BAL = {}
     await ca.dispute(GID, "c1", actor_id=CONTRACTOR, actor_name="C", action="settle")
@@ -279,7 +279,7 @@ async def main():
           DB["c1"]["due_date"] == "2099-05-05", DB["c1"]["due_date"])
     check("the request is cleared", DB["c1"].get("pending_request") is None)
 
-    print("\nreview — issuer drops the dispute and accepts after all")
+    print("\nreview: issuer drops the dispute and accepts after all")
     _mk(status=cdb.SUBMITTED)
     BAL = {}
     await ca.review(GID, "c1", actor_id=ISSUER, actor_name="I", approve=False)
@@ -302,7 +302,7 @@ async def main():
     check("accepting twice is refused", not r.ok and r.code == ca.BAD_STATE)
     check("no double payment", BAL[CONTRACTOR] == 100, BAL)
 
-    print("\nreview — an escalated case stays with the moderators")
+    print("\nreview: an escalated case stays with the moderators")
     _mk(status=cdb.MOD_REVIEW)
     BAL = {}
     r = await ca.review(GID, "c1", actor_id=ISSUER, actor_name="I", approve=True)
@@ -310,7 +310,7 @@ async def main():
           not r.ok and r.code == ca.BAD_STATE, r.code)
     check("nothing was paid", BAL == {}, BAL)
 
-    print("\ndispute clock — one extension request per dispute")
+    print("\ndispute clock: one extension request per dispute")
     _mk(status=cdb.SUBMITTED)
     BAL = {}
     await ca.review(GID, "c1", actor_id=ISSUER, actor_name="I", approve=False)
@@ -328,7 +328,7 @@ async def main():
     r = await ca.dispute(GID, "c1", actor_id=CONTRACTOR, actor_name="C", action="settle")
     check("settle is still available", r.ok, r.message)
 
-    print("\ndispute clock — a granted extension restores the allowance")
+    print("\ndispute clock: a granted extension restores the allowance")
     _mk(status=cdb.SUBMITTED)
     await ca.review(GID, "c1", actor_id=ISSUER, actor_name="I", approve=False)
     await ca.dispute(GID, "c1", actor_id=CONTRACTOR, actor_name="C",
@@ -369,7 +369,7 @@ async def main():
     check("expiring twice is refused", not r.ok and r.code == ca.BAD_STATE)
     check("no second collection", BAL[CONTRACTOR] == 460, BAL)
 
-    print("\ndispute timeout — a broke contractor cannot stall forever")
+    print("\ndispute timeout: a broke contractor cannot stall forever")
     _mk(status=cdb.DISPUTED,
         disputed_at=(datetime.utcnow() - timedelta(days=30)).isoformat())
     BAL = {CONTRACTOR: 5}
@@ -379,7 +379,7 @@ async def main():
     check("issuer credited only what was actually collected",
           BAL[ISSUER] == 105, BAL)
 
-    print("\ndispute timeout — a pending request does not pause the clock")
+    print("\ndispute timeout: a pending request does not pause the clock")
     _mk(status=cdb.DISPUTED,
         disputed_at=(datetime.utcnow() - timedelta(days=30)).isoformat())
     BAL = {CONTRACTOR: 500}

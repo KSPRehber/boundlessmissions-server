@@ -52,7 +52,7 @@ _storage_bucket = wrap_bucket(fb_storage.bucket() if _bucket_name else None)
 if _storage_bucket:
     log.info("Firebase Storage configured: %s", _bucket_name)
 else:
-    log.warning("FIREBASE_STORAGE_BUCKET not set — contract file uploads disabled")
+    log.warning("FIREBASE_STORAGE_BUCKET not set: contract file uploads disabled")
 
 
 # ── Upload sanitization (client-supplied filenames / content types) ──────────
@@ -230,7 +230,7 @@ class UserStore:
                 total += 1
             log.info("Loaded %d global user records from Firestore", total)
         except Exception as exc:
-            log.error("Failed to load from Firestore: %s — starting fresh", exc)
+            log.error("Failed to load from Firestore: %s, starting fresh", exc)
             self._users = {}
 
         # One-time merge of legacy guilds/{gid}/users/{uid} wallets into the global

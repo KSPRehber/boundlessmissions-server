@@ -1,5 +1,9 @@
 """
 data/contracts.py – Firestore + Firebase Storage helpers for contracts.
+
+Firestore structure:
+    contracts/{contract_id}          → { ...contract fields... }
+    contract_reports/{contract_id}_{reporter_id} → { ...one report... }
 """
 import logging
 import uuid
@@ -7,6 +11,7 @@ from datetime import datetime
 from typing import Any
 
 import aiohttp
+from firebase_admin import firestore
 
 from data.store import (
     _db, _storage_bucket, safe_filename, safe_content_type,
@@ -146,6 +151,84 @@ def count_active(guild_id: int, user_id: int) -> int:
         1 for c in iter_user_contracts(guild_id, user_id)
         if c.get("status") in active_statuses
     )
+
+
+# ── Reports ──────────────────────────────────────────────────────────────────
+#
+# A contract report is the marketplace's report system pointed at the other side of
+# a deal (see data/marketplace.py). The shape is deliberately identical — a keyed
+# (subject, reporter) document plus a counter on the subject — because the question
+# a moderator asks is the same one: has this person been reported before, and by how
+# many different people?
+#
+# What differs is who may file one. A listing is public and anyone browsing can
+# report it; a contract is private to its two parties, so the only people who can
+# see one to complain about it are the issuer and the contractor. The endpoint
+# enforces that; this module only stores what it is given.
+
+
+def _report_id(contract_id: str, reporter_id: int | str) -> str:
+    return f"{contract_id}_{reporter_id}"
+
+
+def get_report(contract_id: str, reporter_id: int | str) -> dict[str, Any] | None:
+    """This user's existing report against this contract, if any.
+
+    The document id is the (contract, reporter) pair, so "have I already reported
+    this?" is one keyed read — no composite index, and no way to file the same
+    complaint twice to make it look louder."""
+    snap = _db.collection("contract_reports").document(
+        _report_id(contract_id, reporter_id)).get()
+    return snap.to_dict() if snap.exists else None
+
+
+def record_report(contract: ContractData, reporter_id: int | str, reporter_name: str,
+                  reason: str, guild_id: int | str = "",
+                  ticket_channel_id: int | str = "") -> None:
+    """Store a report and bump the contract's report_count.
+
+    The Discord ticket is where a report is actually *handled*; this record exists so
+    the count survives the ticket being closed, and so a second report from the same
+    user overwrites rather than accumulates.
+
+    The contract's status at the time is stored with it, because a report is about a
+    moment — "they refused after I delivered" reads very differently once the same
+    contract has been settled — and the live document will have moved on by the time
+    a moderator opens the ticket.
+    """
+    contract_id = contract["contract_id"]
+    reporter = str(reporter_id)
+    issuer_id = str(contract.get("issuer_id", ""))
+    # Whoever the reporter is not. A report is always *about* the counterparty, so
+    # storing them saves every reader re-deriving it from two ids and a role.
+    subject_id = (str(contract.get("contractor_id", "")) if reporter == issuer_id
+                  else issuer_id)
+    subject_name = (contract.get("contractor_name", "") if reporter == issuer_id
+                    else contract.get("issuer_name", ""))
+    first_time = get_report(contract_id, reporter_id) is None
+    _db.collection("contract_reports").document(_report_id(contract_id, reporter_id)).set({
+        "contract_id": contract_id,
+        "mission": (contract.get("mission", "") or "")[:500],
+        "status": contract.get("status", ""),
+        "issuer_id": issuer_id,
+        "issuer_name": contract.get("issuer_name", ""),
+        "contractor_id": str(contract.get("contractor_id", "")),
+        "contractor_name": contract.get("contractor_name", ""),
+        "subject_id": subject_id,
+        "subject_name": subject_name,
+        "reporter_id": reporter,
+        "reporter_name": reporter_name,
+        "reason": reason,
+        "guild_id": str(guild_id),
+        "ticket_channel_id": str(ticket_channel_id),
+        "created_at": datetime.utcnow().isoformat(),
+    })
+    if first_time:
+        try:
+            _col().document(contract_id).update({"report_count": firestore.Increment(1)})
+        except Exception as exc:  # a vanished contract must not lose the report
+            log.warning("Could not bump report_count for contract %s: %s", contract_id, exc)
+    log.info("Contract %s reported by %s (%s)", contract_id, reporter_name, reporter_id)
 
 
 async def upload_to_storage(contract_id: str, filename: str, data: bytes, content_type: str = "application/octet-stream") -> str:

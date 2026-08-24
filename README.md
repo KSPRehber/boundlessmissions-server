@@ -166,7 +166,7 @@ codebase. `moderation.py` is loaded only when `ENABLE_MOD_COMMANDS` is set.
 | `economy.py` | KCoins — balance, pay, and the mod tools (give / fine / set) |
 | `xp.py` | Levelling, rank, leaderboard, and the `auto_save` loop that flushes the store |
 | `roles.py` | Self-assignable role menus |
-| `corps.py` | Corporations — one per user, each with a dedicated channel |
+| `corps.py` | Corporations — one per user, each with a dedicated channel, created when the player links KSP (never on server join) |
 | `contracts.py` | Player-to-player contracts, Discord side (**creation lives in the mod and the website**) |
 | `contract_views.py` | The interactive contract buttons and the Discord-side AI review |
 | `contractcraft.py` | "Load to KSP" on a corp-delivered contract craft |

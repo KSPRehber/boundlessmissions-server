@@ -220,7 +220,7 @@ class _MetricsClient:
                         if "403" in msg or "PERMISSION_DENIED" in msg:
                             # This one *is* fatal and worth saying once, loudly.
                             self._disabled_reason = (
-                                "Cloud Monitoring denied access — grant "
+                                "Cloud Monitoring denied access: grant "
                                 "roles/monitoring.viewer to the service account "
                                 f"in {cfg.FIREBASE_CREDENTIALS}"
                             )

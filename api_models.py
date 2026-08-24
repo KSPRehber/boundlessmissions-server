@@ -30,7 +30,7 @@ class LinkResponse(BaseModel):
 class DeviceStatusResponse(BaseModel):
     # status: "pending" (keep polling) | "approved" (device trusted, resume) |
     #         "denied" (rejected) | "expired". On a denied report awaiting client
-    #         diagnostics, report_id is set so the client uploads MAC + KSP.log.
+    #         diagnostics, report_id is set so the client uploads its KSP.log.
     status: str = "pending"
     report_id: Optional[str] = None
     # True (once) when the owner pressed "🔔 Ping this PC" in their Discord DM, so
@@ -140,6 +140,13 @@ class RescueTarget(BaseModel):
                         surface); margin_alt is the allowed +/- on each.
     mode == "surface" → lat/lon define the landing spot (degrees); margin_pos is
                         the allowed great-circle tolerance (degrees).
+
+    Both pairs are optional, and *absent means no requirement*, never zero: no ap/pe
+    is "any orbit of the body", no lat/lon is "anywhere on it". The mode's situation
+    still holds either way — an any-orbit rescue must still be delivered in orbit —
+    and the plane / regime constraints below can be asked for on their own. Only the
+    pair belonging to the other mode is normally missing, so a contract issued before
+    the issuer could switch these off always carries both halves of its own pair.
     is_modded is flagged by the issuer's client (it scans the real body list).
 
     `mode` is where; `recovery` is *what* has to get there:

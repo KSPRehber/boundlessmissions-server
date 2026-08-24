@@ -1,4 +1,4 @@
-"""Interchangeable KSP part names — GENERATED, do not edit by hand.
+"""Interchangeable KSP part names: GENERATED, do not edit by hand.
 
 Regenerate with `python tools/gen_part_aliases.py` after editing the source of
 truth, "KSP Mod Side/GeneKerman/PartAliases.cs". See that file for how the pairs

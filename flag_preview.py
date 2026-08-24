@@ -63,7 +63,7 @@ def make_watermarked(image_bytes: bytes) -> bytes:
     try:
         from PIL import Image, ImageDraw
     except Exception as exc:
-        log.warning("flag_preview: Pillow unavailable (%s) — using placeholder", exc)
+        log.warning("flag_preview: Pillow unavailable (%s), using placeholder", exc)
         return _placeholder()
 
     try:
@@ -107,5 +107,5 @@ def make_watermarked(image_bytes: bytes) -> bytes:
         out.save(buf, format="PNG")
         return buf.getvalue()
     except Exception as exc:
-        log.warning("flag_preview: watermarking failed (%s) — using placeholder", exc)
+        log.warning("flag_preview: watermarking failed (%s), using placeholder", exc)
         return _placeholder()

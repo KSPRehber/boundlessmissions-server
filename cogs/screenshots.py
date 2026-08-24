@@ -39,7 +39,7 @@ if _GEMINI_KEY and _GEMINI_KEY != "YOUR_GEMINI_API_KEY_HERE":
 else:
     _client = None
     _MODEL = None
-    log.warning("GEMINI_API_KEY not set — screenshot analysis disabled")
+    log.warning("GEMINI_API_KEY not set: screenshot analysis disabled")
 
 
 def active_client():
@@ -69,22 +69,22 @@ Your job: analyze a screenshot and return ONLY a valid JSON object. No markdown,
 
 ### Stock Kerbol System
 - **Kerbol** (Sun/Star)
-- **Moho** — innermost planet, no atmosphere, high gravity relative to size
-- **Eve** — purple atmosphere, thick, ocean of Explodium, very hard to return from. Moon: **Gilly** (tiny asteroid)
-- **Kerbin** — home planet, blue-green, KSC visible. Moons: **Mun** (grey, craters), **Minmus** (mint green, flats)
-- **Duna** — red/rust, thin atmosphere. Moon: **Ike** (grey, tidally locked)
-- **Dres** — asteroid belt dwarf planet, grey, canyon
-- **Jool** — green gas giant, banded atmosphere. Moons: **Laythe** (ocean world, blue, atmosphere), **Vall** (icy, smooth), **Tylo** (large, no atmosphere, high gravity), **Bop** (tiny, dark, irregular), **Pol** (tiny, yellowish)
-- **Eeloo** — distant dwarf planet, icy white/blue
+- **Moho**: innermost planet, no atmosphere, high gravity relative to size
+- **Eve**: purple atmosphere, thick, ocean of Explodium, very hard to return from. Moon: **Gilly** (tiny asteroid)
+- **Kerbin**: home planet, blue-green, KSC visible. Moons: **Mun** (grey, craters), **Minmus** (mint green, flats)
+- **Duna**: red/rust, thin atmosphere. Moon: **Ike** (grey, tidally locked)
+- **Dres**: asteroid belt dwarf planet, grey, canyon
+- **Jool**: green gas giant, banded atmosphere. Moons: **Laythe** (ocean world, blue, atmosphere), **Vall** (icy, smooth), **Tylo** (large, no atmosphere, high gravity), **Bop** (tiny, dark, irregular), **Pol** (tiny, yellowish)
+- **Eeloo**: distant dwarf planet, icy white/blue
 
 ### Outer Planets Mod (OPM)
-- **Sarnus** — ringed yellow gas giant. Moons: **Hale**, **Ovok**, **Eeloo** (moved here), **Slate**, **Tekto** (atmosphere, orange)
-- **Urlum** — blue-green ice giant, ringed. Moons: **Polta**, **Priax**, **Wal** (+ sub-moon **Tal**)
-- **Neidon** — blue ice giant. Moons: **Thatmo** (atmosphere, retrograde), **Nissee**
-- **Plock** — distant dwarf. Moon: **Karen**
+- **Sarnus**: ringed yellow gas giant. Moons: **Hale**, **Ovok**, **Eeloo** (moved here), **Slate**, **Tekto** (atmosphere, orange)
+- **Urlum**: blue-green ice giant, ringed. Moons: **Polta**, **Priax**, **Wal** (+ sub-moon **Tal**)
+- **Neidon**: blue ice giant. Moons: **Thatmo** (atmosphere, retrograde), **Nissee**
+- **Plock**: distant dwarf. Moon: **Karen**
 
 ### Kcalbeloh System (Interstellar mod)
-- **Kcalbeloh** — black hole at center, accretion disk
+- **Kcalbeloh**: black hole at center, accretion disk
 - Orbiting bodies include: **Suluco**, **Yeldo**, **Noyreg**, **Efil**, **Otsol**, **Ambrosh**, many more
 - Distinctive visual: black void with bright accretion ring, extreme gravitational lensing
 
@@ -93,25 +93,25 @@ Your job: analyze a screenshot and return ONLY a valid JSON object. No markdown,
 - Earth replaces Kerbin, Moon replaces Mun, etc.
 
 ### Other Common Mods
-- **Galaxies Unbound** — multiple star systems
-- **Beyond Home** — custom star system replacing stock
-- **Parallax** — enhanced terrain (visible in surface shots)
-- **EVE/Scatterer** — volumetric clouds, atmospheric scattering
-- **Restock** — updated part textures
+- **Galaxies Unbound**: multiple star systems
+- **Beyond Home**: custom star system replacing stock
+- **Parallax**: enhanced terrain (visible in surface shots)
+- **EVE/Scatterer**: volumetric clouds, atmospheric scattering
+- **Restock**: updated part textures
 
 ## Difficulty Rating Scale (1-10)
 Rate how difficult the DEPICTED mission/achievement would be to accomplish AND RETURN safely:
 
-1. **1** — Launch pad / runway scene, pre-launch
-2. **2** — Suborbital flight, basic atmosphere flight
-3. **3** — Kerbin orbit achieved
-4. **4** — Mun/Minmus flyby or orbit
-5. **5** — Mun/Minmus landing and return, interplanetary flyby
-6. **6** — Duna/Eve orbit, inner system landings (Moho, Gilly)
-7. **7** — Duna landing + return, Jool system operations, Eve orbit + return
-8. **8** — Tylo landing, Eve ascent vehicle, large station construction, Jool-5
-9. **9** — Grand tour, interstellar travel (Kcalbeloh), full colonization
-10. **10** — Completing seemingly impossible feats: Eve SSTO return, full interstellar colonization, grand tour SSTO
+1. **1**: Launch pad / runway scene, pre-launch
+2. **2**: Suborbital flight, basic atmosphere flight
+3. **3**: Kerbin orbit achieved
+4. **4**: Mun/Minmus flyby or orbit
+5. **5**: Mun/Minmus landing and return, interplanetary flyby
+6. **6**: Duna/Eve orbit, inner system landings (Moho, Gilly)
+7. **7**: Duna landing + return, Jool system operations, Eve orbit + return
+8. **8**: Tylo landing, Eve ascent vehicle, large station construction, Jool-5
+9. **9**: Grand tour, interstellar travel (Kcalbeloh), full colonization
+10. **10**: Completing seemingly impossible feats: Eve SSTO return, full interstellar colonization, grand tour SSTO
 
 ## Achievement Levels (1-15)
 Assign the highest applicable KSP achievement level from this exact list:
@@ -133,8 +133,8 @@ Assign the highest applicable KSP achievement level from this exact list:
 
 Set "ksp_level" to the corresponding integer (1-15). If the screenshot does not clearly depict one of these achievements, set it to 0. NOTE: Both crewed and uncrewed (probe) missions count equally for all achievements. A probe landing on Eve qualifies for Eve Landing.
 
-### CRITICAL: Landing vs Orbit — do NOT confuse them
-A "**Landing**" achievement (e.g. Mun Landing, Duna Landing, Eve Landing, RSS Moon/Venus Landing) requires the craft to be **physically on the surface** of that body — landing legs/wheels touching the ground, dust/terrain right under the craft, or a planted flag/EVA kerbal standing on the surface. The `situation` must be **landed** or **splashed**.
+### CRITICAL: Landing vs Orbit, do NOT confuse them
+A "**Landing**" achievement (e.g. Mun Landing, Duna Landing, Eve Landing, RSS Moon/Venus Landing) requires the craft to be **physically on the surface** of that body: landing legs/wheels touching the ground, dust/terrain right under the craft, or a planted flag/EVA kerbal standing on the surface. The `situation` must be **landed** or **splashed**.
 - A craft **orbiting**, doing a **flyby**, or hanging in **space above** a body does **NOT** qualify for that body's Landing achievement, no matter how close it looks. Being in orbit of the Mun is NOT "Mun Landing". Being in orbit of Duna is NOT "Duna Landing".
 - If the craft is only in **orbit / suborbital / flying / in space** (not touching the surface), pick the highest achievement that IS satisfied by an orbit (e.g. "Kerbin Orbit" / "RSS Earth Orbit"), or set ksp_level to **0** if no orbit-level achievement in the list applies to that body.
 - When unsure whether the craft is truly landed, treat it as NOT landed and do not award a Landing achievement.
@@ -174,7 +174,7 @@ A "**Landing**" achievement (e.g. Mun Landing, Duna Landing, Eve Landing, RSS Mo
 ## Rules
 - If the image is NOT from KSP/KSP2, set `"approved": false` and set `difficulty_rating` to 0 and all other fields to null/empty
 - ALWAYS return valid JSON only. No markdown fences, no explanation text
-- Be specific about celestial bodies — don't guess randomly
+- Be specific about celestial bodies, don't guess randomly
 - If unsure about a body, use the visual cues (color, terrain, atmosphere, rings)
 - Rate based on the FULL mission difficulty including return, not just getting there
 """
@@ -456,7 +456,7 @@ class Screenshots(commands.Cog, name="Screenshots"):
             # This command still grants XP + KCoins for the analysis.
 
             await interaction.followup.send(embed=embed)
-            log.info("%s analyzed %d direct upload(s) — difficulty %d (+%d XP, +%d coins)",
+            log.info("%s analyzed %d direct upload(s), difficulty %d (+%d XP, +%d coins)",
                      interaction.user, len(direct), rating, xp_r, coin_r)
             return
 
@@ -535,7 +535,7 @@ class Screenshots(commands.Cog, name="Screenshots"):
         await interaction.followup.send("✅", ephemeral=True)
 
         log.info(
-            "%s analyzed screenshot (msg %d, %d imgs): %s @ %s — difficulty %d (+%d XP, +%d coins)",
+            "%s analyzed screenshot (msg %d, %d imgs): %s @ %s, difficulty %d (+%d XP, +%d coins)",
             interaction.user, target_msg.id, len(images),
             data.get("location", {}).get("celestial_body", "?"),
             data.get("location", {}).get("situation", "?"),
@@ -569,6 +569,6 @@ async def setup(bot: commands.Bot) -> None:
     # active_client/_run_gemini/_grant_rewards keep working for the in-game
     # achievement-photo path.
     if not settings.SCREENSHOT_ANALYSIS_ENABLED:
-        log.info("Screenshot analysis disabled (settings.SCREENSHOT_ANALYSIS_ENABLED) — /analyze not registered")
+        log.info("Screenshot analysis disabled (settings.SCREENSHOT_ANALYSIS_ENABLED), /analyze not registered")
         return
     await bot.add_cog(Screenshots(bot))

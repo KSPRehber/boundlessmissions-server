@@ -35,7 +35,7 @@ log = logging.getLogger(__name__)
 _ID_PATTERN = r"(?P<lid>[^:]+):(?P<gid>\d+)"
 
 MOVED_NOTICE = (
-    "🛒 The craft marketplace has moved to the website — browse, buy and manage your "
+    "🛒 The craft marketplace has moved to the website: browse, buy and manage your "
     f"listings at {settings.MARKETPLACE_WEB_URL}. Purchases land in your KSP import "
     "queue automatically, and you list a craft from the mod's **Market** panel with "
     "the ship open in the VAB or SPH.\n\n"

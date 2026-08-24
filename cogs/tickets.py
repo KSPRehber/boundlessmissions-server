@@ -222,7 +222,7 @@ async def create_ticket(
         if notify_role is not None:
             ping_roles.append(notify_role)
         elif mod_role is not None:
-            log.warning("Ticket role '%s' is not configured in guild %s — pinging the "
+            log.warning("Ticket role '%s' is not configured in guild %s, pinging the "
                         "mod role instead", notify_role_key, guild.id)
             ping_roles.append(mod_role)
 

@@ -79,7 +79,7 @@ def evaluate(cheat_report: str | None, enabled: bool = True) -> Result:
         lines = ["the submitted craft was flagged by the in-game cheat watchdog"]
 
     message = (
-        "Submission disqualified — cheats were detected on the submitted craft:\n- "
+        "Submission disqualified: cheats were detected on the submitted craft:\n- "
         + "\n- ".join(lines)
         + "\n\nQuickload or revert to a save from before the cheat was used and "
         "fly the mission clean, then submit again."

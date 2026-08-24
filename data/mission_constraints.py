@@ -1234,7 +1234,7 @@ def _check_crew_traits(constraints: dict, crew_traits: dict | None) -> list[str]
             # when no kerbal in the save could ever have been one.
             mod = trait_mod(trait)
             if aboard == 0 and mod:
-                out.append(f"The '{trait}' profession comes from {mod} — an install "
+                out.append(f"The '{trait}' profession comes from {mod}; an install "
                            "without it cannot field one.")
         if mx is not None and aboard > mx:
             out.append(f"No {trait} may fly this mission: {aboard} aboard." if mx == 0

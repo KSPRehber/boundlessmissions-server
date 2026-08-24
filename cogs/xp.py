@@ -90,7 +90,7 @@ class XP(commands.Cog, name="XP"):
                     total_updated += 1
         if total_updated:
             await store.save_if_dirty()
-        log.info("Member scan complete — %d new, %d updated", total_new, total_updated)
+        log.info("Member scan complete: %d new, %d updated", total_new, total_updated)
 
     # ── Listener: award XP on message ────────────────────────────────────────
     @commands.Cog.listener()

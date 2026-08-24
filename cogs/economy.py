@@ -171,7 +171,7 @@ class Economy(commands.Cog, name="Economy"):
         )
         embed.set_footer(text=t(gid, "common.issued_by", name=interaction.user.display_name))
         await interaction.response.send_message(embed=embed)
-        log.info("%s gave %s %d KCoins — %s", interaction.user, member, amount, reason)
+        log.info("%s gave %s %d KCoins: %s", interaction.user, member, amount, reason)
 
     # ── /fine ─────────────────────────────────────────────────────────────────
     @app_commands.command(name="fine", description="Deduct KCoins from a user (Mod only)")
@@ -206,7 +206,7 @@ class Economy(commands.Cog, name="Economy"):
                 currency=settings.CURRENCY_NAME, reason=reason))
         except discord.Forbidden:
             pass
-        log.info("%s fined %s %d KCoins — %s", interaction.user, member, amount, reason)
+        log.info("%s fined %s %d KCoins: %s", interaction.user, member, amount, reason)
 
     # ── /setbalance ───────────────────────────────────────────────────────────
     @app_commands.command(name="setbalance", description="Set a user's KCoin balance (Mod only)")

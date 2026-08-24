@@ -207,6 +207,15 @@ class _GuardedBucket:
             def blob(*args, **kwargs):
                 return _GuardedBlob(attr(*args, **kwargs))
             return blob
+        # list_blobs is the other way a caller gets hold of a Blob, and the ones
+        # it hands back used to arrive unwrapped — so every delete driven off a
+        # listing (marketplace.delete_listing, imports) passed straight through
+        # the gate and was never counted. Callers only ever iterate it, so a
+        # generator is a fair substitute for the HTTPIterator.
+        if name == "list_blobs" and callable(attr):
+            def list_blobs(*args, **kwargs):
+                return (_GuardedBlob(b) for b in attr(*args, **kwargs))
+            return list_blobs
         return attr
 
     def __setattr__(self, name, value):

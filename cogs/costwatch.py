@@ -45,8 +45,8 @@ _TICK = 30
 
 _LEVEL_STYLE = {
     "warning": (discord.Color.gold(), "⚠️", "Half the monthly budget is gone"),
-    "degraded": (discord.Color.orange(), "🟠", "Budget nearly spent — uploads paused"),
-    "frozen": (discord.Color.red(), "🛑", "Budget spent — Firebase is paused"),
+    "degraded": (discord.Color.orange(), "🟠", "Budget nearly spent: uploads paused"),
+    "frozen": (discord.Color.red(), "🛑", "Budget spent: Firebase is paused"),
 }
 
 _LEVEL_DETAIL = {
@@ -56,7 +56,7 @@ _LEVEL_DETAIL = {
     ),
     "degraded": (
         "New file uploads (craft listings, screenshots, contract attachments) are "
-        "being refused. Everything else — reads, downloads, XP, contracts — still "
+        "being refused. Everything else (reads, downloads, XP, contracts) still "
         "works normally."
     ),
     "frozen": (
@@ -119,13 +119,13 @@ class CostWatch(commands.Cog, name="CostWatch"):
         # is not a fault.
         if settings.COST_METRICS_ENABLED and snap.error != self._metrics_error_announced:
             self._metrics_error_announced = snap.error
-            log.warning("cost_guard: no authoritative usage — %s", snap.error)
+            log.warning("cost_guard: no authoritative usage, %s", snap.error)
             await self._dm_owner(discord.Embed(
                 title="📉 Cost tracking is running on estimates only",
                 color=discord.Color.greyple(),
                 description=(
                     f"Cloud Monitoring could not be read:\n```{snap.error}```\n"
-                    "The spending brake still works — it is running on the "
+                    "The spending brake still works; it is running on the "
                     "in-process estimate alone, which cannot see direct-download "
                     "egress or bytes at rest, so the figures will read low.\n\n"
                     "If this is the IAM grant, give the service account "
@@ -151,7 +151,7 @@ class CostWatch(commands.Cog, name="CostWatch"):
                      snap.total_usd, snap.currency, snap.invoice_month)
         else:
             guard.note_billing_error(snap.error)
-            log.debug("cost_guard: no billing data — %s", snap.error)
+            log.debug("cost_guard: no billing data, %s", snap.error)
 
     # ── alerts ───────────────────────────────────────────────────────────────
     async def _dispatch_alerts(self) -> None:
@@ -186,7 +186,7 @@ class CostWatch(commands.Cog, name="CostWatch"):
                 description=(
                     f"**${alert['usd']:.4f}** of **${alert['budget']:.2f}** used in "
                     f"{alert['month']}.\n\nAI analysis has fallen back to the keyword "
-                    "heuristics for the rest of the month. Nothing is broken — "
+                    "heuristics for the rest of the month. Nothing is broken; "
                     "screenshot analysis is off and classification is less accurate."
                 ),
             )
@@ -226,7 +226,7 @@ class CostWatch(commands.Cog, name="CostWatch"):
             except Exception:
                 user = None
         if user is None:
-            log.error("cost_guard: no owner to alert — %s", embed.title)
+            log.error("cost_guard: no owner to alert, %s", embed.title)
             return
         await user.send(embed=embed)
 

@@ -360,7 +360,7 @@ class _CostGuard:
         except OSError as exc:
             log.warning("cost_guard: could not append history: %s", exc)
 
-        log.info("cost_guard: new month %s — resetting spend tallies", current)
+        log.info("cost_guard: new month %s, resetting spend tallies", current)
         self._month = current
         self._gemini_usd = 0.0
         self._daily = {}
@@ -451,7 +451,7 @@ class _CostGuard:
                     "month": self._month,
                 })
                 log.warning(
-                    "cost_guard: Gemini budget hit ($%.4f / $%.2f) — AI degraded "
+                    "cost_guard: Gemini budget hit ($%.4f / $%.2f), AI degraded "
                     "to fallbacks until %s rolls over.",
                     self._gemini_usd, budget, self._month,
                 )
@@ -489,7 +489,7 @@ class _CostGuard:
             armed = self._flush_grace
             if armed:
                 self._flush_grace = False
-                log.warning("cost_guard: frozen — allowing one final flush of "
+                log.warning("cost_guard: frozen, allowing one final flush of "
                             "buffered writes before the stop takes hold.")
         if not armed:
             yield False

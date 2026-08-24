@@ -454,11 +454,11 @@ async def main() -> None:
             if disabled_gates:
                 banner = "  ".join(disabled_gates)
                 print("\n" + "!" * 72)
-                print("!!  SECURITY GATES DISABLED — DO NOT RUN THIS IN PRODUCTION")
+                print("!!  SECURITY GATES DISABLED: DO NOT RUN THIS IN PRODUCTION")
                 print(f"!!  {banner}")
                 print("!!  Set these back to true in .env before public deployment.")
                 print("!" * 72 + "\n")
-                log.warning("SECURITY GATES DISABLED: %s — dev only, re-enable before deployment.",
+                log.warning("SECURITY GATES DISABLED: %s, dev only, re-enable before deployment.",
                             ", ".join(disabled_gates))
 
             # Serve HTTPS directly if a cert+key are configured; otherwise plain

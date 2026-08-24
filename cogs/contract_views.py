@@ -48,7 +48,7 @@ def _crew_requirement_text(constraints: dict) -> str | None:
     mod_line = "\n🧩 needs " + "; ".join(mods) if mods else ""
 
     if mx == 0:
-        count = "uncrewed — nobody aboard"
+        count = "uncrewed, nobody aboard"
     elif mn and mx:
         count = f"exactly {mn} aboard" if mn == mx else f"{mn}–{mx} aboard"
     elif mx:
@@ -99,13 +99,22 @@ def _rescue_terms_text(c: dict) -> str | None:
         return None
 
     body = rt.get("body") or "?"
+    # A missing coordinate is "anywhere", not 0 — see RescueTarget. Printing the
+    # zeros would describe a target the issuer never set, and 0°,0° is a real place.
     if (rt.get("mode") or "orbit").lower() == "surface":
-        where = f"land at **{body}** {float(rt.get('lat') or 0):.1f}°, {float(rt.get('lon') or 0):.1f}°"
+        if rt.get("lat") is None or rt.get("lon") is None:
+            where = f"land **anywhere on {body}**"
+        else:
+            where = f"land at **{body}** {float(rt['lat']):.1f}°, {float(rt['lon']):.1f}°"
     else:
-        where = (f"orbit **{body}** at "
-                 f"{float(rt.get('ap') or 0) / 1000:.0f}×{float(rt.get('pe') or 0) / 1000:.0f} km")
+        if rt.get("ap") is None or rt.get("pe") is None:
+            where = f"reach **any orbit of {body}**"
+        else:
+            where = (f"orbit **{body}** at "
+                     f"{float(rt['ap']) / 1000:.0f}×{float(rt['pe']) / 1000:.0f} km")
         # The plane / regime, when the issuer asked for one. Ap/Pe alone don't say
-        # which orbit this is, and matching the plane is the expensive half.
+        # which orbit this is, and matching the plane is the expensive half — which
+        # is also why it can be the whole requirement, with no Ap/Pe beside it.
         orbit_req = oc.describe_target(rt.get("inc"), rt.get("margin_inc"),
                                        rt.get("orbit_types"))
         if orbit_req:
@@ -314,7 +323,7 @@ class GiveUpButton(DynamicItem[Button], template=r"ct_giveup:" + _ID_PATTERN):
 # case has to answer with an explanation rather than a dead interaction.
 SUBMIT_MOVED_NOTICE = (
     "📤 Submissions now happen in KSP. Open the sidebar's **Contracts** panel and "
-    "press **Submit** there — the mod sends the craft, its mod list and the telemetry "
+    "press **Submit** there; the mod sends the craft, its mod list and the telemetry "
     "the review is judged against, which an upload here cannot carry."
 )
 

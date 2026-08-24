@@ -39,7 +39,7 @@ def main() -> None:
         patched += 1
         log.info("patched %s", blob.name)
 
-    log.info("done — %d patched, %d already correct", patched, skipped)
+    log.info("done: %d patched, %d already correct", patched, skipped)
 
 
 if __name__ == "__main__":

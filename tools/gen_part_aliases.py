@@ -30,7 +30,7 @@ def main() -> int:
     src = CS.read_text(encoding="utf-8")
     groups = [(label, a, b) for label, a, b, _note in GROUP_RX.findall(src)]
     if not groups:
-        print("error: no G(...) entries parsed — did the table's shape change?", file=sys.stderr)
+        print("error: no G(...) entries parsed; did the table's shape change?", file=sys.stderr)
         return 1
 
     seen: dict[str, str] = {}
@@ -42,7 +42,7 @@ def main() -> int:
             seen[n] = label
 
     lines = [
-        '"""Interchangeable KSP part names — GENERATED, do not edit by hand.',
+        '"""Interchangeable KSP part names: GENERATED, do not edit by hand.',
         "",
         "Regenerate with `python tools/gen_part_aliases.py` after editing the source of",
         'truth, "KSP Mod Side/GeneKerman/PartAliases.cs". See that file for how the pairs',
@@ -64,7 +64,7 @@ def main() -> int:
     lines.append("")
 
     OUT.write_text("\n".join(lines), encoding="utf-8")
-    print(f"wrote {OUT} — {len(groups)} pairs, {len(seen)} names")
+    print(f"wrote {OUT}: {len(groups)} pairs, {len(seen)} names")
     return 0
 
 

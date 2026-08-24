@@ -190,7 +190,7 @@ with tuned(**PRICING):
 
 
 # ── [C] the escape hatch ─────────────────────────────────────────────────────
-print("\n[C] final_flush() — exactly one grace pass per freeze")
+print("\n[C] final_flush(): exactly one grace pass per freeze")
 with tuned(**PRICING):
     g = fresh()
     with g.final_flush() as armed:
@@ -297,7 +297,7 @@ with tuned(**{**PRICING, "FIREBASE_MONTHLY_BUDGET_USD": 0.0}):
 
 
 # ── [G] Gemini ───────────────────────────────────────────────────────────────
-print("\n[G] The Gemini budget is soft — it degrades, it never raises")
+print("\n[G] The Gemini budget is soft; it degrades, it never raises")
 class _Usage:
     def __init__(self, i, o):
         self.prompt_token_count, self.candidates_token_count = i, o
@@ -331,7 +331,7 @@ with tuned(**PRICING):
     g._daily = {"2026-08-01": {"reads": 2 * FREE}}
     check("the same reads in ONE day are half billable",
           abs(g.snapshot()["firebase"]["usd"] - 0.03) < 1e-9, g.snapshot()["firebase"]["usd"])
-    check("a month-total free tier would have said $0 here — it does not",
+    check("a month-total free tier would have said $0 here; it does not",
           g.snapshot()["firebase"]["usd"] > 0)
 
     g = fresh()
@@ -398,7 +398,7 @@ with tuned(**PRICING):
 
 
 # ── [J] tier 2 ───────────────────────────────────────────────────────────────
-print("\n[J] The BigQuery invoice is display only — it must never move the ladder")
+print("\n[J] The BigQuery invoice is display only; it must never move the ladder")
 class _Bill:
     ok = True
     invoice_month = "202608"
@@ -494,7 +494,7 @@ with tuned(**PRICING):
 
 
 # ── [N] the proxies ──────────────────────────────────────────────────────────
-print("\n[N] data/firebase_guard.py — metering and gating the real Firestore/Storage handles")
+print("\n[N] data/firebase_guard.py: metering and gating the real Firestore/Storage handles")
 from data import firebase_guard as fg  # noqa: E402
 
 
@@ -628,7 +628,7 @@ with tuned(**PRICING):
         # is not gated — a frozen bot can still hand out URLs whose egress bills.
         signed_ok = raises(lambda: bucket.blob("x").generate_signed_url()) is False
         print(f"  NOTE  signed-URL issuing is NOT gated at FROZEN "
-              f"({'still allowed' if signed_ok else 'refused'}) — egress it "
+              f"({'still allowed' if signed_ok else 'refused'}), egress it "
               f"authorises is billed but unmetered here")
 
 

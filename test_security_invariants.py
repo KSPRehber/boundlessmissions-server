@@ -37,7 +37,7 @@ def read(path):
 
 # ── (A) SOURCE GUARDS ─────────────────────────────────────────────────────────
 
-print("\n[A1] CRITICAL — FlagTransfer.cs no longer trusts sender url/ext")
+print("\n[A1] CRITICAL: FlagTransfer.cs no longer trusts sender url/ext")
 ft = read(os.path.join(MOD, "FlagTransfer.cs"))
 m = re.search(r"private static bool TryInstallFlagNode\(ConfigNode fn\)(.*?)\n        \}",
               ft, re.S)
@@ -52,14 +52,14 @@ check("SafeFlagExt helper exists and clamps to FLAG_EXTS",
 check("InstallOneFlag has a GameData containment guard",
       "refusing flag write outside GameData" in ft or "GetFullPath(GameDataRoot)" in ft)
 
-print("\n[A2] HIGH — CraftInstaller.cs sanitizes the server-supplied filename")
+print("\n[A2] HIGH: CraftInstaller.cs sanitizes the server-supplied filename")
 ci = read(os.path.join(MOD, "CraftInstaller.cs"))
 check("SanitizeCraftFileName helper exists", "private static string SanitizeCraftFileName" in ci)
 check("Install() calls SanitizeCraftFileName", "SanitizeCraftFileName(craftFileName)" in ci)
 check("old unsanitized 'safeName = craftFileName;' assignment is gone",
       "string safeName = craftFileName;" not in ci)
 
-print("\n[A3] Upload split — craft/vessel/gift/marketplace objects are PRIVATE")
+print("\n[A3] Upload split: craft/vessel/gift/marketplace objects are PRIVATE")
 contracts = read(os.path.join(BOT, "data", "contracts.py"))
 imports = read(os.path.join(BOT, "data", "imports.py"))
 mkt = read(os.path.join(BOT, "data", "marketplace.py"))
@@ -125,7 +125,7 @@ def sanitize_craft_filename(name):
     return name or "received_craft.craft"
 
 
-print("\n[B1] SafeFlagExt spec — dangerous extensions are refused")
+print("\n[B1] SafeFlagExt spec: dangerous extensions are refused")
 check("dll -> png", safe_flag_ext("dll") == "png")
 check("cfg -> png", safe_flag_ext("cfg") == "png")
 check(".DLL (dot/case) -> png", safe_flag_ext(".DLL") == "png")
@@ -133,7 +133,7 @@ check("empty -> png", safe_flag_ext("") == "png")
 check("png stays png", safe_flag_ext("png") == "png")
 check("dds (real texture) stays dds", safe_flag_ext("dds") == "dds")
 
-print("\n[B2] SanitizeCraftFileName spec — traversal/rooting collapse to a basename")
+print("\n[B2] SanitizeCraftFileName spec: traversal/rooting collapse to a basename")
 check("../../ traversal -> basename", sanitize_craft_filename("../../../../evil.craft") == "evil.craft")
 check("windows \\..\\ traversal -> basename",
       sanitize_craft_filename("..\\..\\evil.craft") == "evil.craft")

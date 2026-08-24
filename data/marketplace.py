@@ -56,6 +56,7 @@ def create_listing(
     ls_endurance_days: float = 0.0,
     ls_crew_capacity: int = 0,
     custom_textures: bool = False,
+    craft_hashes: list[str] | None = None,
 ) -> ListingData:
     lid = uuid.uuid4().hex[:12]
     now = datetime.utcnow().isoformat()
@@ -105,6 +106,14 @@ def create_listing(
         # made before the flag existed; those fall back to the mod row
         # (see _has_custom_textures).
         "custom_textures": bool(custom_textures),
+        # Fingerprints of the craft file, as "exact:<sha>" / "design:<sha>" /
+        # "parts:<sha>" (see data/craft_bans.py). Stored so a craft ban can find
+        # every listing that IS the banned craft with one array-contains query —
+        # the alternative, hashing at ban time, means downloading every craft in
+        # the market. Empty for listings made before fingerprinting existed;
+        # those are matched only when a moderator bans from the listing itself,
+        # which hashes that one file on demand.
+        "craft_hashes": list(craft_hashes or []),
         "status": ACTIVE,
         "created_at": now,
         # Vote tallies. These are *derived* counters kept in step with the per-user
@@ -165,6 +174,18 @@ def list_by_buyer(buyer_id: int) -> list[ListingData]:
     return [
         doc.to_dict()
         for doc in _col().where("buyers", "array_contains", str(buyer_id)).stream()
+    ]
+
+
+def list_by_hash(entry: str) -> list[ListingData]:
+    """Every listing whose craft carries this "kind:hash" fingerprint, any status.
+
+    One array-contains query rather than a scan: issuing a ban has to sweep the
+    market, and a market that has to be read whole to be swept is one that stops
+    being swept once it is big enough to matter."""
+    return [
+        doc.to_dict()
+        for doc in _col().where("craft_hashes", "array_contains", entry).stream()
     ]
 
 

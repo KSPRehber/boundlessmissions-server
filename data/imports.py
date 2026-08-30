@@ -14,6 +14,8 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from firebase_admin import firestore
+
 from data.store import _db, _storage_bucket, safe_filename, upload_private
 
 log = logging.getLogger(__name__)

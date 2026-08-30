@@ -37,8 +37,20 @@ imp._storage_bucket = bucket
 store_mod._storage_bucket = bucket
 queues = FakeQueues()
 imp._col = queues
+class _FakeTxn:
+    """Stand-in for google.cloud.firestore Transaction: enough for the real
+    firestore.transactional decorator to run _claim against FakeQueues."""
+    _read_only = False
+    _max_attempts = 1
+    _id = None
+    in_progress = False
+    def _begin(self, retry_id=None): self.in_progress = True
+    def _commit(self): self.in_progress = False; return []
+    def _rollback(self): self.in_progress = False
+    def _clean_up(self): pass
+    def update(self, ref, data, **kw): ref.update(data)
 class _DB:
-    def transaction(self): return object()
+    def transaction(self): return _FakeTxn()
 imp._db = _DB()
 corps._get_corp = lambda gid, rid: {"owner_name": "Friend", "guild_id": str(gid)}
 async def _no_ban(*a, **k): return None
@@ -144,7 +156,7 @@ async def main():
     section("controls")
     bucket.objects.clear()
     await send_vessel()
-    iid = queues.entries("100", "9002")[0]["import_id"]
+    iid = [e for e in queues.entries("100", "9002") if e["status"] == "offered"][-1]["import_id"]
     r1 = await api_server.craft_gift_accept(iid, user=THIRD)
     r2 = await api_server.craft_import_done(iid, user=THIRD)
     check("a third party cannot accept or ack another user's offer by id",

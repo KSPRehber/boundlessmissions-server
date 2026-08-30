@@ -149,13 +149,37 @@ def _has_selected(guild_id: int, week_key: str, user_id: int, mission_id: int) -
     return _selection_ref(guild_id, week_key, user_id, mission_id).get().exists
 
 
-def _save_selection(guild_id: int, week_key: str, user_id: int, mission_id: int):
-    _selection_ref(guild_id, week_key, user_id, mission_id).set({
-        "user_id": str(user_id),
-        "mission_id": mission_id,
-        "selected_at": datetime.now(TZ).isoformat(),
-        "status": "active",
-    })
+def _save_selection(guild_id: int, week_key: str, user_id: int, mission_id: int) -> bool:
+    """Record the selection — and CLAIM it.
+
+    The document is created with `create()`, which fails when it already exists,
+    so two requests for the same (week, player, mission) that both passed
+    `_has_selected` cannot both get through: the second returns False and must
+    not create a contract. Both selection paths (the KSP endpoint and the Discord
+    button) call this *before* the contract is created, so the claim is the
+    guard rather than a note written after the fact. Returns True when this call
+    made the claim.
+    """
+    from google.api_core.exceptions import AlreadyExists
+    try:
+        _selection_ref(guild_id, week_key, user_id, mission_id).create({
+            "user_id": str(user_id),
+            "mission_id": mission_id,
+            "selected_at": datetime.now(TZ).isoformat(),
+            "status": "active",
+        })
+    except AlreadyExists:
+        return False
+    return True
+
+
+def _release_selection(guild_id: int, week_key: str, user_id: int, mission_id: int) -> None:
+    """Undo a claim whose contract never got created, so the player can retry."""
+    try:
+        _selection_ref(guild_id, week_key, user_id, mission_id).delete()
+    except Exception as exc:  # noqa: BLE001 - best effort; the claim is a stale row at worst
+        log.warning("Could not release weekly selection %s/%s/%s: %s",
+                    week_key, user_id, mission_id, exc)
 
 
 # ── Embed builder ────────────────────────────────────────────────────────────
@@ -255,7 +279,7 @@ async def _handle_selection(interaction: discord.Interaction, week_key: str, gui
         await interaction.followup.send(t(guild_id, "wm.no_corp"), ephemeral=True)
         return
 
-    # Already selected?
+    # Already selected? The read is the friendly answer; the claim below is the gate.
     if _has_selected(guild_id, week_key, uid, mission["id"]):
         await interaction.followup.send(t(guild_id, "wm.already"), ephemeral=True)
         return
@@ -270,6 +294,13 @@ async def _handle_selection(interaction: discord.Interaction, week_key: str, gui
             await interaction.followup.send("❌ Corp channel not found.", ephemeral=True)
             return
 
+    # Claim the selection BEFORE creating the contract: everything above awaited
+    # Discord, and two presses of the button that both passed `_has_selected`
+    # would otherwise each create a contract for one mission.
+    if _save_selection(guild_id, week_key, uid, mission["id"]) is False:
+        await interaction.followup.send(t(guild_id, "wm.already"), ephemeral=True)
+        return
+
     desc = mission["desc_en"]
     sym = settings.CURRENCY_SYMBOL
 
@@ -279,17 +310,21 @@ async def _handle_selection(interaction: discord.Interaction, week_key: str, gui
     _, week_end = _week_bounds(now)
     due = (week_end - timedelta(days=1)).strftime("%Y-%m-%d")
 
-    c = cdb.create_contract(
-        guild_id=guild_id,
-        issuer_id=interaction.client.user.id,
-        issuer_name="Boundless Missions",
-        contractor_id=uid,
-        contractor_name=interaction.user.display_name,
-        mission=desc,
-        payment=mission["coins"],
-        fine=mission["fine"],
-        due_date=due,
-    )
+    try:
+        c = cdb.create_contract(
+            guild_id=guild_id,
+            issuer_id=interaction.client.user.id,
+            issuer_name="Boundless Missions",
+            contractor_id=uid,
+            contractor_name=interaction.user.display_name,
+            mission=desc,
+            payment=mission["coins"],
+            fine=mission["fine"],
+            due_date=due,
+        )
+    except Exception:
+        _release_selection(guild_id, week_key, uid, mission["id"])
+        raise
 
     # Build embed for corp channel
     embed = discord.Embed(
@@ -309,9 +344,6 @@ async def _handle_selection(interaction: discord.Interaction, week_key: str, gui
     view = ContractWorkView(c["contract_id"], guild_id)
     msg = await channel.send(embed=embed, view=view)
     cdb.update_contract(guild_id, c["contract_id"], dm_message_id=str(msg.id), status=cdb.ACTIVE)
-
-    # Save selection ONLY after everything succeeded
-    _save_selection(guild_id, week_key, uid, mission["id"])
 
     await interaction.followup.send(
         t(guild_id, "wm.accepted", n=mission["id"], channel=channel.mention),

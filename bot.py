@@ -169,6 +169,7 @@ class GeneKermanBot(commands.Bot):
             "cogs.weeklymissions",
             "cogs.roles",
             "cogs.ksp_bridge",
+            "cogs.account",
             "cogs.marketplace",   # tombstone only — the marketplace is the website's
             "cogs.contractcraft",
             "cogs.tickets",

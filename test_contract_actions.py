@@ -5,25 +5,34 @@ the decisions the module makes, not the plumbing under it.
 """
 import asyncio
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import contract_actions as ca
+import rewards
 import settings
 from data import contracts as cdb
 import api_server
 
 BOT = 999
 GID = 1
-ISSUER = 100
-CONTRACTOR = 200
-STRANGER = 300
+# Account ids are strings — the real store has always keyed on `str(user_id)`, and
+# since accounts a website sign-up's id is not numeric at all. The ints these used
+# to be were only ever cosmetic.
+ISSUER = "100"
+CONTRACTOR = "200"
+STRANGER = "300"
 
 DB = {}
 BAL = {}
 EVENTS = []
+# user id → {creditor id → amount owed}; "" is a bot-issued fine with no creditor.
+DEBT = {}
+# (user id, amount) for every credit flagged as earnings, so a test can assert that
+# a refund was not one.
+GARNISHABLE = []
 
 
 def _mk(status=cdb.PENDING, **over):
@@ -50,18 +59,58 @@ def _update(gid, cid, **fields):
 cdb.update_contract = _update
 
 
+from data import store as real_store
+
+
 class _Store:
-    async def add_balance(self, gid, uid, amt):
+    """Keys on str(uid), exactly as data/store.py does.
+
+    The ledger kwargs (`category` / `detail` / `counterparty`) are accepted and
+    ignored: what they record is tested in test_debt.py against the real store,
+    while what matters here is which credits are flagged garnishable. Accepting
+    them is not optional though — every money call in contract_actions passes
+    them now, so a stub without them fails with a TypeError rather than a
+    meaningful assertion.
+    """
+
+    # Real module constants, not copies: a category renamed in the store must not
+    # keep passing here against a stale duplicate.
+    TX_OTHER = real_store.TX_OTHER
+    TX_CONTRACT_PAYMENT = real_store.TX_CONTRACT_PAYMENT
+    TX_CONTRACT_REFUND = real_store.TX_CONTRACT_REFUND
+    TX_CONTRACT_FINE = real_store.TX_CONTRACT_FINE
+    TX_FINE_RECEIVED = real_store.TX_FINE_RECEIVED
+    tx_detail = staticmethod(real_store.tx_detail)
+
+    async def add_balance(self, gid, uid, amt, *, garnishable=False,
+                          category="", detail="", counterparty=""):
+        uid = str(uid)
         BAL[uid] = BAL.get(uid, 0) + amt
+        # Mirror the real store closely enough to catch a caller that garnishes a
+        # refund: the tests assert on which credits were flagged, not on the split.
+        if garnishable and amt > 0:
+            GARNISHABLE.append((uid, amt))
         return BAL[uid]
 
-    async def try_debit(self, gid, uid, amt):
+    def debt_total(self, gid, uid):
+        return sum(DEBT.get(str(uid), {}).values())
+
+    async def add_debt(self, gid, uid, creditor_id, amount):
+        d = DEBT.setdefault(str(uid), {})
+        d[str(creditor_id or "")] = d.get(str(creditor_id or ""), 0) + amount
+        return sum(d.values())
+
+    async def try_debit(self, gid, uid, amt, *, category="", detail="",
+                        counterparty=""):
+        uid = str(uid)
         if BAL.get(uid, 0) < amt:
             return False
         BAL[uid] -= amt
         return True
 
-    async def debit_up_to(self, gid, uid, amt):
+    async def debit_up_to(self, gid, uid, amt, *, category="", detail="",
+                          counterparty=""):
+        uid = str(uid)
         take = min(BAL.get(uid, 0), amt)
         BAL[uid] = BAL.get(uid, 0) - take
         return take
@@ -88,6 +137,17 @@ api_server._deliver_rescue_craft = _deliver
 api_server._restore_issuer_vessel = _restore
 
 
+# XP is a cross-module effect like the rescue hand-offs above: this file checks
+# that approving awards it, not what `rewards` does with it (see test_rewards.py).
+async def _grant_xp(gid, uid, amount, *, reason=""):
+    if amount > 0:
+        EVENTS.append(("xp", uid, amount))
+    return amount, False
+
+
+ca.rewards.grant_xp = _grant_xp
+
+
 # ── assertions ───────────────────────────────────────────────────────────────
 FAILED = []
 
@@ -101,7 +161,7 @@ def check(label, cond, detail=""):
 
 
 async def main():
-    global BAL, EVENTS
+    global BAL, EVENTS, DEBT, GARNISHABLE
 
     print("\naccept")
     _mk()
@@ -126,9 +186,15 @@ async def main():
     check("no refund was paid on that refusal", BAL.get(ISSUER, 0) == 0)
     r = await ca.cancel(GID, "c1", actor_id=STRANGER, actor_name="Nosy")
     check("a stranger cannot cancel", not r.ok and r.code == ca.FORBIDDEN)
+    DEBT.clear()
     r = await ca.cancel(GID, "c1", actor_id=ISSUER, actor_name="Issuer")
     check("issuer can withdraw an active contract", r.ok and DB["c1"]["status"] == cdb.CANCELLED)
     check("escrow refunded once", BAL.get(ISSUER) == 100, BAL)
+    # Withdrawing after the contractor accepted is not free: the agreed fine goes
+    # to the contractor (here the issuer had nothing on hand, so it is a debt).
+    check("issuer owes the contractor the withdrawal fine",
+          DEBT.get(str(ISSUER), {}).get(str(CONTRACTOR)) == 40
+          and r.data.get("fine_owed") == 40, (DEBT, r.data))
     r = await ca.cancel(GID, "c1", actor_id=ISSUER, actor_name="Issuer")
     check("cancelling twice is refused", not r.ok and r.code == ca.BAD_STATE)
     check("no second refund", BAL.get(ISSUER) == 100, BAL)
@@ -145,32 +211,63 @@ async def main():
     check("a bot issuer is never credited", BAL.get(BOT, 0) == 0, BAL)
 
     print("\ngive_up")
+    # Backing out used to be refused outright when the contractor could not cover the
+    # fine, which left the contract ACTIVE with no exit — while submitting junk and
+    # waiting out the dispute clock took the same partial amount three days later.
     _mk(status=cdb.ACTIVE)
-    BAL = {CONTRACTOR: 10}
+    BAL, DEBT = {CONTRACTOR: 10}, {}
     r = await ca.give_up(GID, "c1", actor_id=CONTRACTOR, actor_name="Contractor")
-    check("give up is refused without the fine", not r.ok and r.code == ca.NO_FUNDS)
-    check("state untouched", DB["c1"]["status"] == cdb.ACTIVE)
-    BAL = {CONTRACTOR: 50}
+    check("give up succeeds without the full fine", r.ok, r.code)
+    check("contract closed anyway", DB["c1"]["status"] == cdb.CANCELLED)
+    check("what they had was taken", BAL[CONTRACTOR] == 0, BAL)
+    check("the shortfall is owed to the issuer",
+          DEBT[str(CONTRACTOR)][str(ISSUER)] == 30, DEBT)
+    check("the issuer got escrow + what was collected", BAL[ISSUER] == 110, BAL)
+    check("only the fine half was garnishable",
+          GARNISHABLE == [(str(ISSUER), 10)], GARNISHABLE)
+
+    print("\ngive_up: a bot fine is owed to nobody")
+    _mk(status=cdb.ACTIVE, issuer_id=str(BOT))
+    BAL, DEBT, GARNISHABLE = {CONTRACTOR: 0}, {}, []
+    await ca.give_up(GID, "c1", actor_id=CONTRACTOR, actor_name="Contractor")
+    check("debt is filed under an empty creditor",
+          DEBT[str(CONTRACTOR)] == {"": 40}, DEBT)
+    check("the bot is never credited", BAL.get(str(BOT), 0) == 0, BAL)
+
+    _mk(status=cdb.ACTIVE)
+    BAL, DEBT, GARNISHABLE = {CONTRACTOR: 50}, {}, []
     r = await ca.give_up(GID, "c1", actor_id=ISSUER, actor_name="Issuer")
     check("the issuer cannot give up", not r.ok and r.code == ca.FORBIDDEN)
     r = await ca.give_up(GID, "c1", actor_id=CONTRACTOR, actor_name="Contractor")
     check("contractor gives up", r.ok and DB["c1"]["status"] == cdb.CANCELLED)
     check("fine debited", BAL[CONTRACTOR] == 10, BAL)
     check("issuer paid fine + escrow", BAL[ISSUER] == 140, BAL)
+    check("no debt when the fine was covered", not DEBT.get(str(CONTRACTOR)), DEBT)
 
     print("\nreview")
     _mk(status=cdb.SUBMITTED)
-    BAL = {}
+    BAL, EVENTS = {}, []
     r = await ca.review(GID, "c1", actor_id=CONTRACTOR, actor_name="C", approve=True)
     check("the contractor cannot approve their own submission",
           not r.ok and r.code == ca.FORBIDDEN)
     check("nothing was paid", BAL == {}, BAL)
+    check("no XP for a refused approval",
+          not [e for e in EVENTS if e[0] == "xp"], EVENTS)
     r = await ca.review(GID, "c1", actor_id=ISSUER, actor_name="Issuer", approve=True)
     check("issuer approves", r.ok and DB["c1"]["status"] == cdb.COMPLETED)
     check("contractor paid", BAL[CONTRACTOR] == 100, BAL)
+    # A player-issued contract earns no XP unless settings.CONTRACT_XP_HUMAN_ISSUED
+    # is on: the issuer is the only judge of the work, and two cooperating accounts
+    # could cycle one contract for unbounded XP and level-up coins (2908 audit, F3).
+    # grant_xp is a no-op for 0, so no "xp" event is the expected shape.
+    xp_expected = rewards.contract_xp(100)
+    check("contractor earned exactly the configured XP (none by default)",
+          (("xp", CONTRACTOR, xp_expected) in EVENTS) == (xp_expected > 0), EVENTS)
     r = await ca.review(GID, "c1", actor_id=ISSUER, actor_name="Issuer", approve=True)
     check("approving twice is refused", not r.ok and r.code == ca.BAD_STATE)
     check("no double payment", BAL[CONTRACTOR] == 100, BAL)
+    check("no double XP",
+          len([e for e in EVENTS if e[0] == "xp"]) == (1 if xp_expected > 0 else 0), EVENTS)
 
     print("\nreview: rescue delivery")
     _mk(status=cdb.SUBMITTED, mission_type=cdb.RESCUE, issuer_vessel_removed=True)
@@ -192,6 +289,13 @@ async def main():
     r = await ca.dispute(GID, "c1", actor_id=CONTRACTOR, actor_name="C", action="pay_fine")
     check("paying the fine twice is refused", not r.ok and r.code == ca.BAD_STATE)
     check("balance unchanged", BAL[CONTRACTOR] == 460, BAL)
+
+    print("\ndispute: conceding is possible while broke")
+    _mk(status=cdb.DISPUTED)
+    BAL, DEBT, GARNISHABLE = {CONTRACTOR: 5}, {}, []
+    r = await ca.dispute(GID, "c1", actor_id=CONTRACTOR, actor_name="C", action="pay_fine")
+    check("pay_fine still closes the contract", r.ok and DB["c1"]["status"] == cdb.COMPLETED)
+    check("the rest is billed", DEBT[str(CONTRACTOR)][str(ISSUER)] == 35, DEBT)
 
     print("\ndispute: rescue is handed back on pay_fine")
     _mk(status=cdb.DISPUTED, mission_type=cdb.RESCUE, issuer_vessel_removed=True)
@@ -379,15 +483,64 @@ async def main():
     check("issuer credited only what was actually collected",
           BAL[ISSUER] == 105, BAL)
 
-    print("\ndispute timeout: a pending request does not pause the clock")
+    print("\ndispute timeout: an unanswered request is not the contractor's fault")
+    # The clock does not pause — but a request the issuer never answered goes to
+    # the moderators rather than to the fine (2908 audit, F8). With no moderator
+    # channel configured (as here), the request is cleared and the clock restarts
+    # exactly once; the second time it runs out, the agreed fine lands.
     _mk(status=cdb.DISPUTED,
         disputed_at=(datetime.utcnow() - timedelta(days=30)).isoformat())
     BAL = {CONTRACTOR: 500}
     await ca.dispute(GID, "c1", actor_id=CONTRACTOR, actor_name="C", action="settle")
     check("a settle request is open", DB["c1"].get("pending_request") is not None)
     r = await ca.expire_dispute(GID, "c1")
-    check("the fine still lands", r.ok and DB["c1"]["status"] == cdb.COMPLETED, r.message)
+    check("an unanswered request is not fined", not r.ok and BAL[CONTRACTOR] == 500
+          and DB["c1"]["status"] == cdb.DISPUTED, r.message)
     check("the request is cleared", DB["c1"].get("pending_request") is None)
+    check("the clock restarted once", DB["c1"].get("request_grace_used") is True)
+    DB["c1"]["disputed_at"] = (datetime.utcnow() - timedelta(days=30)).isoformat()
+    await ca.dispute(GID, "c1", actor_id=CONTRACTOR, actor_name="C", action="settle")
+    r = await ca.expire_dispute(GID, "c1")
+    check("a second unanswered request does not restart it again: the fine lands",
+          r.ok and DB["c1"]["status"] == cdb.COMPLETED, r.message)
+    check("the request is cleared", DB["c1"].get("pending_request") is None)
+
+    print("\noverdue: an unsubmitted contract cannot sit ACTIVE forever")
+    from datetime import timedelta as _td
+    _tz = timezone(timedelta(hours=3))
+    _today = datetime.now(_tz).date()
+    _mk(status=cdb.ACTIVE, due_date="2099-01-01")
+    BAL, DEBT, EVENTS = {}, {}, []
+    r = await ca.expire_overdue(GID, "c1")
+    check("a contract in date is left alone", not r.ok and r.code == ca.BAD_STATE)
+
+    _mk(status=cdb.ACTIVE,
+        due_date=str(_today - _td(days=settings.CONTRACT_OVERDUE_GRACE_DAYS)))
+    r = await ca.expire_overdue(GID, "c1")
+    check("the grace period is honoured", not r.ok and r.code == ca.BAD_STATE, r.message)
+    check("still active", DB["c1"]["status"] == cdb.ACTIVE)
+
+    _mk(status=cdb.ACTIVE,
+        due_date=str(_today - _td(days=settings.CONTRACT_OVERDUE_GRACE_DAYS + 1)))
+    BAL, DEBT, EVENTS = {}, {}, []
+    r = await ca.expire_overdue(GID, "c1")
+    check("past it the contract goes to dispute",
+          r.ok and DB["c1"]["status"] == cdb.DISPUTED, r.message)
+    check("nothing was charged", BAL == {} and DEBT == {}, (BAL, DEBT))
+    check("the auto-fine clock is now running", ca.auto_fine_at(DB["c1"]) is not None)
+    check("both parties were told", len([e for e in EVENTS if e[0] == "notify"]) == 2, EVENTS)
+    r = await ca.expire_overdue(GID, "c1")
+    check("sweeping twice is refused", not r.ok and r.code == ca.BAD_STATE)
+
+    _mk(status=cdb.SUBMITTED, due_date="2000-01-01")
+    r = await ca.expire_overdue(GID, "c1")
+    check("a submitted contract is never swept — that wait is the issuer's",
+          not r.ok and r.code == ca.BAD_STATE)
+
+    _mk(status=cdb.ACTIVE, due_date="")
+    r = await ca.expire_overdue(GID, "c1")
+    check("a contract with no due date is left alone",
+          not r.ok and r.code == ca.BAD_REQUEST)
 
     print("\nmod_resolve")
     _mk(status=cdb.MOD_REVIEW)

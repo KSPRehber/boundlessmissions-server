@@ -11,9 +11,9 @@ failure modes the fixes target:
       must not cache the empty guess.
   [3] Device removal/listing — the approval prompt is reversible: ArrayRemove
       path, metadata cleanup, immediate cache effect.
-  [4] Link-code sweep defense — enough failed guesses burn all outstanding codes.
-  [5] Source guards — missing-Authorization is our 401 (not 422), the WS legacy
-      token path honors suspensions, device reports are ownership-checked, the
+  [4] Link-code brute force — wrong codes lock out the address that sent them (no global purge).
+  [5] Source guards — missing-Authorization is our 401 (not 422), the WS
+      takes tickets only (no ?token= fallback), device reports are ownership-checked, the
       ban listener exists and every verify call site uses the accept list.
 
 Run:  ./.venv/bin/python test_auth_hardening.py
@@ -201,14 +201,22 @@ check("cached set survives an outage read",
       and api_auth.check_device("7", "attacker-device") == "unknown")
 sessions.fail = False
 
-print("\n[2c] trust-on-first-use still works on a healthy empty account")
+print("\n[2c] a healthy empty account requires approval — no silent trust-on-first-use")
 sessions.docs["8"] = {"token_version": 0}
 api_auth._allowed_devices.clear()
-check("first device adopted", api_auth.check_device("8", "firstdev") == "ok")
-check("adoption persisted", "firstdev" in sessions.docs["8"]["allowed_devices"])
-check("adoption recorded metadata",
+# A legacy account with no bound device must NOT adopt the first id it sees —
+# a stolen token would otherwise bind the thief's device with no approval. It
+# reads as unknown, which drives the DM-approval flow; nothing is written yet.
+check("first device NOT auto-adopted", api_auth.check_device("8", "firstdev") == "unknown")
+check("nothing persisted without approval",
+      "firstdev" not in (sessions.docs["8"].get("allowed_devices") or []))
+# Approval (the DM the owner receives and accepts) is what binds it; the
+# device-approval path calls add_allowed_device, modelled here directly.
+api_auth.add_allowed_device("8", "firstdev")
+check("approved device now trusted", api_auth.check_device("8", "firstdev") == "ok")
+check("approval recorded metadata",
       "firstdev" in sessions.docs["8"].get("device_meta", {}))
-check("second device blocked", api_auth.check_device("8", "seconddev") == "unknown")
+check("a different device is still blocked", api_auth.check_device("8", "seconddev") == "unknown")
 
 
 # ── [3] Device removal / listing ─────────────────────────────────────────────
@@ -229,34 +237,37 @@ check("removal is effective immediately (cache)",
       api_auth.check_device("8", "laptopdev") == "unknown")
 check("remaining device still trusted", api_auth.check_device("8", "firstdev") == "ok")
 api_auth.remove_allowed_device("8", "firstdev")
-check("removing the last device re-arms trust-on-first-use",
-      api_auth.check_device("8", "newpc") == "ok"
-      and "newpc" in sessions.docs["8"]["allowed_devices"])
+check("removing the last device does NOT re-arm silent adoption",
+      api_auth.check_device("8", "newpc") == "unknown"
+      and "newpc" not in (sessions.docs["8"].get("allowed_devices") or []))
 
 
 # ── [4] Link-code sweep defense ──────────────────────────────────────────────
 
-print("\n[4] Failed-guess sweep purges outstanding codes")
+print("\n[4] Wrong link codes lock out the address that sent them")
+import types
 import api_server
 
-purges = []
-_real_purge = api_server.purge_all_link_codes
-api_server.purge_all_link_codes = lambda: purges.append(1) or 3
-api_server._FAILED_LINK_GUESSES.clear()
-for _ in range(api_server._LINK_SWEEP_MAX_FAILURES - 1):
-    api_server._note_failed_link_guess()
-check("below threshold: no purge", not purges)
-api_server._note_failed_link_guess()
-check("at threshold: purge fired once", len(purges) == 1)
-check("counter reset after purge", not api_server._FAILED_LINK_GUESSES)
-api_server._note_failed_link_guess()
-check("a lone failure after reset doesn't re-trigger", len(purges) == 1)
-api_server.purge_all_link_codes = _real_purge
+api_server._LINK_FAILURES.clear()
+api_server._RATE_BUCKETS.clear()
+req = lambda ip: types.SimpleNamespace(client=types.SimpleNamespace(host=ip), headers={})
+for _ in range(api_server._LINK_FAIL_MAX - 1):
+    api_server._note_failed_link_guess("10.9.9.9")
+api_server._guard_link_attempt(req("10.9.9.9"))
+check("below threshold: the address may still try", True)
+api_server._note_failed_link_guess("10.9.9.9")
+try:
+    api_server._guard_link_attempt(req("10.9.9.9"))
+    locked = False
+except Exception as exc:
+    locked = getattr(exc, "status_code", None) == 429
+check("at threshold: the address is refused (429)", locked)
+api_server._guard_link_attempt(req("10.9.9.8"))
+check("another address is unaffected", True)
+check("no global purge exists any more", not hasattr(api_server, "_FAILED_LINK_GUESSES"))
 
-print("\n[4b] purge_all_link_codes deletes every outstanding code")
-link_codes.docs = {"111111": {"user_id": "1"}, "222222": {"user_id": "2"}}
-n = api_auth.purge_all_link_codes()
-check("all codes deleted", n == 2 and not link_codes.docs)
+print("\n[4b] the global link-code purge is gone (dead since the per-IP lockout)")
+check("no purge_all_link_codes", not hasattr(api_auth, "purge_all_link_codes"))
 
 
 # ── [5] Source guards ────────────────────────────────────────────────────────
@@ -270,12 +281,14 @@ conf = open(os.path.join(BOT, "config.py"), encoding="utf-8").read()
 check("no required Header(...) left on authorization (401 not 422)",
       'authorization: str = Header(...)' not in api)
 check("every verify call site uses _accept_secrets()",
-      len(re.findall(r"verify_session_token\([^)]*_accept_secrets\(\)", api)) >= 2
-      and "verify_session_token(authorization[7:], _get_api_secret())" not in api)
+      len(re.findall(r"verify_session_token\([^)]*_accept_secrets\(\)", api)) >= 1
+      and "verify_session_token(authorization[7:], _get_api_secret())" not in api
+      and "verify_session_token(token, _get_api_secret())" not in api)
 check("signing still uses the current key only",
       "_get_api_secret(),\n" in api or "_get_api_secret())" in api)
-check("WS legacy token path enforces suspension",
-      re.search(r'query_params\.get\("token".*?suspensions\.get_active', api, re.S) is not None)
+check("WS accepts tickets only (no ?token= fallback that logs the session token)",
+      'websocket.query_params.get("token"' not in api
+      and 'websocket.query_params.get("ticket"' in api)
 check("device report is ownership-checked",
       'target.get("user_id")) != str(user.get("user_id")' in api)
 check("device management endpoints exist behind get_current_user",

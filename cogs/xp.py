@@ -1,16 +1,20 @@
 """
-cogs/xp.py – XP & leveling system.
+cogs/xp.py – XP & leveling commands.
 
-Awards XP for messages, tracks levels, provides rank/leaderboard commands.
+Levels, rank and the leaderboard. XP is no longer earned by talking: the
+message listener that used to award it is gone, and every award now comes from
+something flown — a completed contract, an analysed screenshot, a weekly
+mission — through `rewards.grant_xp`. This cog only reads that state (plus the
+admin setter and the auto-save loop that flushes the store).
 """
 
 import logging
-import random
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
 import settings
+from cogs import targets
 from data.store import store, xp_for_level
 from data import guild_config
 from i18n import t, tp, load_all_langs
@@ -92,65 +96,25 @@ class XP(commands.Cog, name="XP"):
             await store.save_if_dirty()
         log.info("Member scan complete: %d new, %d updated", total_new, total_updated)
 
-    # ── Listener: award XP on message ────────────────────────────────────────
-    @commands.Cog.listener()
-    async def on_message(self, message: discord.Message) -> None:
-        # Ignore bots, DMs, and blacklisted channels
-        if message.author.bot:
-            return
-        if message.guild is None:
-            return
-        if message.channel.id in settings.XP_BLACKLISTED_CHANNELS:
-            return
-
-        # Calculate XP
-        amount = settings.XP_PER_MESSAGE + random.randint(
-            settings.XP_BONUS_MIN, settings.XP_BONUS_MAX
-        )
-
-        # Server boosters get a multiplier
-        if hasattr(message.author, "premium_since") and message.author.premium_since:
-            amount = int(amount * settings.BOOSTER_XP_MULTIPLIER)
-
-        new_xp, new_level, leveled_up = await store.add_xp(
-            message.guild.id, message.author.id, amount
-        )
-
-        if leveled_up and settings.ANNOUNCE_LEVEL_UP:
-            # Award level-up KCoins
-            reward = settings.LEVEL_UP_REWARD
-            new_balance = await store.add_balance(
-                message.guild.id, message.author.id, reward
-            )
-
-            channel = message.channel
-            ch = guild_config.resolve_channel(self.bot, message.guild.id, "level_up")
-            if ch:
-                channel = ch
-
-            gid = message.guild.id
-            embed = discord.Embed(
-                title=t(gid, "xp.level_up.title"),
-                description=t(gid, "xp.level_up.desc",
-                    user=message.author.mention, level=new_level,
-                    xp=f"{new_xp:,}", next_xp=f"{xp_for_level(new_level + 1):,}",
-                    symbol=settings.CURRENCY_SYMBOL, reward=f"{reward:,}",
-                    currency=settings.CURRENCY_NAME, balance=f"{new_balance:,}"),
-                color=discord.Color.gold(),
-            )
-            await channel.send(embed=embed)
-
     # ── /rank ─────────────────────────────────────────────────────────────────
     @app_commands.command(name="rank", description="View your XP rank and level")
-    @app_commands.describe(member="Member to check (defaults to yourself)")
+    @app_commands.describe(member="Member to check (defaults to yourself)",
+                           username=targets.USERNAME_DESC)
+    @targets.username_param
     async def rank(
         self,
         interaction: discord.Interaction,
         member: discord.Member | None = None,
+        username: str | None = None,
     ) -> None:
-        member = member or interaction.user
         gid = interaction.guild_id
-        user = store.get_user(gid, member.id)
+        await interaction.response.defer()
+        try:
+            tgt = await targets.resolve(interaction, member, username, default_self=True)
+        except targets.TargetError as err:
+            await targets.reject(interaction, err)
+            return
+        user = store.get_user(gid, tgt.account_id)
 
         current_level = user["level"]
         current_xp = user["xp"]
@@ -168,16 +132,20 @@ class XP(commands.Cog, name="XP"):
         # Rank position
         all_users = store.leaderboard(gid, limit=9999)
         rank_pos = next(
-            (i + 1 for i, (uid, _) in enumerate(all_users) if uid == str(member.id)),
+            (i + 1 for i, (uid, _) in enumerate(all_users) if uid == tgt.account_id),
             len(all_users),
         )
 
         uid = interaction.user.id
+        colour = discord.Color.blurple()
+        if tgt.member is not None and tgt.member.color.value:
+            colour = tgt.member.color
         embed = discord.Embed(
-            title=tp(gid, uid, "xp.rank.title", name=member.display_name),
-            color=member.color if member.color.value else discord.Color.blurple(),
+            title=tp(gid, uid, "xp.rank.title", name=tgt.label),
+            color=colour,
         )
-        embed.set_thumbnail(url=member.display_avatar.url)
+        if tgt.avatar_url:
+            embed.set_thumbnail(url=tgt.avatar_url)
         embed.add_field(name=tp(gid, uid, "xp.rank.level"), value=f"**{current_level}**", inline=True)
         embed.add_field(name="XP", value=f"`{current_xp:,}`", inline=True)
         embed.add_field(name=tp(gid, uid, "xp.rank.rank"), value=f"#{rank_pos}", inline=True)
@@ -187,16 +155,11 @@ class XP(commands.Cog, name="XP"):
             inline=False,
         )
         embed.add_field(
-            name=tp(gid, uid, "xp.rank.messages"),
-            value=f"`{user['messages']:,}`",
-            inline=True,
-        )
-        embed.add_field(
             name=settings.CURRENCY_NAME,
             value=f"{settings.CURRENCY_SYMBOL} `{user['balance']:,}`",
             inline=True,
         )
-        await interaction.response.send_message(embed=embed)
+        await interaction.followup.send(embed=embed)
 
     # ── /leaderboard ──────────────────────────────────────────────────────────
     @app_commands.command(name="leaderboard", description="View the server XP leaderboard")
@@ -208,13 +171,13 @@ class XP(commands.Cog, name="XP"):
                 t(gid, "xp.lb.empty"), ephemeral=True
             )
             return
+        await targets.prefetch_names(uid for uid, _ in lb)
 
         lines = []
         medals = ["🥇", "🥈", "🥉"]
         for i, (uid, data) in enumerate(lb):
             prefix = medals[i] if i < 3 else f"`{i + 1}.`"
-            member = interaction.guild.get_member(int(uid))
-            name = member.display_name if member else f"User {uid}"
+            name = targets.board_name(interaction.guild, uid)
             lines.append(
                 f"{prefix} **{name}** · Lvl `{data['level']}` · `{data['xp']:,}` XP"
             )
@@ -228,24 +191,34 @@ class XP(commands.Cog, name="XP"):
 
     # ── /setxp (admin) ────────────────────────────────────────────────────────
     @app_commands.command(name="setxp", description="Set a user's XP (Admin only)")
-    @app_commands.describe(member="Target member", amount="XP amount to set")
+    @app_commands.describe(member="Target member", username=targets.USERNAME_DESC,
+                           amount="XP amount to set")
     @app_commands.default_permissions(administrator=True)
     @app_commands.checks.has_permissions(administrator=True)
+    @targets.username_param
     async def setxp(
         self,
         interaction: discord.Interaction,
-        member: discord.Member,
         amount: int,
+        member: discord.Member | None = None,
+        username: str | None = None,
     ) -> None:
         gid = interaction.guild_id
         uid = interaction.user.id
-        await store.set_xp(gid, member.id, amount)
-        user = store.get_user(gid, member.id)
-        await interaction.response.send_message(
-            tp(gid, uid, "xp.setxp.done", name=member.display_name, xp=f"{user['xp']:,}", level=user['level']),
+        await interaction.response.defer(ephemeral=True)
+        try:
+            tgt = await targets.resolve(interaction, member, username)
+        except targets.TargetError as err:
+            await targets.reject(interaction, err)
+            return
+        await store.set_xp(gid, tgt.account_id, amount)
+        user = store.get_user(gid, tgt.account_id)
+        await interaction.followup.send(
+            tp(gid, uid, "xp.setxp.done", name=tgt.label, xp=f"{user['xp']:,}", level=user['level']),
             ephemeral=True,
         )
-        log.info("%s set %s XP to %d", interaction.user, member, amount)
+        log.info("%s set %s (%s) XP to %d",
+                 interaction.user, tgt.label, tgt.account_id, amount)
 
     # ── Error handler ─────────────────────────────────────────────────────────
     async def cog_app_command_error(

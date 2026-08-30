@@ -169,6 +169,86 @@ def _auto_corp_name(member: discord.Member) -> str:
 _ensuring: set[str] = set()
 
 
+def ensure_corp_record_for_account(guild_id, account_id, display_name: str) -> bool:
+    """Give a player with no Discord a corporation — the record, without a channel.
+
+    A corp is two things that had always arrived together: a Firestore record that
+    says this player exists and can be hired, and a private Discord channel their
+    paperwork lands in. A website account can have the first and not the second,
+    and the first is the one that matters — it is what puts them in the in-game
+    player picker (`/api/v1/corps/list`) and what `_get_corp` answers with when
+    somebody offers them a contract. Without it a website player can play but can
+    never be *hired*, which is most of the point of the game.
+
+    `channel_id` is deliberately absent rather than empty: `deliver_to_player`
+    tests it before posting, so a missing key means "no Discord surface" and the
+    delivery falls through to the player's own notification feed, which every
+    caller already writes to alongside. Returns True if a record was created.
+    """
+    aid = str(account_id)
+    try:
+        if _get_corp(int(guild_id), aid):
+            return False
+        now = datetime.datetime.now(datetime.timezone.utc)
+        _save_corp(int(guild_id), aid, {
+            "name": f"{display_name} Space Agency",
+            "owner_id": aid,
+            "owner_name": display_name,
+            # No channel_id and no pin_message_id: there is no channel. See above.
+            "established_at": now.isoformat(),
+            "members": [aid],
+            "web_only": True,
+            # Filled by `sync_web_corp_profile` when they set a picture. Stored as
+            # a bucket path; the picker signs it at serve time.
+            "avatar_url": "",
+        })
+        # The global pointer is what lets `_get_corp` find this corp from any
+        # guild's session, which for an account with no guild of its own is the
+        # only way it is ever found.
+        _set_owner_ptr(aid, int(guild_id), 0, f"{display_name} Space Agency")
+        log.info("Established channel-less corp for website account %s", aid)
+        return True
+    except Exception as exc:
+        # Same contract as `ensure_corp_for_linked_user`: a corp is a convenience,
+        # and failing to make one must never cost the player the link they were
+        # completing.
+        log.warning("Could not establish corp record for %s: %s", aid, exc)
+        return False
+
+
+def sync_web_corp_profile(guild_id, account_id, *, display_name=None,
+                          avatar_url=None) -> bool:
+    """Keep a channel-less corp's cached identity in step with its account.
+
+    A Discord corp needs nothing like this: the picker resolves the live member
+    and its stored `owner_name` is only the fallback for someone who has left. A
+    website account has no member to resolve, so what is stored IS what everyone
+    sees — and it would otherwise be frozen at whatever the name was on the day
+    the corp was made.
+
+    The avatar is kept as a bucket path, not a signed URL: a signed URL expires,
+    and the serve point signs it fresh anyway. Denormalised onto the corp rather
+    than read per-row, so the player picker stays one scan instead of one extra
+    Firestore read per website account on every open.
+    """
+    patch = {}
+    if display_name:
+        patch["owner_name"] = str(display_name)
+    if avatar_url is not None:
+        patch["avatar_url"] = str(avatar_url or "")
+    if not patch:
+        return False
+    try:
+        ref = _get_corp_ref(int(guild_id), str(account_id))
+        if not ref.get().exists:
+            return False
+        ref.set(patch, merge=True)
+        return True
+    except Exception as exc:
+        log.warning("Could not sync corp profile for %s: %s", account_id, exc)
+        return False
+
+
 async def ensure_corp_for_linked_user(bot, guild_id, user_id) -> "discord.TextChannel | None":
     """Give a freshly linked player their corporation, if they haven't got one.
 

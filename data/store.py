@@ -22,6 +22,7 @@ import asyncio
 import logging
 import os
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 import firebase_admin
@@ -169,6 +170,83 @@ def sign_stored(value: str | None, ttl: int = SIGNED_URL_TTL) -> str | None:
         return value
 
 
+# ── Transaction ledger vocabulary ────────────────────────────────────────────
+#
+# The category is the *only* thing that turns a row of numbers into an answer to
+# "what did I spend it on", so the set is closed and lives here rather than being
+# spelled out at each call site — a typo'd category would silently open a new
+# bucket in every summary. Call sites import these names; the UIs render
+# TX_LABELS and are free to not know about a category a newer server has added.
+#
+# The split is by *what happened*, not by which module happened to call: a
+# marketplace sale and a contract payout are both income, but a player asking
+# where their money went needs them apart.
+
+TX_OTHER = "other"                        # untagged — a call site nobody flagged
+TX_CONTRACT_PAYMENT = "contract_payment"  # payout for delivering a contract
+TX_CONTRACT_ESCROW = "contract_escrow"    # payment locked when issuing one
+TX_CONTRACT_REFUND = "contract_refund"    # that escrow coming back
+TX_CONTRACT_FINE = "contract_fine"        # a fine charged for failing one
+TX_FINE_RECEIVED = "fine_received"        # the other side of someone's fine
+TX_DEBT_REPAYMENT = "debt_repayment"      # garnished out of an earning
+TX_MARKET_SALE = "market_sale"            # sold a craft on the marketplace
+TX_MARKET_PURCHASE = "market_purchase"    # bought one
+TX_AUCTION_ESCROW = "auction_escrow"      # bid/listing value locked
+TX_AUCTION_REFUND = "auction_refund"      # that escrow coming back
+TX_TRANSFER_IN = "transfer_in"            # another player sent coins
+TX_TRANSFER_OUT = "transfer_out"          # sent coins to another player
+TX_REWARD = "reward"                      # screenshots, daily rewards, XP levels
+TX_ADMIN = "admin"                        # a moderator/owner correction
+
+# Human labels, so all three front ends name a category the same way. A UI that
+# meets a category not in here should fall back to the raw key rather than hide
+# the row: an unexplained movement is still a movement of the player's money.
+TX_LABELS = {
+    TX_OTHER: "Other",
+    TX_CONTRACT_PAYMENT: "Contract payment",
+    TX_CONTRACT_ESCROW: "Contract escrow",
+    TX_CONTRACT_REFUND: "Contract refund",
+    TX_CONTRACT_FINE: "Contract fine",
+    TX_FINE_RECEIVED: "Fine received",
+    TX_DEBT_REPAYMENT: "Debt repayment",
+    TX_MARKET_SALE: "Marketplace sale",
+    TX_MARKET_PURCHASE: "Marketplace purchase",
+    TX_AUCTION_ESCROW: "Auction escrow",
+    TX_AUCTION_REFUND: "Auction refund",
+    TX_TRANSFER_IN: "Received from player",
+    TX_TRANSFER_OUT: "Sent to player",
+    TX_REWARD: "Reward",
+    TX_ADMIN: "Admin adjustment",
+}
+
+# How many entries the ring buffer holds. The whole user record is re-serialised
+# on every flush, so this is a size budget, not a preference: at roughly 90 bytes
+# an entry, 250 is about 22 KB against Firestore's 1 MiB document limit — room to
+# spare, while still covering months of an ordinary player's activity.
+TX_MAX = 250
+
+# Detail strings are truncated to this. Some are player-supplied (a craft name, a
+# transfer note), so this is a bound on the document, not a formatting choice.
+TX_DETAIL_MAX = 120
+
+
+def tx_detail(text: str, fallback: str = "", limit: int = 60) -> str:
+    """Normalise a free-text ledger detail to one short readable line.
+
+    Shared rather than duplicated because every caller wants the same three things
+    — whitespace collapsed (a mission body is multi-line), a cut at a word boundary
+    rather than mid-sentence, and a fallback when the source text is empty. The
+    store truncates again on write; this cut is what makes that one never fire.
+    """
+    cleaned = " ".join(str(text or "").split())
+    if not cleaned:
+        return fallback
+    if len(cleaned) > limit:
+        head = cleaned[:limit].rsplit(" ", 1)[0]
+        cleaned = (head or cleaned[:limit]) + "…"
+    return cleaned
+
+
 def _default_user() -> UserData:
     """Return a fresh user record with default values."""
     return {
@@ -186,6 +264,43 @@ def _default_user() -> UserData:
         # reward key → unix timestamp of the last payout, for rewards that are
         # capped to one per window (see try_claim_timed_reward).
         "reward_cooldowns": {},
+        # Unpaid contract fines, oldest first: [{"creditor_id": str, "amount": int}].
+        # Lives on the user record rather than in its own collection so the debt and
+        # the balance it is collected from are one document and one flush — a crash
+        # between two writes could otherwise credit a creditor without debiting the
+        # debtor, or the reverse. See `add_debt` / `_garnish_locked`.
+        "debts": [],
+        # Whether corp-channel messages from the bot @-mention this player.
+        # Default on: a message nobody is notified of is one nobody answers, and
+        # every caller of `deliver_to_player` is waiting for a reply. Off is a
+        # deliberate "I read my corp channel myself", so the mention is sent with
+        # allowed_mentions=none rather than removed — the post still says who it
+        # is for, it just does not light up Discord.
+        "corp_pings": True,
+        # Player-issued contracts completed as the contractor, newest last:
+        # [{"peer": issuer id, "t": unix time, "xp": granted}], trimmed to the window. With
+        # `last_contract_xp_at` (unix time of the last XP actually granted from a
+        # player-issued contract) this is what `rewards.human_contract_xp` reads to
+        # apply the cooldown and the per-pair limit. On the user record for the
+        # reason the debts and the ledger are: one document, one flush, no extra
+        # Firestore read on the approval path.
+        "contract_xp_log": [],
+        "last_contract_xp_at": 0.0,
+        # Transaction ledger — the last TX_MAX movements, oldest first, plus
+        # lifetime per-category totals that survive entries rolling off the end.
+        # See the "Transaction ledger" section below for why it lives here.
+        #
+        # Seeded with the opening balance when there is one. `STARTING_BALANCE` is 0
+        # today, which makes this a no-op — but the ledger's whole claim is that its
+        # entries add up to the balance they explain, and money placed in a wallet by
+        # the schema rather than by a call would break that silently the day someone
+        # changed the setting. Cheaper to be right now than to debug later.
+        "tx": ([{"t": round(time.time(), 3), "a": int(settings.STARTING_BALANCE),
+                 "c": TX_REWARD, "d": "Opening balance", "p": ""}]
+               if settings.STARTING_BALANCE else []),
+        "tx_totals": ({TX_REWARD: {"in": int(settings.STARTING_BALANCE),
+                                   "out": 0, "n": 1}}
+                      if settings.STARTING_BALANCE else {}),
     }
 
 
@@ -206,6 +321,29 @@ def level_from_xp(xp: int) -> int:
 
 class UserStore:
     """In-memory store backed by Firestore."""
+
+    # Ledger vocabulary, re-exported on the class so a call site that already has
+    # `store` imported can name a category without a second import of the module.
+    # The module-level constants above stay the definitions; these are aliases, so
+    # there is still exactly one place a category is spelled.
+    TX_OTHER = TX_OTHER
+    TX_CONTRACT_PAYMENT = TX_CONTRACT_PAYMENT
+    TX_CONTRACT_ESCROW = TX_CONTRACT_ESCROW
+    TX_CONTRACT_REFUND = TX_CONTRACT_REFUND
+    TX_CONTRACT_FINE = TX_CONTRACT_FINE
+    TX_FINE_RECEIVED = TX_FINE_RECEIVED
+    TX_DEBT_REPAYMENT = TX_DEBT_REPAYMENT
+    TX_MARKET_SALE = TX_MARKET_SALE
+    TX_MARKET_PURCHASE = TX_MARKET_PURCHASE
+    TX_AUCTION_ESCROW = TX_AUCTION_ESCROW
+    TX_AUCTION_REFUND = TX_AUCTION_REFUND
+    TX_TRANSFER_IN = TX_TRANSFER_IN
+    TX_TRANSFER_OUT = TX_TRANSFER_OUT
+    TX_REWARD = TX_REWARD
+    TX_ADMIN = TX_ADMIN
+    TX_LABELS = TX_LABELS
+    TX_MAX = TX_MAX
+    tx_detail = staticmethod(tx_detail)
 
     def __init__(self) -> None:
         # GLOBAL wallet: user_id (str) -> UserData. Balances/XP/levels are now one
@@ -367,6 +505,15 @@ class UserStore:
             self._mark_dirty(guild_id, user_id)
         return self._users[key]
 
+    def has_user(self, user_id) -> bool:
+        """Whether a record already exists — WITHOUT creating one.
+
+        `get_user` creates a default record as a side effect, so it can never
+        answer this. The whole collection is loaded at boot, so the in-memory dict
+        is the authority here and no read is needed.
+        """
+        return str(user_id) in self._users
+
     def get_all_users(self, guild_id: int) -> dict[str, UserData]:
         """Get all (global) user records. guild_id is ignored."""
         return self._users
@@ -386,28 +533,157 @@ class UserStore:
         log.warning("Deleted global user record %s (existed=%s)", ukey, existed)
         return existed
 
-    # ── XP operations ────────────────────────────────────────────────────────
+    # ── Preferences ──────────────────────────────────────────────────────────
+    #
+    # Account settings that only the *server* can act on, so they cannot live in
+    # the mod's settings.cfg: the @-mention on a corp post is added by the bot, and
+    # a file on the player's disk has no say in it. They ride the user record for
+    # the same reason the debt ledger does — one document, one flush, and no extra
+    # Firestore operation for a value read on every delivery.
 
-    async def add_xp(
-        self, guild_id: int, user_id: int, amount: int
-    ) -> tuple[int, int, bool]:
-        """
-        Add XP to a user. Returns (new_xp, new_level, leveled_up).
-        Respects the cooldown from settings.
-        """
+    # ── Player-contract XP history ───────────────────────────────────────────
+
+    def contract_xp_log(self, guild_id: int, user_id: int,
+                        window_seconds: float) -> list[dict]:
+        """Player-issued contracts this user completed as contractor inside the
+        window: copies of [{"peer": issuer id, "t": unix time}]."""
+        cutoff = time.time() - max(0.0, window_seconds)
+        return [dict(e) for e in (self.get_user(guild_id, user_id).get("contract_xp_log") or [])
+                if float(e.get("t", 0) or 0) >= cutoff]
+
+    def last_contract_xp_at(self, guild_id: int, user_id: int) -> float:
+        return float(self.get_user(guild_id, user_id).get("last_contract_xp_at") or 0.0)
+
+    async def note_contract_completion(self, guild_id: int, user_id: int, peer_id,
+                                       *, xp_granted: int, window_seconds: float,
+                                       now: float | None = None) -> None:
+        """Record that `user_id` completed a player-issued contract from `peer_id`,
+        and — if XP was paid for it — start the cooldown. Entries older than the
+        window are dropped here, so the list stays bounded by what one player can
+        actually complete in a day."""
+        now = time.time() if now is None else now
+        cutoff = now - max(0.0, window_seconds)
         async with self._lock:
             user = self.get_user(guild_id, user_id)
-            now = time.time()
+            log_ = [e for e in (user.get("contract_xp_log") or [])
+                    if float(e.get("t", 0) or 0) >= cutoff]
+            log_.append({"peer": str(peer_id), "t": round(now, 3), "xp": int(xp_granted)})
+            user["contract_xp_log"] = log_
+            if xp_granted > 0:
+                user["last_contract_xp_at"] = round(now, 3)
+            self._mark_dirty(guild_id, user_id)
 
-            # Check cooldown
-            if now - user["last_xp_time"] < settings.XP_COOLDOWN_SECONDS:
-                return user["xp"], user["level"], False
+    async def claim_contract_xp(self, guild_id: int, user_id, peer_id, *,
+                                candidate_xp: int, cooldown_seconds: float,
+                                daily_max: int, pair_free: int,
+                                window_seconds: float,
+                                now: float | None = None) -> tuple[int, str, bool]:
+        """Atomically DECIDE the gated XP for a player-issued contract completion
+        and RECORD it, in one critical section. Returns (granted_xp, gate,
+        flag_pair) — the same triple `rewards.human_contract_xp` used to compute
+        itself from lock-free reads followed by a separate locked write.
 
+        That read-decide-then-write straddled the lock, so two concurrent
+        `review`s for a colluding pair could each read the pre-write state and
+        both pass the cooldown/daily/pair gate — an XP (and, through the level-up
+        reward, coin) mint. It was not exploitable while nothing awaited between
+        the read and the write, but that was an accident of the call graph, not a
+        guarantee (see contract_actions.contract_lock). Folding both into this
+        one lock is the mirror of `try_claim_timed_reward`'s double-spend guard.
+        The gate *policy* stays in rewards; only its atomicity lives here.
+        """
+        # Imported lazily: rewards imports store at module load, so a top-level
+        # import here would be circular. By call time rewards is fully loaded.
+        from rewards import XP_GATE_COOLDOWN, XP_GATE_DAILY, XP_GATE_PAIR
+        now = time.time() if now is None else now
+        cutoff = now - max(0.0, window_seconds)
+        a, b = str(user_id), str(peer_id)
+        xp = int(candidate_xp)
+        gate = ""
+        flag_pair = False
+        async with self._lock:
+            user = self.get_user(guild_id, user_id)
+            my_log = [e for e in (user.get("contract_xp_log") or [])
+                      if float(e.get("t", 0) or 0) >= cutoff]
+            if xp > 0 and cooldown_seconds:
+                last_at = float(user.get("last_contract_xp_at") or 0.0)
+                if now - last_at < cooldown_seconds:
+                    gate = XP_GATE_COOLDOWN
+            if xp > 0 and not gate and daily_max > 0:
+                earned = sum(int(e.get("xp", 0) or 0) for e in my_log)
+                if earned >= daily_max:
+                    gate = XP_GATE_DAILY
+                else:
+                    xp = min(xp, daily_max - earned)
+            if pair_free > 0:
+                peer_rec = self.get_user(guild_id, peer_id)
+                peer_log = [e for e in (peer_rec.get("contract_xp_log") or [])
+                            if float(e.get("t", 0) or 0) >= cutoff]
+                seen = (sum(1 for e in my_log if str(e.get("peer")) == b)
+                        + sum(1 for e in peer_log if str(e.get("peer")) == a))
+                if seen >= pair_free:
+                    # Flag on the first crossing only (see rewards).
+                    flag_pair = seen == pair_free
+                    if xp > 0 and not gate:
+                        gate = XP_GATE_PAIR
+            if gate:
+                xp = 0
+            # Record the completion in the SAME lock that decided it — this is
+            # note_contract_completion inlined so no await separates them.
+            my_log.append({"peer": b, "t": round(now, 3), "xp": int(xp)})
+            user["contract_xp_log"] = my_log
+            if xp > 0:
+                user["last_contract_xp_at"] = round(now, 3)
+            self._mark_dirty(guild_id, user_id)
+        return xp, gate, flag_pair
+
+    def corp_pings_enabled(self, guild_id: int, user_id: int) -> bool:
+        """Whether corp-channel deliveries should @-mention this player.
+
+        Deliberately reads the dict directly instead of `get_user`: this is asked
+        on every delivery, including ones aimed at an account with no record yet,
+        and `get_user` would mint one as a side effect. Absent means on — the
+        default the schema carries, and the safe answer for a delivery that
+        someone is expected to reply to.
+        """
+        rec = self._users.get(str(user_id))
+        return True if rec is None else bool(rec.get("corp_pings", True))
+
+    async def set_corp_pings(self, guild_id: int, user_id: int, enabled: bool) -> bool:
+        """Set the corp-ping preference. Returns the value now stored."""
+        async with self._lock:
+            user = self.get_user(guild_id, user_id)
+            user["corp_pings"] = bool(enabled)
+            self._mark_dirty(guild_id, user_id)
+            return user["corp_pings"]
+
+    # ── XP operations ────────────────────────────────────────────────────────
+
+    async def award_xp(
+        self, guild_id: int, user_id: int, amount: int
+    ) -> tuple[int, int, bool]:
+        """Award earned XP. Returns (new_xp, new_level, leveled_up).
+
+        The whole read-modify-write happens under the lock. That is the point of
+        this method: the award sites used to do `set_xp(get_user()["xp"] + n)`,
+        where the read sat OUTSIDE the lock `set_xp` then took, so two awards
+        landing together silently lost one.
+
+        There is deliberately no cooldown. Every caller is a discrete thing the
+        player earned — a completed contract, an analysed screenshot — not a
+        stream of chat messages to be damped, and dropping one would be dropping
+        the reward for the work rather than throttling a farm.
+
+        `set_xp` stays what it says it is: the admin setter.
+        """
+        if amount <= 0:
+            user = self.get_user(guild_id, user_id)
+            return user["xp"], user["level"], False
+
+        async with self._lock:
+            user = self.get_user(guild_id, user_id)
             old_level = user["level"]
             user["xp"] += amount
-            user["messages"] += 1
-            user["last_xp_time"] = now
-
             new_level = level_from_xp(user["xp"])
             user["level"] = new_level
             self._mark_dirty(guild_id, user_id)
@@ -422,23 +698,395 @@ class UserStore:
             user["level"] = level_from_xp(user["xp"])
             self._mark_dirty(guild_id, user_id)
 
-    async def add_balance(self, guild_id: int, user_id: int, amount: int) -> int:
+    # ── Debt & garnishment ───────────────────────────────────────────────────
+    #
+    # An unpayable contract fine is not forgiven; the remainder is recorded as a debt
+    # to the issuer and repaid out of a share of the debtor's later *earnings*. The
+    # design notes that matter:
+    #
+    #  • **Earnings, not credits.** Garnishment is opt-in per call site
+    #    (`garnishable=True`), never a blanket hook on `add_balance`. Roughly half of
+    #    this codebase's credits are refunds and admin corrections — auction escrow
+    #    coming back, a marketplace double-buy refund, an owner-console balance fix,
+    #    and `/take`, which passes a *negative* amount. Skimming those would confiscate
+    #    a player's own money. The default is therefore off, so a call site nobody
+    #    flagged repays a debt slower rather than stealing from its owner.
+    #
+    #  • **The rate scales with the amount owed, not the number of creditors.** Owing
+    #    two people a little is not worse than owing one person a lot, and a count-based
+    #    rate is gameable from both ends — an issuer with an alt could split one
+    #    contract in two to push a debtor into a higher bracket.
+    #
+    #  • **Splitting is pro-rata with a largest-remainder rule.** The wallet is an
+    #    integer, so a naive share leaves dust that never clears and garnishes someone
+    #    who has effectively paid; `DEBT_FORGIVE_BELOW` sweeps what is left.
+    #
+    #  • **A bot-issued contract has no creditor.** `_pay_issuer` already skips paying
+    #    the bot ("no wallet to pay into"), so those debts carry `creditor_id == ""`:
+    #    still collected, because the deterrent is the point, but paid to nobody.
+
+    # ── Transaction ledger ───────────────────────────────────────────────
+    #
+    # Every movement of a wallet is recorded here, so a player can be shown what
+    # they spent money on and what they earned it from. Four decisions shape it.
+    #
+    #  • **It lives on the user document**, as a capped list, rather than in a
+    #    `transactions` subcollection. The store already buffers writes and flushes
+    #    the whole record with `batch.set` every few minutes, so a ledger on the
+    #    record rides that flush and costs **no additional Firestore write** — where
+    #    a subcollection would cost one write per movement, on a project whose
+    #    `cost_guard` exists because that bill is the thing being defended against.
+    #    Reading a history is likewise the read the profile already does.
+    #
+    #  • **The list is a ring buffer and the totals are not.** A capped list is what
+    #    keeps the document small (Firestore's limit is 1 MiB, and this record is
+    #    rewritten in full on every flush), but a cap means old entries fall off the
+    #    end — so a summary computed by summing the list would quietly start
+    #    shrinking. `tx_totals` is therefore a set of running lifetime counters
+    #    updated at the same moment, and it is what the summary and the category
+    #    breakdown are built from; the list is only ever the recent detail.
+    #
+    #  • **The recorded amount is the delta that actually happened**, read off the
+    #    balance either side of the change, never the amount the caller asked for.
+    #    `add_balance` clamps at zero, so a deduction larger than the balance moves
+    #    less than it was given — a ledger that recorded the request would fail to
+    #    add up to the balance it claims to explain, which is the one property that
+    #    makes it worth showing at all.
+    #
+    #  • **An untagged call is recorded, not dropped.** `category` defaults to
+    #    OTHER rather than being required, so a call site nobody thought to tag
+    #    shows up as an unexplained movement the player can still see, instead of
+    #    a gap that makes the running total disagree with the wallet.
+    #
+    # Keys are short (`t`, `a`, `c`, `d`, `p`) because up to TX_MAX of them are
+    # serialised into the user document on every save.
+
+    @staticmethod
+    def _record_locked(user: UserData, amount: int, category: str,
+                       detail: str = "", counterparty: str = "") -> None:
+        """Append one movement to `user`'s ledger and fold it into the totals.
+
+        **Must be called with `self._lock` held** and *after* the balance has been
+        changed, with `amount` being the delta that actually landed. A zero delta is
+        not recorded: it explains nothing and would push a real entry off the end.
+        """
+        if not amount:
+            return
+
+        cat = str(category or TX_OTHER)
+        entries = user.setdefault("tx", [])
+        entries.append({
+            "t": round(time.time(), 3),
+            "a": int(amount),
+            "c": cat,
+            # Truncated rather than trusted: some details are player-supplied
+            # (a craft name, a transfer note) and this is written to a document
+            # with a size limit.
+            "d": str(detail or "")[:TX_DETAIL_MAX],
+            "p": str(counterparty or "")[:64],
+        })
+        if len(entries) > TX_MAX:
+            del entries[:len(entries) - TX_MAX]
+
+        totals = user.setdefault("tx_totals", {})
+        bucket = totals.get(cat)
+        if not isinstance(bucket, dict):
+            bucket = {"in": 0, "out": 0, "n": 0}
+            totals[cat] = bucket
+        if amount > 0:
+            bucket["in"] = int(bucket.get("in", 0)) + int(amount)
+        else:
+            bucket["out"] = int(bucket.get("out", 0)) + int(-amount)
+        bucket["n"] = int(bucket.get("n", 0)) + 1
+
+    def list_transactions(self, guild_id: int, user_id: int, *,
+                          limit: int = 50, offset: int = 0,
+                          category: str = "") -> list[dict]:
+        """Recent movements, **newest first** — the order every UI renders.
+
+        Stored oldest-first (an append is cheaper than an insert), so this reverses.
+        Returns copies: a caller renders these, and must not be able to edit the
+        ledger by editing what it was handed.
+        """
+        entries = self.get_user(guild_id, user_id).get("tx") or []
+        if category:
+            entries = [e for e in entries if str(e.get("c", "")) == category]
+        entries = list(reversed(entries))
+        offset = max(0, offset)
+        limit = max(0, limit)
+        return [dict(e) for e in entries[offset:offset + limit]]
+
+    def transaction_count(self, guild_id: int, user_id: int,
+                          category: str = "") -> int:
+        """How many entries the ledger is *holding* — for paging the list.
+
+        Not a lifetime count: that is `tx_totals[cat]["n"]`, which keeps counting
+        after an entry has rolled off the end of the ring buffer.
+        """
+        entries = self.get_user(guild_id, user_id).get("tx") or []
+        if category:
+            return sum(1 for e in entries if str(e.get("c", "")) == category)
+        return len(entries)
+
+    def transaction_totals(self, guild_id: int, user_id: int) -> dict[str, dict]:
+        """Lifetime in/out/count per category. Copies, for the same reason as above."""
+        totals = self.get_user(guild_id, user_id).get("tx_totals") or {}
+        out: dict[str, dict] = {}
+        for cat, b in totals.items():
+            if not isinstance(b, dict):
+                continue
+            out[str(cat)] = {
+                "in": int(b.get("in", 0) or 0),
+                "out": int(b.get("out", 0) or 0),
+                "n": int(b.get("n", 0) or 0),
+            }
+        return out
+
+    def transaction_series(self, guild_id: int, user_id: int,
+                           days: int = 14) -> list[dict]:
+        """Daily in/out/net over the last `days` days, oldest first — the graph.
+
+        Built from the ring buffer, so it is only as complete as the buffer is: a
+        very busy player's window can be shorter than `days`. Every day in the range
+        is emitted, zeros included, because a bar chart that silently omits quiet
+        days draws a misleading shape — the gaps are the information.
+
+        Days are UTC calendar days, matching the timestamps as stored; no attempt is
+        made to guess the player's timezone, which the server does not know.
+        """
+        days = max(1, min(365, days))
+        now = time.time()
+        # Midnight UTC today, then step back day by day. Integer arithmetic on the
+        # epoch is exact here: UTC has no DST, so every day is 86400s long.
+        day_len = 86400
+        today_start = (int(now) // day_len) * day_len
+        first_start = today_start - (days - 1) * day_len
+
+        buckets = {first_start + i * day_len: {"in": 0, "out": 0} for i in range(days)}
+        for e in self.get_user(guild_id, user_id).get("tx") or []:
+            try:
+                ts = float(e.get("t", 0) or 0)
+                amount = int(e.get("a", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if ts < first_start or not amount:
+                continue
+            key = (int(ts) // day_len) * day_len
+            b = buckets.get(key)
+            if b is None:
+                continue
+            if amount > 0:
+                b["in"] += amount
+            else:
+                b["out"] += -amount
+
+        return [
+            {
+                "day": datetime.fromtimestamp(k, tz=timezone.utc).strftime("%Y-%m-%d"),
+                "ts": k,
+                "in": v["in"],
+                "out": v["out"],
+                "net": v["in"] - v["out"],
+            }
+            for k, v in sorted(buckets.items())
+        ]
+
+    @staticmethod
+    def _garnish_percent(total_debt: int) -> int:
+        """The share of an earning taken, scaled by how much is owed in total."""
+        base = max(0, min(100, settings.DEBT_GARNISH_PERCENT))
+        top = max(base, min(100, settings.DEBT_GARNISH_PERCENT_MAX))
+        at = max(1, settings.DEBT_GARNISH_ESCALATE_AT)
+        return top if total_debt >= at else base
+
+    @staticmethod
+    def _debt_total(user: UserData) -> int:
+        return sum(max(0, int(d.get("amount", 0))) for d in user.get("debts") or [])
+
+    def _garnish_locked(self, guild_id: int, user: UserData, user_id: int,
+                        gross: int) -> list[tuple[str, int]]:
+        """Take the garnishable share of `gross` off `user` and pay their creditors.
+
+        **Must be called with `self._lock` held**, and does not take it itself — the
+        skim has to be part of the same critical section as the credit that triggered
+        it, or a concurrent spend takes the coins in between. Creditor records are
+        mutated directly for the same reason (`add_balance` would deadlock on the
+        non-reentrant lock). Returns the (creditor_id, amount) pairs actually paid so
+        the caller can tell the player what happened.
+        """
+        debts = user.get("debts") or []
+        total = self._debt_total(user)
+        if gross <= 0 or total <= 0:
+            return []
+
+        rate = self._garnish_percent(total)
+        take = min(total, user["balance"], (gross * rate) // 100)
+        if take <= 0:
+            return []
+
+        # Pro-rata by amount owed, largest-remainder for the rounding dust. Sorted by
+        # (remainder, amount, creditor) so the same inputs always split the same way.
+        live = [d for d in debts if int(d.get("amount", 0)) > 0]
+        shares: list[tuple[dict, int, int]] = []
+        for d in live:
+            exact = take * int(d["amount"])
+            shares.append((d, exact // total, exact % total))
+        assigned = sum(w for _, w, _ in shares)
+        for d, _, _ in sorted(shares, key=lambda x: (-x[2], -int(x[0]["amount"]),
+                                                     str(x[0].get("creditor_id", "")))):
+            if assigned >= take:
+                break
+            for i, (dd, whole, rem) in enumerate(shares):
+                if dd is d:
+                    shares[i] = (dd, whole + 1, rem)
+                    break
+            assigned += 1
+
+        paid: list[tuple[str, int]] = []
+        for d, whole, _ in shares:
+            if whole <= 0:
+                continue
+            cid = str(d.get("creditor_id") or "")
+            # A bot-issued fine is collected but paid to nobody — there is no wallet.
+            # The creditor id is used as the string it is: a website issuer's id is
+            # `a_<uid>`, and `get_user` keys on `str()` anyway. The debt is decremented
+            # only once the creditor has actually been credited, so nothing that
+            # fails in between can write a coin of debt off unpaid.
+            if cid:
+                creditor = self.get_user(guild_id, cid)
+                creditor["balance"] = max(0, creditor["balance"] + whole)
+                self._mark_dirty(guild_id, cid)
+                # The creditor's side. Recorded here rather than left to the caller
+                # because this is the only place that knows a payment happened at
+                # all — the creditor is not the one making the call, and money
+                # arriving in a wallet with nothing in the ledger to explain it is
+                # exactly the "the economy is broken" bug report this file's debt
+                # section exists to avoid.
+                self._record_locked(creditor, whole, TX_FINE_RECEIVED,
+                                    "Garnished from an unpaid fine", str(user_id))
+            d["amount"] = max(0, int(d["amount"]) - whole)
+            paid.append((cid, whole))
+
+        user["balance"] = max(0, user["balance"] - take)
+
+        # The debtor's side, one entry per creditor paid rather than one for the
+        # total: debts are merged per creditor, so the count stays small, and a
+        # player repaying two people needs to see which of them this went to.
+        for cid, whole in paid:
+            self._record_locked(user, -whole, TX_DEBT_REPAYMENT,
+                                "Repaid out of earnings" if cid
+                                else "Fine repayment (no creditor)", cid)
+
+        # Drop settled entries, and forgive dust: a debt of a coin or two would
+        # otherwise garnish someone who has paid, forever.
+        floor = max(0, settings.DEBT_FORGIVE_BELOW)
+        user["debts"] = [d for d in debts if int(d.get("amount", 0)) > floor]
+        self._mark_dirty(guild_id, user_id)
+        return paid
+
+    def garnish_percent(self, guild_id: int, user_id: int) -> int:
+        """The share of this user's earnings currently going to their creditors.
+        0 when they owe nothing — the UIs use it to decide whether to say anything."""
+        total = self.debt_total(guild_id, user_id)
+        return self._garnish_percent(total) if total > 0 else 0
+
+    def debt_total(self, guild_id: int, user_id: int) -> int:
+        """Total unpaid fine debt. Synchronous, like the other reads."""
+        return self._debt_total(self.get_user(guild_id, user_id))
+
+    def list_debts(self, guild_id: int, user_id: int) -> list[dict]:
+        """Copy of the debt ledger, oldest first — safe for a caller to render."""
+        return [dict(d) for d in (self.get_user(guild_id, user_id).get("debts") or [])
+                if int(d.get("amount", 0)) > 0]
+
+    async def add_debt(self, guild_id: int, user_id: int, creditor_id: str,
+                       amount: int) -> int:
+        """Record `amount` still owed to `creditor_id`. Returns the new debt total.
+
+        Merged into the existing entry for that creditor rather than appended, so a
+        repeat offender owes one growing sum per person instead of a ledger that grows
+        without bound. `creditor_id` may be "" for a bot-issued contract.
+        """
+        if amount <= 0:
+            return self.debt_total(guild_id, user_id)
+        async with self._lock:
+            user = self.get_user(guild_id, user_id)
+            debts = user.setdefault("debts", [])
+            cid = str(creditor_id or "")
+            for d in debts:
+                if str(d.get("creditor_id") or "") == cid:
+                    d["amount"] = int(d.get("amount", 0)) + amount
+                    break
+            else:
+                debts.append({"creditor_id": cid, "amount": int(amount)})
+            self._mark_dirty(guild_id, user_id)
+            return self._debt_total(user)
+
+    async def clear_debts(self, guild_id: int, user_id: int) -> int:
+        """Wipe a user's debt ledger (moderator/owner correction). Returns what was
+        written off, so the action can be logged with a number."""
+        async with self._lock:
+            user = self.get_user(guild_id, user_id)
+            wiped = self._debt_total(user)
+            user["debts"] = []
+            self._mark_dirty(guild_id, user_id)
+            return wiped
+
+    async def add_balance(self, guild_id: int, user_id: int, amount: int, *,
+                          garnishable: bool = False,
+                          category: str = TX_OTHER, detail: str = "",
+                          counterparty: str = "") -> int:
         """Add (or subtract) from a user's balance. Returns new balance.
 
         NOTE: use this only for credits (refunds, payouts) or deductions that are
         already known to be covered. For a spend that must not overdraw, use
         `try_debit` — `add_balance` clamps at 0, so a too-large deduction silently
         vanishes instead of failing, which a concurrent caller can exploit to spend
-        coins they don't have (TOCTOU double-spend)."""
+        coins they don't have (TOCTOU double-spend).
+
+        `garnishable=True` marks this credit as **earnings**, from which an unpaid
+        fine debt is repaid. Pass it only for money the player earned — a payout, a
+        sale, a reward — never for a refund of their own coins or an admin correction.
+        The skim happens under the same lock as the credit. Use `add_balance_gross`
+        when the caller needs to report what was taken.
+        """
+        new_balance, _ = await self.add_balance_gross(
+            guild_id, user_id, amount, garnishable=garnishable,
+            category=category, detail=detail, counterparty=counterparty)
+        return new_balance
+
+    async def add_balance_gross(self, guild_id: int, user_id: int, amount: int, *,
+                                garnishable: bool = False,
+                                category: str = TX_OTHER, detail: str = "",
+                                counterparty: str = "") -> tuple[int, list[tuple[str, int]]]:
+        """`add_balance`, additionally returning what garnishment took.
+
+        The second element is the (creditor_id, amount) pairs paid out of this credit,
+        so a caller can say "+10 (−5 to debt)" rather than leaving the player to notice
+        that their reward silently halved. An invisible skim reads as the economy being
+        broken and arrives as a bug report instead of an appeal.
+        """
         async with self._lock:
             user = self.get_user(guild_id, user_id)
-            user["balance"] = max(0, user["balance"] + amount)
+            # The ledger records what actually moved, and `max(0, …)` means a
+            # deduction bigger than the balance moves less than it was given.
+            before = user["balance"]
+            user["balance"] = max(0, before + amount)
             self._mark_dirty(guild_id, user_id)
-            return user["balance"]
+            self._record_locked(user, user["balance"] - before, category,
+                                detail, counterparty)
+            paid: list[tuple[str, int]] = []
+            if garnishable and amount > 0:
+                # Records its own debtor-side and creditor-side entries: the skim
+                # is a second movement of this wallet, not a smaller version of
+                # the credit above, and showing it as one would hide the debt.
+                paid = self._garnish_locked(guild_id, user, user_id, amount)
+            return user["balance"], paid
 
     async def try_claim_timed_reward(
         self, guild_id: int, user_id: int, key: str,
-        amount: int, cooldown_seconds: float,
+        amount: int, cooldown_seconds: float, *, garnishable: bool = False,
+        category: str = TX_REWARD, detail: str = "",
     ) -> tuple[bool, float]:
         """Credit `amount` KCoins for `key` at most once per `cooldown_seconds`.
 
@@ -458,11 +1106,18 @@ class UserStore:
                 return False, cooldown_seconds - elapsed
 
             stamps[key] = now
-            user["balance"] = max(0, user["balance"] + amount)
+            before = user["balance"]
+            user["balance"] = max(0, before + amount)
             self._mark_dirty(guild_id, user_id)
+            self._record_locked(user, user["balance"] - before, category,
+                                detail or key)
+            if garnishable and amount > 0:
+                self._garnish_locked(guild_id, user, user_id, amount)
             return True, cooldown_seconds
 
-    async def try_debit(self, guild_id: int, user_id: int, amount: int) -> bool:
+    async def try_debit(self, guild_id: int, user_id: int, amount: int, *,
+                        category: str = TX_OTHER, detail: str = "",
+                        counterparty: str = "") -> bool:
         """Atomically deduct `amount` only if the balance fully covers it.
 
         Returns True if the debit was applied, False on insufficient funds. The
@@ -478,9 +1133,12 @@ class UserStore:
                 return False
             user["balance"] -= amount
             self._mark_dirty(guild_id, user_id)
+            self._record_locked(user, -amount, category, detail, counterparty)
             return True
 
-    async def debit_up_to(self, guild_id: int, user_id: int, amount: int) -> int:
+    async def debit_up_to(self, guild_id: int, user_id: int, amount: int, *,
+                          category: str = TX_OTHER, detail: str = "",
+                          counterparty: str = "") -> int:
         """Atomically deduct up to `amount`, capped at the available balance.
 
         Returns the amount actually taken. For "take whatever they can pay" fines
@@ -494,6 +1152,7 @@ class UserStore:
             if taken > 0:
                 user["balance"] -= taken
                 self._mark_dirty(guild_id, user_id)
+                self._record_locked(user, -taken, category, detail, counterparty)
             return taken
 
     async def add_rescue(self, guild_id: int, user_id: int, amount: int = 1) -> int:

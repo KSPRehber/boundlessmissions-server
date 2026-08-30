@@ -117,6 +117,48 @@ def update_contract(guild_id: int, contract_id: str, **fields) -> None:
     _col(guild_id).document(contract_id).update(fields)
 
 
+def claim_submission(guild_id: int, contract_id: str, fields: dict[str, Any]) -> bool:
+    """Atomically move a contract ACTIVE -> SUBMITTED, writing `fields` with it.
+
+    Returns True only for the call that did the flip. `submit_contract` awaits real
+    I/O (file reads, the ban check, Storage uploads) between reading `status ==
+    ACTIVE` and writing SUBMITTED, and the transitions in `contract_actions`
+    (cancel, give_up, ...) can run in that window from another request. A plain
+    `update()` would then clobber a CANCELLED contract — whose escrow was already
+    refunded — back to SUBMITTED, and the review that followed would pay the
+    contractor from nothing. Deciding the flip inside a Firestore transaction
+    makes the status check and the write one step, which holds even with no
+    shared in-process lock and across workers (the `try_claim_purchase` pattern).
+    """
+    ref = _col(guild_id).document(contract_id)
+    transaction = _db.transaction()
+    fields = dict(fields)
+    fields["status"] = SUBMITTED
+
+    @firestore.transactional
+    def _claim(txn) -> bool:
+        snap = ref.get(transaction=txn)
+        if not snap.exists or (snap.to_dict() or {}).get("status") != ACTIVE:
+            return False
+        txn.update(ref, fields)
+        return True
+
+    return _claim(transaction)
+
+
+def delete_stored_file(path: str) -> bool:
+    """Best-effort delete of a Storage object stored on a contract by bucket path
+    (the shape `upload_private_to_storage` returns). False if nothing was deleted."""
+    if _storage_bucket is None or not path or "://" in str(path):
+        return False
+    try:
+        _storage_bucket.blob(str(path)).delete()
+        return True
+    except Exception as exc:
+        log.warning("Could not delete stored file %s: %s", path, exc)
+        return False
+
+
 def iter_user_contracts(guild_id: int, user_id: int) -> list[ContractData]:
     """All contracts where the user is issuer or contractor, deduped by id.
 

@@ -28,9 +28,39 @@ log = logging.getLogger(__name__)
 # Token lifetime: 30 days
 TOKEN_LIFETIME = 30 * 24 * 3600
 
+# Which surface a token was minted for. A KSP token must not open the website's
+# endpoints and vice versa: the two tiers carry different gates (device binding
+# and the mod-hash gate exist only on the KSP tier), so a token that works on
+# both lets a copied session.token bypass every gate the KSP tier still enforces.
+# Tokens minted before this field existed carry no `aud`; verify_session_token
+# reports None for them and the dependencies accept that for the rest of their
+# 30-day life rather than logging everybody out at once.
+AUD_KSP = "ksp"
+AUD_WEB = "web"
+
+
+def _mask(code: str) -> str:
+    """A link code for the log: enough to correlate, not enough to use."""
+    s = str(code or "")
+    return s[:2] + "*" * max(0, len(s) - 2)
+
 # Link code / login-approval challenge lifetime: 3 minutes
 LINK_CODE_LIFETIME = 180
 APPROVAL_LIFETIME = 180
+
+# A code minted from the account panel gets longer, because the journey is longer.
+# Three minutes is fine between two apps that are both already running — read the
+# code in Discord, alt-tab to KSP. It is not enough when the next step is *launching*
+# a modded KSP, which can spend minutes on the loading screen before the link window
+# exists to type into. The wider window is cheap here because a panel-minted code
+# does not authorize anything on its own: it says which account is being asked
+# about, and the approval (which lands back in the panel) is the actual gate.
+PANEL_LINK_CODE_LIFETIME = 600
+
+# Where a link code was minted, which decides where its approval is answered.
+# The rule: the approval must land on the surface that did NOT consume the code.
+SOURCE_DISCORD = "discord"   # /linkcode in Discord  → approve in the Discord DM
+SOURCE_PANEL = "panel"       # account panel on the website → approve in the panel
 
 # Device-approval challenge lifetime: 1 hour. Longer than a login approval — a
 # blocked device re-prompts the user if the DM is missed, so a short window would
@@ -109,11 +139,39 @@ def generate_link_code(guild_id: int, user_id: int, username: str) -> str:
         "guild_id": str(guild_id),
         "user_id": str(user_id),
         "username": username,
+        "source": SOURCE_DISCORD,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "expires_at": time.time() + LINK_CODE_LIFETIME,  # 3 minutes
     })
-    log.info("Generated link code %s for user %s (%s)", code, user_id, username)
+    log.info("Generated link code %s for user %s (%s)", _mask(code), user_id, username)
     return code
+
+
+def generate_account_link_code(account_id, guild_id, display_name: str) -> tuple[str, float]:
+    """Mint a link code from the account panel. Returns (code, expires_at).
+
+    The one that makes a Discord-less account possible at all: `/linkcode` is a
+    Discord slash command, so without this a player who signed up with Google has
+    no way to link a KSP install. It does NOT replace `/linkcode` — an existing
+    Discord player should never be made to create a website account first — so both
+    mint into this same collection and only the `source` differs.
+    """
+    aid = str(account_id)
+    for doc in _link_codes_col().where("user_id", "==", aid).stream():
+        doc.reference.delete()
+
+    code = _digit_code(6)
+    expires_at = time.time() + PANEL_LINK_CODE_LIFETIME
+    _link_codes_col().document(code).set({
+        "guild_id": str(guild_id),
+        "user_id": aid,
+        "username": display_name,
+        "source": SOURCE_PANEL,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "expires_at": expires_at,
+    })
+    log.info("Generated panel link code %s for account %s", _mask(code), aid)
+    return code, expires_at
 
 
 def validate_link_code(code: str) -> dict | None:
@@ -134,28 +192,15 @@ def validate_link_code(code: str) -> dict | None:
 
     # One-time use — delete
     doc.reference.delete()
-    log.info("Validated link code %s for user %s", code, data["user_id"])
+    log.info("Validated link code %s for user %s", _mask(code), data["user_id"])
     return {
         "guild_id": data["guild_id"],
         "user_id": data["user_id"],
         "username": data["username"],
+        # Absent on codes minted before panel linking existed, which were all
+        # Discord ones — so the default is what those actually were.
+        "source": data.get("source", SOURCE_DISCORD),
     }
-
-
-def purge_all_link_codes() -> int:
-    """Burn every outstanding link code. The sweep defense (see api_server's
-    _note_failed_link_guess): a code costs its owner one /linkcode to regenerate,
-    so when the failure pattern says someone is sweeping the 6-digit space, the
-    cheapest possible response is to make sure there is nothing left to hit.
-    Best-effort; returns how many codes were deleted."""
-    n = 0
-    try:
-        for doc in _link_codes_col().stream():
-            doc.reference.delete()
-            n += 1
-    except Exception as exc:
-        log.warning("Could not purge link codes: %s", exc)
-    return n
 
 
 # ── Discord DM login approval ────────────────────────────────────────────────
@@ -172,8 +217,15 @@ def purge_all_link_codes() -> int:
 # the (144-bit, single-use, 3-minute) challenge_id. Gated by cfg.KSP_2FA_ENABLED.
 
 def create_approval_challenge(guild_id: str, user_id: str, username: str,
-                              client_ip: str = "") -> str:
-    """Create a pending login-approval challenge. Returns the challenge_id."""
+                              client_ip: str = "", source: str = SOURCE_DISCORD,
+                              device_id: str = "") -> str:
+    """Create a pending login-approval challenge. Returns the challenge_id.
+
+    `source` decides which surface answers it — a DM for a code that came from
+    Discord, the account panel for one that came from the panel. The device id is
+    kept only so the approving surface can show *what* is asking; it is not part of
+    the decision, and the device is trusted by `_issue_link_token` as it always was.
+    """
     challenge_id = secrets.token_urlsafe(18)
     _twofa_col().document(challenge_id).set({
         "guild_id": str(guild_id),
@@ -181,11 +233,39 @@ def create_approval_challenge(guild_id: str, user_id: str, username: str,
         "username": username,
         "status": "pending",
         "client_ip": client_ip,
+        "source": source,
+        "device_id": device_id,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "expires_at": time.time() + APPROVAL_LIFETIME,
     })
-    log.info("Created login-approval challenge for user %s", user_id)
+    log.info("Created %s login-approval challenge for user %s", source, user_id)
     return challenge_id
+
+
+def pending_panel_approval(account_id) -> dict | None:
+    """The panel-sourced login approval this account is currently being asked for.
+
+    Queried on `user_id` alone and filtered in Python rather than with a compound
+    where(): a single-field equality needs no composite index, and this collection
+    holds at most a handful of live rows per user. Returns the challenge (with its
+    id) or None when there is nothing to answer.
+    """
+    aid = str(account_id)
+    try:
+        from google.cloud.firestore_v1.base_query import FieldFilter
+        q = _twofa_col().where(filter=FieldFilter("user_id", "==", aid)).limit(10)
+        now = time.time()
+        for doc in q.stream():
+            d = doc.to_dict() or {}
+            if d.get("source") != SOURCE_PANEL:
+                continue
+            if d.get("status") != "pending" or now > d.get("expires_at", 0):
+                continue
+            d["challenge_id"] = doc.id
+            return d
+    except Exception as exc:
+        log.warning("Could not read pending approvals for %s: %s", aid, exc)
+    return None
 
 
 def resolve_approval(challenge_id: str, acting_user_id: str, approve: bool) -> bool:
@@ -276,12 +356,13 @@ def _get_allowed_devices(user_id: str) -> set | None:
     (Firestore read failed with nothing cached).
 
     None is deliberately distinct from an empty set. Empty means "no device
-    bound yet" and triggers trust-on-first-use in check_device; that adoption is
-    a PERMANENT write, so it must never run off a failed read — an attacker
-    holding a copied session token who happened to ask during a Firestore blip
-    would get their device bound to the account for good. Same rule as
-    _get_token_version above: on a failed read, return the last known value if
-    there is one, and never cache the guess."""
+    bound yet", which check_device now treats as an UNKNOWN device (it drives
+    the DM-approval flow rather than silently adopting the first id seen). None
+    means the read failed: check_device fails OPEN for that one request only, so
+    an outage never locks everyone out. Keeping them distinct is what stops a
+    Firestore blip from reading as "no devices" — same rule as _get_token_version
+    above: on a failed read, return the last known value if there is one, and
+    never cache the guess."""
     cached = _allowed_devices.get(user_id)
     now = time.time()
     if cached is not None and now - cached[1] < _ALLOWED_DEV_TTL:
@@ -365,9 +446,10 @@ def list_devices(user_id: str) -> list[dict]:
 def check_device(user_id: str, device_id: str) -> str:
     """Return "ok" if the device is trusted for the user, else "unknown".
 
-    Trust-on-first-use: if the account has no bound device yet (a session created
-    before binding existed), the first device id seen is adopted so existing users
-    aren't locked out by the rollout. After that, only known ids pass.
+    An account with no bound device yet (a legacy pre-binding session) is
+    treated as an unknown device: the caller triggers the DM-approval flow,
+    so the owner confirms their device once rather than any holder of the
+    token binding one silently. After that, only known ids pass.
     """
     allowed = _get_allowed_devices(user_id)
     if allowed is None:
@@ -378,9 +460,13 @@ def check_device(user_id: str, device_id: str) -> str:
         # nothing, so no permanent trust is ever granted on a failed read.
         return "ok"
     if not allowed:
-        if device_id:
-            add_allowed_device(user_id, device_id)
-        return "ok"
+        # Legacy account with no bound device yet (a session predating binding).
+        # Do NOT silently adopt the first id seen: a stolen token would bind the
+        # thief's device with no approval. Route it through the same DM-approval
+        # flow as any new device — the real owner approves once, while an
+        # attacker's attempt DMs the victim (who rejects it). Return "unknown"
+        # WITHOUT caching, so nothing is trusted on the strength of the request.
+        return "unknown"
     if not device_id:
         return "unknown"
     return "ok" if device_id in allowed else "unknown"
@@ -628,22 +714,34 @@ def _verify_token(token: str, secret: str) -> dict | None:
     return payload
 
 
-def create_session_token(guild_id: str, user_id: str, username: str, secret: str) -> str:
-    """Create a signed session token and store session in Firestore."""
-    now = time.time()
-    # Mint the token at the user's current version. A fresh login does NOT bump
-    # the version — only logout_all_devices does — so logging in on a new device
-    # never invalidates the user's other devices.
-    version = _get_token_version(user_id)
-    payload = {
+def build_session_payload(guild_id: str, user_id: str, username: str, secret: str,
+                          version: int, aud: str = AUD_KSP, now: float | None = None) -> dict:
+    """The claims a session token carries. Pure, so it can be tested without
+    Firestore; `create_session_token` is the only production caller."""
+    now = time.time() if now is None else now
+    return {
         "gid": guild_id,
         "uid": user_id,
         "usr": username,
         "iat": int(now),
         "exp": int(now + TOKEN_LIFETIME),
         "tv": version,
+        "aud": aud,
         "kid": key_id(secret),  # which key minted this — observability only
     }
+
+
+def create_session_token(guild_id: str, user_id: str, username: str, secret: str,
+                         aud: str = AUD_KSP) -> str:
+    """Create a signed session token and store session in Firestore.
+
+    `aud` names the surface the token is for (AUD_KSP / AUD_WEB); see the note
+    above the constants."""
+    # Mint the token at the user's current version. A fresh login does NOT bump
+    # the version — only logout_all_devices does — so logging in on a new device
+    # never invalidates the user's other devices.
+    version = _get_token_version(user_id)
+    payload = build_session_payload(guild_id, user_id, username, secret, version, aud)
     token = _sign_token(payload, secret)
 
     # Store session reference in Firestore. merge=True preserves token_version if
@@ -690,6 +788,9 @@ def verify_session_token(token: str, secret: "str | list[str] | tuple") -> dict 
         "guild_id": payload["gid"],
         "user_id": payload["uid"],
         "username": payload["usr"],
+        # None for tokens minted before audiences existed (accepted on both tiers
+        # until they expire); AUD_KSP / AUD_WEB otherwise.
+        "aud": payload.get("aud"),
     }
 
 

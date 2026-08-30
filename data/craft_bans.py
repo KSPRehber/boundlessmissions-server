@@ -119,6 +119,18 @@ REASON_MAX = 300
 NOTE_MAX = 500
 LABEL_MAX = 100
 
+# The fingerprint parser builds one object per part and sorts them all, so an
+# oversized payload turns into millions of tuples and a multi-second sort in the
+# bot's own process. `_safe_gunzip` bounds the decompressed *bytes* (64 MB) but
+# not the object graph built from them, so a ~127 KB gzip bomb of minimal PART
+# blocks reached this scanner and cost seconds of CPU and ~1 GB of RSS per
+# request. A real .craft or vessel node is far under this cap; past it the craft
+# still gets its `exact` hash (a cheap sha256 of the bytes) but no design/parts
+# hash, and is flagged `suspect` — the same honest 'could not read this' answer
+# the scanner already gives, consistent with the module's 'a text edit defeats
+# any hash' threat model.
+_MAX_FINGERPRINT_BYTES = 4 * 1024 * 1024
+
 # The default refusal, for a ban issued without one. Deliberately says who did it
 # and what to do about it: a flat "no" from the server reads as a bug and arrives
 # as a bug report.
@@ -165,28 +177,31 @@ def _parts_of(text: str) -> list[tuple[str, tuple[float, float, float]]]:
     depth = 0
     # Depth at which the PART node we are inside begins, or None when outside one.
     part_depth: int | None = None
+    # A .craft names its part `part = mk1pod_42`, a VESSEL node `name = mk1pod`.
+    # Both are collected and `part` wins: KSP ignores an unknown `name =` key in a
+    # .craft PART node, so taking the first of the two let a stray line ahead of
+    # `part =` rename the part for the hash without touching the craft.
+    cur_part = ""
     cur_name = ""
     cur_pos = (0.0, 0.0, 0.0)
     pending = ""  # last bare token seen; a ConfigNode's node name precedes its "{"
 
     def flush():
-        nonlocal cur_name, cur_pos
-        if cur_name:
-            out.append((cur_name, cur_pos))
-        cur_name, cur_pos = "", (0.0, 0.0, 0.0)
+        nonlocal cur_part, cur_name, cur_pos
+        name = cur_part or cur_name
+        if name:
+            out.append((name, cur_pos))
+        cur_part, cur_name, cur_pos = "", "", (0.0, 0.0, 0.0)
 
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        if line.startswith("{"):
+    for line in _preformat(text):
+        if line == "{":
             depth += 1
             if part_depth is None and pending.upper() == "PART":
                 part_depth = depth
-                cur_name, cur_pos = "", (0.0, 0.0, 0.0)
+                cur_part, cur_name, cur_pos = "", "", (0.0, 0.0, 0.0)
             pending = ""
             continue
-        if line.startswith("}"):
+        if line == "}":
             if part_depth is not None and depth == part_depth:
                 flush()
                 part_depth = None
@@ -203,7 +218,9 @@ def _parts_of(text: str) -> list[tuple[str, tuple[float, float, float]]]:
         if part_depth is None or depth != part_depth:
             continue
         key, val = m.group(1), m.group(2)
-        if key in ("part", "name") and not cur_name:
+        if key == "part" and not cur_part:
+            cur_part = _PART_ID_SUFFIX.sub("", val.strip())
+        elif key == "name" and not cur_name:
             cur_name = _PART_ID_SUFFIX.sub("", val.strip())
         elif key in ("pos", "position"):
             cur_pos = _vec(val)
@@ -211,6 +228,41 @@ def _parts_of(text: str) -> list[tuple[str, tuple[float, float, float]]]:
     # A file truncated mid-node still yields the parts that closed cleanly; the
     # one left open is dropped rather than hashed half-read.
     return out
+
+
+def _preformat(text: str) -> list[str]:
+    """The lines KSP's ConfigNode reader actually sees.
+
+    `ConfigNode.PreFormatConfig` strips `//` comments and splits every `{` and `}`
+    onto a line of its own, which is what lets `PART {` (brace on the node's own
+    line) and `} PART {` load unchanged. The scanner must see the same token
+    stream, or a re-formatting that changes nothing KSP reads would leave it with
+    no PART token before the `{` — zero parts, no design/parts hash, and every
+    fuzzy ban matching nothing.
+    """
+    out: list[str] = []
+    for raw in text.splitlines():
+        cut = raw.find("//")
+        if cut >= 0:
+            raw = raw[:cut]
+        buf = ""
+        for ch in raw:
+            if ch in "{}":
+                if buf.strip():
+                    out.append(buf.strip())
+                out.append(ch)
+                buf = ""
+            else:
+                buf += ch
+        if buf.strip():
+            out.append(buf.strip())
+    return out
+
+
+def _mentions_part_node(text: str) -> bool:
+    """Whether the payload carries a PART node token at all — the difference
+    between "not a craft" and "a craft this scanner could not read"."""
+    return any(line.upper() == "PART" for line in _preformat(text))
 
 
 def _vec(val: str) -> tuple[float, float, float]:
@@ -240,6 +292,18 @@ def fingerprint(data: bytes) -> dict:
     callers rely on it: a fingerprint that silently fell back to hashing nothing
     would make one ban match every unparseable upload.
     """
+    if len(data) > _MAX_FINGERPRINT_BYTES:
+        # Too large to scan safely — hash the bytes and stop. Do NOT parse:
+        # that is exactly the work an oversized payload is trying to make us do.
+        log.warning("craft fingerprint: payload too large to scan (%d bytes) — exact hash only", len(data))
+        return {
+            EXACT: hashlib.sha256(data).hexdigest(),
+            DESIGN: None,
+            PARTS: None,
+            "part_count": 0,
+            "distinct_parts": 0,
+            "suspect": True,
+        }
     text = data.decode("utf-8", "ignore")
     parts = _parts_of(text)
     fp = {
@@ -248,7 +312,16 @@ def fingerprint(data: bytes) -> dict:
         PARTS: None,
         "part_count": len(parts),
         "distinct_parts": len({n for n, _ in parts}),
+        # A payload that names PART nodes but yielded none is not "not a craft" —
+        # it is one the scanner could not read, which is exactly the shape a
+        # ban-dodging edit has. Flagged rather than hashed, so a caller can log it
+        # and a moderator can look, without one ban matching every odd upload.
+        "suspect": False,
     }
+    if not parts and _mentions_part_node(text):
+        fp["suspect"] = True
+        log.warning("craft fingerprint: payload has PART nodes but none could be read "
+                    "(%d bytes) — unusual formatting", len(data))
     if parts:
         fp[DESIGN] = _sha("\n".join(sorted(
             f"{n}|{p[0]:.2f},{p[1]:.2f},{p[2]:.2f}" for n, p in parts)))

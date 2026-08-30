@@ -177,35 +177,24 @@ BUG_REPORT_ROLE_ID: int | None = _env_id("BUG_REPORT_ROLE_ID")
 TICKET_CATEGORY_ID: int | None = 1518238099505680516
 TICKET_PANEL_CHANNEL_ID: int | None = 1518238266686443660
 
-# ── XP System ────────────────────────────────────────────────────────────────
-
-# XP awarded per qualifying message
-XP_PER_MESSAGE = 15
-
-# Random bonus range added on top (0 = no randomness)
-XP_BONUS_MIN = 0
-XP_BONUS_MAX = 10
-
-# Cooldown in seconds between XP-eligible messages (prevents spam farming)
-XP_COOLDOWN_SECONDS = 45
-
-# XP multiplier for server boosters (2.0 = double XP)
-BOOSTER_XP_MULTIPLIER = 2.0
-
-# Channels where XP is NOT awarded (by channel ID)
-# Example: XP_BLACKLISTED_CHANNELS = [123456789, 987654321]
-XP_BLACKLISTED_CHANNELS: list[int] = []
-
 # ── Leveling ─────────────────────────────────────────────────────────────────
+#
+# XP is earned by flying, not by talking. The per-message rate, its random bonus,
+# the anti-spam cooldown, the booster multiplier and the channel blacklist were
+# all deleted with the message listener — every award now comes from a completed
+# contract, an analysed screenshot or a weekly mission, via `rewards.grant_xp`.
 
 # Formula: XP needed for level N = BASE * (N ^ EXPONENT)
 LEVEL_XP_BASE = 100
 LEVEL_XP_EXPONENT = 1.5
 
-# Whether to announce level-ups in the channel where it happened
+# Whether to announce level-ups in Discord at all. Off still writes the player's
+# own notification feed — that one is how a player with no Discord hears about it.
 ANNOUNCE_LEVEL_UP = True
 
-# Optional: dedicated channel ID for level-up announcements (None = same channel)
+# Guild fallback for the `level_up` channel (map it per guild with /admin setrole's
+# channel equivalent). Unmapped means no Discord post: with message XP gone there
+# is no longer a channel the player was "just talking in" to fall back to.
 LEVEL_UP_CHANNEL_ID: int | None = None
 
 # ── Economy ──────────────────────────────────────────────────────────────────
@@ -222,6 +211,36 @@ PRIVACY_URL = ""
 
 # KCoins awarded per level-up
 LEVEL_UP_REWARD = 200
+
+# ── XP from player-issued contracts ───────────────────────────────────────────
+# A player-issued contract is judged by its own issuer, and two cooperating accounts
+# can issue → submit → approve the same coins back and forth: the money is conserved
+# but the XP is not, and every level crossed pays LEVEL_UP_REWARD — at low levels
+# that cycle printed more coins than it cost to run (2026-08-29 audit, F3). Bot-issued
+# contracts (weekly/custom missions, judged by the AI or a moderator) are never
+# subject to any of this. The three brakes below are deterministic on purpose: the
+# evidence of a mint is structural (same pair, both directions, money looping) and
+# is read straight off the store, where an AI review would see only a mission text
+# and a screenshot — which a mint can genuinely satisfy — and would cost a Gemini
+# call per cycle, switching itself off exactly when the budget is being drained.
+CONTRACT_XP_HUMAN_ISSUED = True
+# Per contract: the XP rate is 100 per 60 coins with no ceiling, so without this a
+# cooldown bounds how *often* a pair cycles, not how much each cycle pays.
+CONTRACT_XP_HUMAN_MAX = 500
+# Per contractor: XP from a player-issued contract is paid only if this long has
+# passed since their last such grant. Coins are unaffected — the deal still settles.
+CONTRACT_XP_COOLDOWN_MINUTES = 30
+# Per pair: completed player-issued contracts between the same two accounts, in
+# EITHER direction, inside CONTRACT_PAIR_WINDOW_HOURS. Past the free count the
+# contractor earns no XP from that pair and the pair is flagged to the moderators
+# once (`contract_reciprocity` in api_server._SUSPICION_RULES). 0 disables the pair
+# brake.
+CONTRACT_PAIR_XP_FREE_PER_DAY = 3
+CONTRACT_PAIR_WINDOW_HOURS = 24
+# Per contractor: total XP from player-issued contracts inside the same window,
+# whoever issued them. The pair brake bounds one partner; this bounds a ring of
+# alts, each a fresh pair. 0 disables it.
+CONTRACT_XP_HUMAN_DAILY_MAX = 1500
 
 # Minimum transfer amount for /pay
 MIN_TRANSFER = 1
@@ -287,13 +306,64 @@ CONTRACT_ALLOW_SELF = False
 # pending settle or extension request. Pausing it would hand back the same loophole
 # through a different door: ask to settle, and stall for as long as the issuer takes
 # to answer. The agreed penalty is the default outcome; everything else needs someone
-# to actively agree to it in time.
+# to actively agree to it in time. One exception, which is not a pause: a request
+# still *unanswered* when the clock runs out is handed to the moderators rather than
+# fined (the contractor acted; the issuer did not), and where moderator review is not
+# configured the clock restarts exactly once — see contract_actions.expire_dispute.
 DISPUTE_AUTO_FINE_DAYS = 3
 
 # A contractor gets one deadline-extension request per dispute. Without this they can
 # keep asking with a new date every time one is refused, which is stalling by another
 # name. Submitting again and being refused again opens a *new* dispute, which resets it.
 DISPUTE_MAX_MORE_TIME_REQUESTS = 1
+
+# Days past the due date before an ACTIVE contract is pushed into dispute by itself.
+# Without this an accepted contract nobody submits sits ACTIVE forever: DISPUTED was
+# the only status ever swept, so a contractor who simply stopped answering left the
+# deal — and the issuer's escrow — parked with no end. The sweep does not judge the
+# work, it just starts the clock the contractor can still settle, extend, pay or sue
+# against. A SUBMITTED contract is never swept: waiting on the issuer to review is
+# not the contractor's fault.
+CONTRACT_OVERDUE_GRACE_DAYS = 1
+
+# ── Fine debt ────────────────────────────────────────────────────────────────
+# A fine is collected from whatever the contractor actually has; before this, the
+# remainder was silently forgiven, which made the penalty proportional to the
+# offender's wealth — smallest for exactly the players most likely to walk away.
+# The shortfall is now recorded as a debt to the issuer and repaid out of a share of
+# later *earnings* (see `store.add_balance(garnishable=True)`).
+#
+# Garnishment rather than a lockout on purpose: a lockout punishes but never collects,
+# and leaves the debtor with no way back except a repayment they have no reason to
+# make. A share of earnings self-liquidates — the debt shrinks with play, the player
+# stays in the economy, and the issuer is eventually paid.
+DEBT_GARNISH_PERCENT = 50
+
+# The rate rises with the amount owed, not with the number of creditors: owing two
+# people a little is not worse than owing one person a lot, and a count-based rate is
+# gameable from both ends (an issuer with an alt could split one contract in two to
+# push a debtor into a higher bracket). At or above DEBT_GARNISH_ESCALATE_AT the max
+# rate applies; the split across creditors is pro-rata by amount owed either way.
+DEBT_GARNISH_PERCENT_MAX = 75
+DEBT_GARNISH_ESCALATE_AT = 5_000
+
+# Debts at or below this are written off when the ledger is next touched. The wallet
+# is an integer and the pro-rata split rounds, so without a floor a debt strands at a
+# coin or two and garnishes someone who has effectively paid, forever.
+DEBT_FORGIVE_BELOW = 5
+
+# A player may not accept a new contract while owing more than this. Not a lockout —
+# garnishment is already collecting — just a stop on accumulating unbounded
+# obligations across MAX_ACTIVE_CONTRACTS_PER_USER contracts at once. 0 disables it.
+DEBT_MAX_OUTSTANDING = 20_000
+
+# A fine may not exceed this multiple of the contract's payment. The fine used to be
+# bounded only by `ge=0`, which was survivable while an unpayable one was quietly
+# forgiven; now that the shortfall follows the player as a debt, an issuer dangling a
+# mission with an absurd fine is handing out a punishment rather than a contract.
+# Tied to the payment because that is the number the fine is judged against — the
+# stake the issuer themselves put up. 0 disables the check.
+MAX_FINE_MULTIPLE_OF_PAYMENT = 5
 
 # ── Mod-only gameplay ─────────────────────────────────────────────────────────
 # When True, gameplay commands that the in-game KSP mod can perform itself are
@@ -363,6 +433,18 @@ MARKETPLACE_AUTO_DELIST_SCORE = -20
 # undoes — so it is off by default, and a rating alone should probably never be
 # what erases someone's work.
 MARKETPLACE_AUTO_DELIST_DELETE = False
+# The floor only engages once this many votes (likes + dislikes) are on the
+# listing. A floor of -20 reached by twenty accounts casting one dislike each is
+# twenty free sign-ups, not a community verdict.
+MARKETPLACE_AUTO_DELIST_MIN_VOTES = 40
+# An account may vote once it is this many days old or has earned any XP. A vote
+# is free and the floor removes a craft, so a same-day sign-up's vote is the
+# cheapest grief on the site. 0 disables the check.
+MARKETPLACE_VOTE_MIN_ACCOUNT_AGE_DAYS = 3
+# Quicksend payloads (`gifts/`) nobody has acted on are deleted after this many
+# days; an accepted gift is imported within minutes and a declined vessel's
+# return is fetched the next time its owner plays.
+GIFT_FILE_MAX_AGE_DAYS = 30
 
 
 # ── Weekly Missions ──────────────────────────────────────────────────────────

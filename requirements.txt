@@ -7,3 +7,6 @@ fastapi>=0.115.0
 uvicorn[standard]>=0.30.0
 pydantic>=2.0.0
 Pillow>=10.0.0
+# QR codes for two-factor enrolment. Pure Python, no dependencies of its own;
+# everything security-relevant (RFC 6238 itself) stays hand-rolled in data/twofa.py.
+segno>=1.6.0

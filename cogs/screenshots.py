@@ -23,6 +23,7 @@ from google.genai import types
 from i18n import t, tp, S
 import settings
 from data.store import store
+import rewards
 from cost_guard import guard
 from cogs import perms
 
@@ -365,10 +366,12 @@ async def _grant_rewards(gid: int, uid: int, rating: int) -> tuple[int, int]:
     """Grant XP + KCoins based on difficulty. Returns (xp_awarded, coins_awarded)."""
     xp_reward = rating * settings.SCREENSHOT_XP_PER_DIFFICULTY
     coin_reward = rating * settings.SCREENSHOT_COINS_PER_DIFFICULTY
-    if xp_reward > 0:
-        await store.set_xp(gid, uid, store.get_user(gid, uid)["xp"] + xp_reward)
+    xp_reward, _leveled = await rewards.grant_xp(gid, uid, xp_reward,
+                                                 reason="Screenshot analysed")
     if coin_reward > 0:
-        await store.add_balance(gid, uid, coin_reward)
+        await store.add_balance(gid, uid, coin_reward, garnishable=True,
+                                category=store.TX_REWARD,
+                                detail="Screenshot analysed")
     return xp_reward, coin_reward
 
 

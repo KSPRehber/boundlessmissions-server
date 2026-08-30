@@ -11,7 +11,7 @@ Storage layout: guilds/{gid}/ksp_craft_imports/{uid}/items/{import_id}
 """
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from data.store import _db, _storage_bucket, safe_filename, upload_private
@@ -137,6 +137,65 @@ def list_pending(guild_id: int, user_id: int) -> list[ImportEntry]:
 def get(guild_id: int, user_id: int, import_id: str) -> ImportEntry | None:
     doc = _col(guild_id, user_id).document(import_id).get()
     return doc.to_dict() if doc.exists else None
+
+
+def claim_offer(guild_id: int, user_id: int, import_id: str, new_status: str) -> ImportEntry | None:
+    """Atomically settle an OFFERED gift: flip it to `new_status` ("queued" on
+    accept, "rejected" on decline) only if it is still offered, and return the
+    entry as it was. None when it is gone or already settled — so of an accept and
+    a reject racing on one offer exactly one wins, which is what stops a live
+    vessel ending up in both the recipient's and the sender's save. Runs in a
+    Firestore transaction rather than relying on the handlers not yielding
+    between check and write, so it holds across workers too."""
+    ref = _col(guild_id, user_id).document(import_id)
+    transaction = _db.transaction()
+
+    @firestore.transactional
+    def _claim(txn) -> ImportEntry | None:
+        snap = ref.get(transaction=txn)
+        if not snap.exists:
+            return None
+        d = snap.to_dict() or {}
+        if (d.get("status") or "queued") != "offered":
+            return None
+        txn.update(ref, {"status": new_status})
+        return d
+
+    return _claim(transaction)
+
+
+def sweep_stale_gift_files(max_age_days: int) -> int:
+    """Delete gift payloads older than `max_age_days` from Storage.
+
+    A gift's files are otherwise removed only when the recipient acts on the
+    offer (accept → import ack, or decline). An offer nobody ever answers — a
+    quicksend to an account that never polls — keeps its files forever, and the
+    upload quota is a daily *rate*, so that was unbounded cumulative storage.
+    Anything this old is abandoned: an accepted gift is imported within minutes,
+    and a declined vessel's return is fetched the next time the sender plays.
+    Storage-side rather than a Firestore query because the entries live under
+    every guild's every user (a collection-group query would need an index) and
+    the object's own creation time is the fact being tested. One list operation
+    per thousand objects, once a day."""
+    if _storage_bucket is None:
+        return 0
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max(1, int(max_age_days)))
+    removed = 0
+    try:
+        for blob in _storage_bucket.list_blobs(prefix="gifts/"):
+            created = getattr(blob, "time_created", None)
+            if created is None or created > cutoff:
+                continue
+            try:
+                blob.delete()
+                removed += 1
+            except Exception as exc:
+                log.warning("Could not delete stale gift file %s: %s", blob.name, exc)
+    except Exception as exc:
+        log.warning("Stale gift sweep failed: %s", exc)
+    if removed:
+        log.info("Stale gift sweep removed %d file(s) older than %d days", removed, max_age_days)
+    return removed
 
 
 def set_status(guild_id: int, user_id: int, import_id: str, status: str) -> bool:

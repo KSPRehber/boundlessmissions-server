@@ -12,10 +12,26 @@ from discord.ext import commands
 
 import settings
 from cogs import perms
+from cogs import targets
 from data.store import store
-from i18n import t, tp
+from i18n import S, t, tp
 
 log = logging.getLogger(__name__)
+
+# Debt is shown wherever a balance is, and every garnished credit says so. A player
+# whose rewards silently halve files a bug report rather than an appeal — the same
+# reasoning that makes the marketplace rating floor tell the seller.
+S.update({
+    "eco.balance.debt":     {"en": "Unpaid fines"},
+    "eco.balance.debt_val": {"en": "**{amount}** — {pct}% of what you earn goes to it"},
+    "eco.pay.garnished":    {"en": "{amount} {currency} of this went to {name}'s unpaid fines."},
+    # Said out loud because a moderator otherwise cannot tell a delivered notice
+    # from an undeliverable one, and will not chase it anywhere else. The two
+    # reasons are kept apart: closed DMs are the player's own setting, no Discord
+    # at all is a website account and needs a different channel entirely.
+    "eco.fine.no_discord":  {"en": "⚠️ Not notified — this account has no Discord to message. Tell them another way."},
+    "eco.fine.dm_closed":   {"en": "⚠️ Not notified — their DMs are closed."},
+})
 
 
 def mod_only():
@@ -38,26 +54,44 @@ class Economy(commands.Cog, name="Economy"):
 
     # ── /balance ──────────────────────────────────────────────────────────────
     @app_commands.command(name="balance", description="Check your or another user's KCoin balance")
-    @app_commands.describe(member="Member to check (defaults to yourself)")
-    async def balance(self, interaction: discord.Interaction, member: discord.Member | None = None) -> None:
-        member = member or interaction.user
+    @app_commands.describe(member="Member to check (defaults to yourself)",
+                           username=targets.USERNAME_DESC)
+    @targets.username_param
+    async def balance(self, interaction: discord.Interaction,
+                      member: discord.Member | None = None,
+                      username: str | None = None) -> None:
         gid = interaction.guild_id
         uid = interaction.user.id
-        user = store.get_user(gid, member.id)
+        await interaction.response.defer()
+        try:
+            tgt = await targets.resolve(interaction, member, username, default_self=True)
+        except targets.TargetError as err:
+            await targets.reject(interaction, err)
+            return
+        user = store.get_user(gid, tgt.account_id)
 
         embed = discord.Embed(
-            title=tp(gid, uid, "eco.balance.title", symbol=settings.CURRENCY_SYMBOL, name=member.display_name),
+            title=tp(gid, uid, "eco.balance.title", symbol=settings.CURRENCY_SYMBOL, name=tgt.label),
             color=discord.Color.green(),
         )
-        embed.set_thumbnail(url=member.display_avatar.url)
+        if tgt.avatar_url:
+            embed.set_thumbnail(url=tgt.avatar_url)
         embed.add_field(
             name=settings.CURRENCY_NAME,
             value=f"**{user['balance']:,}**",
             inline=True,
         )
         embed.add_field(name=tp(gid, uid, "xp.rank.level"), value=f"**{user['level']}**", inline=True)
+        owed = store.debt_total(gid, tgt.account_id)
+        if owed > 0:
+            embed.add_field(
+                name=tp(gid, uid, "eco.balance.debt"),
+                value=tp(gid, uid, "eco.balance.debt_val", amount=f"{owed:,}",
+                         pct=store.garnish_percent(gid, tgt.account_id)),
+                inline=False,
+            )
         embed.set_footer(text=tp(gid, uid, "eco.balance.footer", currency=settings.CURRENCY_NAME))
-        await interaction.response.send_message(embed=embed)
+        await interaction.followup.send(embed=embed)
 
     # ── /pay ──────────────────────────────────────────────────────────────────
     @app_commands.command(name="pay", description="Transfer KCoins to another user")
@@ -81,7 +115,9 @@ class Economy(commands.Cog, name="Economy"):
 
         # Execute transfer. Atomic debit so two concurrent /pay calls can't both
         # pass the balance check on the same funds and transfer more than is held.
-        if not await store.try_debit(gid, interaction.user.id, amount):
+        if not await store.try_debit(gid, interaction.user.id, amount,
+                                     category=store.TX_TRANSFER_OUT,
+                                     counterparty=str(member.id)):
             sender = store.get_user(gid, interaction.user.id)
             await interaction.response.send_message(
                 tp(gid, uid, "eco.pay.insufficient", balance=f"{sender['balance']:,}", currency=settings.CURRENCY_NAME),
@@ -89,7 +125,13 @@ class Economy(commands.Cog, name="Economy"):
             )
             return
 
-        new_receiver_bal = await store.add_balance(gid, member.id, amount)
+        # Garnishable: a transfer is the obvious way round a debt otherwise — sell
+        # through an alt, or have a friend hand the coins over. The sender is told
+        # below how much of it went to the recipient's creditors.
+        new_receiver_bal, _garnished = await store.add_balance_gross(
+            gid, member.id, amount, garnishable=True,
+            category=store.TX_TRANSFER_IN,
+            counterparty=str(interaction.user.id))
         new_sender_bal = store.get_user(gid, interaction.user.id)["balance"]
 
         embed = discord.Embed(
@@ -109,6 +151,14 @@ class Economy(commands.Cog, name="Economy"):
             value=f"`{new_receiver_bal:,}`",
             inline=True,
         )
+        taken = sum(a for _cid, a in _garnished)
+        if taken:
+            embed.add_field(
+                name="\u200b",
+                value=t(gid, "eco.pay.garnished", amount=f"{taken:,}",
+                        currency=settings.CURRENCY_NAME, name=member.display_name),
+                inline=False,
+            )
         await interaction.response.send_message(embed=embed)
         log.info("%s paid %s %d KCoins", interaction.user, member, amount)
 
@@ -120,6 +170,7 @@ class Economy(commands.Cog, name="Economy"):
         if not lb:
             await interaction.response.send_message(t(gid, "eco.richest.empty"), ephemeral=True)
             return
+        await targets.prefetch_names(uid for uid, _ in lb)
 
         lines = []
         medals = ["🥇", "🥈", "🥉"]
@@ -127,8 +178,7 @@ class Economy(commands.Cog, name="Economy"):
             if data.get("balance", 0) == 0:
                 continue
             prefix = medals[i] if i < 3 else f"`{i + 1}.`"
-            member = interaction.guild.get_member(int(uid))
-            name = member.display_name if member else f"User {uid}"
+            name = targets.board_name(interaction.guild, uid)
             lines.append(f"{prefix} **{name}** · {settings.CURRENCY_SYMBOL} `{data['balance']:,}`")
 
         if not lines:
@@ -148,89 +198,131 @@ class Economy(commands.Cog, name="Economy"):
 
     # ── /givemoney ────────────────────────────────────────────────────────────
     @app_commands.command(name="givemoney", description="Give KCoins to a user (Mod only)")
-    @app_commands.describe(member="Who to give to", amount="Amount to give", reason="Reason (optional)")
+    @app_commands.describe(member="Who to give to", username=targets.USERNAME_DESC,
+                           amount="Amount to give", reason="Reason (optional)")
     @app_commands.default_permissions(kick_members=True)
     @mod_only()
+    @targets.username_param
     async def givemoney(
-        self, interaction: discord.Interaction, member: discord.Member,
-        amount: int, reason: str = "No reason provided",
+        self, interaction: discord.Interaction, amount: int,
+        member: discord.Member | None = None, username: str | None = None,
+        reason: str = "No reason provided",
     ) -> None:
         gid = interaction.guild_id
         uid = interaction.user.id
         if amount <= 0:
             await interaction.response.send_message(tp(gid, uid, "common.amount_positive"), ephemeral=True)
             return
+        await interaction.response.defer()
+        try:
+            tgt = await targets.resolve(interaction, member, username)
+        except targets.TargetError as err:
+            await targets.reject(interaction, err)
+            return
 
-        new_bal = await store.add_balance(gid, member.id, amount)
+        new_bal = await store.add_balance(gid, tgt.account_id, amount,
+                                          category=store.TX_ADMIN,
+                                          detail=reason or "Granted by a moderator",
+                                          counterparty=str(interaction.user.id))
         embed = discord.Embed(
             title=t(gid, "eco.give.title", symbol=settings.CURRENCY_SYMBOL),
             description=t(gid, "eco.give.desc",
-                name=member.display_name, amount=f"{amount:,}",
+                name=tgt.label, amount=f"{amount:,}",
                 currency=settings.CURRENCY_NAME, reason=reason, balance=f"{new_bal:,}"),
             color=discord.Color.green(),
         )
         embed.set_footer(text=t(gid, "common.issued_by", name=interaction.user.display_name))
-        await interaction.response.send_message(embed=embed)
-        log.info("%s gave %s %d KCoins: %s", interaction.user, member, amount, reason)
+        await interaction.followup.send(embed=embed)
+        log.info("%s gave %s (%s) %d KCoins: %s",
+                 interaction.user, tgt.label, tgt.account_id, amount, reason)
 
     # ── /fine ─────────────────────────────────────────────────────────────────
     @app_commands.command(name="fine", description="Deduct KCoins from a user (Mod only)")
-    @app_commands.describe(member="Who to fine", amount="Amount to deduct", reason="Reason (optional)")
+    @app_commands.describe(member="Who to fine", username=targets.USERNAME_DESC,
+                           amount="Amount to deduct", reason="Reason (optional)")
     @app_commands.default_permissions(kick_members=True)
     @mod_only()
+    @targets.username_param
     async def fine(
-        self, interaction: discord.Interaction, member: discord.Member,
-        amount: int, reason: str = "No reason provided",
+        self, interaction: discord.Interaction, amount: int,
+        member: discord.Member | None = None, username: str | None = None,
+        reason: str = "No reason provided",
     ) -> None:
         gid = interaction.guild_id
         uid = interaction.user.id
         if amount <= 0:
             await interaction.response.send_message(tp(gid, uid, "common.amount_positive"), ephemeral=True)
             return
+        await interaction.response.defer()
+        try:
+            tgt = await targets.resolve(interaction, member, username)
+        except targets.TargetError as err:
+            await targets.reject(interaction, err)
+            return
 
-        new_bal = await store.add_balance(gid, member.id, -amount)
+        new_bal = await store.add_balance(gid, tgt.account_id, -amount,
+                                          category=store.TX_ADMIN,
+                                          detail=reason or "Fined by a moderator",
+                                          counterparty=str(interaction.user.id))
         embed = discord.Embed(
             title=t(gid, "eco.fine.title"),
             description=t(gid, "eco.fine.desc",
-                name=member.display_name, amount=f"{amount:,}",
+                name=tgt.label, amount=f"{amount:,}",
                 currency=settings.CURRENCY_NAME, reason=reason, balance=f"{new_bal:,}"),
             color=discord.Color.red(),
         )
         embed.set_footer(text=t(gid, "common.issued_by", name=interaction.user.display_name))
-        await interaction.response.send_message(embed=embed)
 
-        # DM the fined user
-        try:
-            await member.send(t(gid, "eco.fine.dm",
-                guild=interaction.guild.name, amount=f"{amount:,}",
-                currency=settings.CURRENCY_NAME, reason=reason))
-        except discord.Forbidden:
-            pass
-        log.info("%s fined %s %d KCoins: %s", interaction.user, member, amount, reason)
+        # Tell the fined player. A website-only account has no DM to send to, and
+        # a moderator who assumes one was sent will not follow it up anywhere else
+        # — so the embed says outright when nobody was told, rather than leaving
+        # the silent case looking identical to the delivered one.
+        told = await tgt.dm(t(gid, "eco.fine.dm",
+            guild=interaction.guild.name, amount=f"{amount:,}",
+            currency=settings.CURRENCY_NAME, reason=reason))
+        if not told:
+            embed.add_field(
+                name="\u200b",
+                value=t(gid, "eco.fine.dm_closed" if tgt.can_dm else "eco.fine.no_discord"),
+                inline=False)
+        await interaction.followup.send(embed=embed)
+        log.info("%s fined %s (%s) %d KCoins: %s",
+                 interaction.user, tgt.label, tgt.account_id, amount, reason)
 
     # ── /setbalance ───────────────────────────────────────────────────────────
     @app_commands.command(name="setbalance", description="Set a user's KCoin balance (Mod only)")
-    @app_commands.describe(member="Target member", amount="New balance amount")
+    @app_commands.describe(member="Target member", username=targets.USERNAME_DESC,
+                           amount="New balance amount")
     @app_commands.default_permissions(kick_members=True)
     @mod_only()
-    async def setbalance(self, interaction: discord.Interaction, member: discord.Member, amount: int) -> None:
+    @targets.username_param
+    async def setbalance(self, interaction: discord.Interaction, amount: int,
+                         member: discord.Member | None = None,
+                         username: str | None = None) -> None:
         gid = interaction.guild_id
         uid = interaction.user.id
         if amount < 0:
             await interaction.response.send_message(tp(gid, uid, "common.amount_negative"), ephemeral=True)
             return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            tgt = await targets.resolve(interaction, member, username)
+        except targets.TargetError as err:
+            await targets.reject(interaction, err)
+            return
 
         # Set directly via store
         async with store._lock:
-            user = store.get_user(gid, member.id)
+            user = store.get_user(gid, tgt.account_id)
             user["balance"] = amount
-            store._mark_dirty(gid, member.id)
+            store._mark_dirty(gid, tgt.account_id)
 
-        await interaction.response.send_message(
-            tp(gid, uid, "eco.setbal.done", name=member.display_name, amount=f"{amount:,}", currency=settings.CURRENCY_NAME),
+        await interaction.followup.send(
+            tp(gid, uid, "eco.setbal.done", name=tgt.label, amount=f"{amount:,}", currency=settings.CURRENCY_NAME),
             ephemeral=True,
         )
-        log.info("%s set %s balance to %d", interaction.user, member, amount)
+        log.info("%s set %s (%s) balance to %d",
+                 interaction.user, tgt.label, tgt.account_id, amount)
 
     # ── Error handler ─────────────────────────────────────────────────────────
     async def cog_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:

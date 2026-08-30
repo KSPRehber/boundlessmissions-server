@@ -758,6 +758,55 @@ class ModCancelButton(DynamicItem[Button], template=r"ct_mod_c:" + _ID_PATTERN):
         await interaction.edit_original_response(content=f"❌ {r.message}", view=None)
 
 
+class ModHeldApproveButton(DynamicItem[Button], template=r"ct_mod_ok:" + _ID_PATTERN):
+    """Approve a bot-issued submission the AI reviewer could not judge."""
+    def __init__(self, contract_id: str, guild_id: int):
+        super().__init__(Button(label="✅ Approve submission", style=discord.ButtonStyle.green,
+                                custom_id=_cid("ct_mod_ok", contract_id, guild_id)))
+        self.cid = contract_id
+        self.gid = int(guild_id)
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(match["cid"], int(match["gid"]))
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        if not await _require_mod(interaction):
+            return
+        uid, name = _actor(interaction)
+        r = await ca.mod_review_submission(self.gid, self.cid, actor_id=uid, actor_name=name,
+                                           approve=True)
+        if not r.ok:
+            await _reject(interaction, r)
+            return
+        await interaction.edit_original_response(content=f"✅ {r.message}", view=None)
+
+
+class ModHeldRefuseButton(DynamicItem[Button], template=r"ct_mod_no:" + _ID_PATTERN):
+    def __init__(self, contract_id: str, guild_id: int):
+        super().__init__(Button(label="❌ Refuse submission", style=discord.ButtonStyle.red,
+                                custom_id=_cid("ct_mod_no", contract_id, guild_id)))
+        self.cid = contract_id
+        self.gid = int(guild_id)
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(match["cid"], int(match["gid"]))
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        if not await _require_mod(interaction):
+            return
+        uid, name = _actor(interaction)
+        r = await ca.mod_review_submission(self.gid, self.cid, actor_id=uid, actor_name=name,
+                                           approve=False)
+        if not r.ok:
+            await _reject(interaction, r)
+            return
+        await interaction.edit_original_response(content=f"❌ {r.message}", view=None)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  View Classes (compose DynamicItem instances)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -820,6 +869,15 @@ class ModReviewView(View):
         super().__init__(timeout=None)
         self.add_item(ModEnforceButton(contract_id, guild_id))
         self.add_item(ModCancelButton(contract_id, guild_id))
+
+
+class HeldSubmissionView(View):
+    """A bot-issued submission nobody could review automatically: the moderators
+    decide it (see contract_actions.mod_review_submission)."""
+    def __init__(self, contract_id: str = "", guild_id: int = 0):
+        super().__init__(timeout=None)
+        self.add_item(ModHeldApproveButton(contract_id, guild_id))
+        self.add_item(ModHeldRefuseButton(contract_id, guild_id))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -996,4 +1054,5 @@ ALL_DYNAMIC_ITEMS = [
     MoreTimeApproveButton, MoreTimeRefuseButton,
     SettleApproveButton, SettleRefuseButton,
     ModEnforceButton, ModCancelButton,
+    ModHeldApproveButton, ModHeldRefuseButton,
 ]

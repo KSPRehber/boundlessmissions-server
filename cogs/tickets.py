@@ -27,6 +27,7 @@ from discord.ui import View, Button, DynamicItem, Select, Modal, TextInput
 
 import settings
 from data.store import _db
+from data import tickets as tdb
 from data import guild_config
 
 try:
@@ -173,7 +174,17 @@ async def create_ticket(
             overwrites[role] = discord.PermissionOverwrite(
                 view_channel=True, send_messages=True, attach_files=True)
 
-    member_ids = ([int(opener_id)] if opener_id else []) + [int(u) for u in (extra_user_ids or [])]
+    # An opener id is an ACCOUNT id, and a website account has no Discord user to
+    # grant channel access to. That is not a failure: the channel is the mods'
+    # view of the ticket, and the opener's view is the thread on the website. So
+    # a non-snowflake opener simply contributes no overwrite.
+    def _snowflake(value):
+        s = str(value or "")
+        return int(s) if s.isdigit() else None
+
+    member_ids = [v for v in
+                  ([_snowflake(opener_id)] + [_snowflake(u) for u in (extra_user_ids or [])])
+                  if v is not None]
     for uid in dict.fromkeys(member_ids):  # de-dupe, preserve order
         member = guild.get_member(uid)
         if member is None:
@@ -206,11 +217,52 @@ async def create_ticket(
         color=color or discord.Color.blurple(),
     )
     e.set_footer(text=f"Ticket #{num:04d}")
-    opener = guild.get_member(int(opener_id)) if opener_id else None
+
+    # Who opened it. A Discord member answers this on their own; a website account
+    # does not, and a ticket whose opener is a blank space is one a moderator
+    # cannot act on — they cannot look the person up, check their history or
+    # decide whether the report is credible. So the account record fills in for
+    # the member object: its display name and username in the author line, its
+    # uploaded avatar as the icon, and the ids spelled out in a field underneath
+    # (a website account has no mention, and `<@a_…>` is broken text, not a link).
+    opener_did = _snowflake(opener_id)
+    opener = guild.get_member(opener_did) if opener_did else None
+    acct = None
+    if opener_id:
+        try:
+            from data import accounts as _accounts
+            acct = await asyncio.to_thread(_accounts.get_account, opener_id)
+        except Exception as exc:
+            log.warning("Ticket: could not read account %s: %s", opener_id, exc)
+
+    author_name = ""
+    author_icon = None
+    if acct:
+        handle = str(acct.get("username") or "")
+        shown = str(acct.get("display_name") or "") or handle or str(opener_id)
+        author_name = f"{shown} (@{handle})" if handle else shown
+        stored = acct.get("avatar_url") or ""
+        if stored:
+            try:
+                from data.store import sign_stored, SIGNED_URL_MAX_TTL
+                author_icon = sign_stored(stored, ttl=SIGNED_URL_MAX_TTL)
+            except Exception:
+                author_icon = None
     if opener:
-        e.set_author(name=str(opener), icon_url=getattr(opener.display_avatar, "url", None))
+        author_name = author_name or str(opener)
+        author_icon = author_icon or getattr(opener.display_avatar, "url", None)
+    if author_name:
+        e.set_author(name=author_name[:256], icon_url=author_icon)
+
+    if opener_id:
+        who = f"<@{opener_did}>" if opener_did else "no Discord account"
+        line = f"{who}\n`{opener_id}`"
+        if acct and acct.get("username"):
+            line += f"\nUsername: `{acct['username']}`"
+        e.add_field(name="Opened by", value=line, inline=False)
     if subject_user_id:
-        subj = guild.get_member(int(subject_user_id))
+        subj_did = _snowflake(subject_user_id)
+        subj = guild.get_member(subj_did) if subj_did else None
         e.add_field(name="Reported user",
                     value=(f"{subj.mention} (`{subject_user_id}`)" if subj else f"`{subject_user_id}`"),
                     inline=False)
@@ -247,6 +299,31 @@ async def create_ticket(
             await channel.send(view=extra_view, files=files or [])
     except Exception as exc:
         log.warning("Ticket %s created but opening post failed: %s", chan_name, exc)
+
+    # Record the ticket. This is what makes it readable anywhere but here: the
+    # channel above is the mods' view, and for a player with no Discord it is the
+    # ONLY view unless the record exists. Written after the channel so it can
+    # carry the channel id, and best-effort — a ticket a moderator can see and
+    # answer is worth more than one that failed to be filed.
+    ticket = None
+    try:
+        ticket = await asyncio.to_thread(
+            tdb.create,
+            guild_id=guild.id, opener_id=opener_id, kind=kind, title=title,
+            description=description, number=num, channel_id=channel.id,
+            subject_user_id=subject_user_id)
+        if ticket:
+            # Keep the id on the channel topic too. The topic is what survives a
+            # Firestore outage, and it is how `get_by_channel` can be repaired by
+            # hand if a record is ever lost.
+            try:
+                await channel.edit(
+                    topic=f"GKTicket|opener={opener_id or ''}|kind={kind}"
+                          f"|id={ticket['ticket_id']}")
+            except Exception:
+                pass
+    except Exception as exc:
+        log.warning("Ticket %s created but not recorded: %s", chan_name, exc)
 
     log.info("Opened ticket %s (kind=%s) for user %s in guild %s",
              chan_name, kind, opener_id, guild.id)
@@ -383,6 +460,21 @@ class CloseTicketButton(DynamicItem[Button], template=r"gk_ticket_close"):
             embed=discord.Embed(
                 description=f"🔒 Ticket closed by {member.mention}. Deleting in 5 seconds…",
                 color=discord.Color.greyple()))
+        # Close the RECORD before the channel is deleted. Deleting the channel is
+        # what used to end a ticket, and once it is gone there is nothing left to
+        # look the record up by — so this has to happen first, and the closing
+        # note goes into the thread so the opener can read on the website why it
+        # ended rather than watching it silently vanish.
+        ticket = await asyncio.to_thread(tdb.get_by_channel, channel.id)
+        if ticket:
+            tid = ticket["ticket_id"]
+            await asyncio.to_thread(
+                tdb.add_message, tid,
+                author_id=str(member.id), author_name=member.display_name,
+                author_kind=tdb.AUTHOR_SYSTEM,
+                body=f"Ticket closed by {member.display_name}.")
+            await asyncio.to_thread(tdb.close, tid, str(member.id))
+
         await asyncio.sleep(5)
         try:
             await channel.delete(reason=f"Ticket closed by {member}")
@@ -446,6 +538,72 @@ class Tickets(commands.Cog, name="Tickets"):
         if guild is None:
             return None
         return guild_config.resolve_channel(self.bot, guild.id, "ticket_panel")
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        """Mirror a staff reply in a ticket channel into the ticket's thread.
+
+        This is the half that makes a ticket two-way: without it a moderator's
+        answer exists only in Discord, which is exactly where the person who
+        needs it may not be.
+
+        Four things are deliberately skipped. **Our own messages**, because the
+        website's replies are posted into the channel BY the bot and would
+        otherwise come straight back as duplicates — belt and braces with the
+        `has_discord_message` check below, which also covers a restart mid-flight.
+        **Anything outside a ticket channel**, resolved by one keyed lookup rather
+        than a scan. **Empty messages** (a bare attachment still counts, so the
+        test is on content *and* attachments). And **the opening post**, which the
+        record already carries as its description.
+        """
+        if message.author.bot or message.guild is None:
+            return
+        if not (message.content or message.attachments):
+            return
+        # Cheap reject first: ticket channels are named ticket-NNNN, so anything
+        # else costs nothing. The Firestore lookup only happens for a real one.
+        if not str(getattr(message.channel, "name", "")).startswith("ticket-"):
+            return
+
+        try:
+            ticket = await asyncio.to_thread(tdb.get_by_channel, message.channel.id)
+            if not ticket or ticket.get("status") != tdb.OPEN:
+                return
+            tid = ticket["ticket_id"]
+            if await asyncio.to_thread(tdb.has_discord_message, tid, message.id):
+                return
+
+            # Who is talking. The opener's own messages are theirs; everyone else
+            # in a private ticket channel is there because they are staff.
+            opener = str(ticket.get("opener_id") or "")
+            kind = tdb.AUTHOR_OPENER if str(message.author.id) == opener else tdb.AUTHOR_STAFF
+
+            atts = [{"name": a.filename, "url": a.url} for a in message.attachments][:10]
+            await asyncio.to_thread(
+                tdb.add_message, tid,
+                author_id=str(message.author.id),
+                author_name=message.author.display_name,
+                author_kind=kind,
+                body=message.content or "",
+                discord_message_id=str(message.id),
+                attachments=atts)
+
+            # Tell the opener, in the feed they already have. The unread dot on
+            # the account page only helps someone already looking at it; this
+            # reaches a player who is in the game, which for a website-only
+            # account is the only place they would otherwise find out at all.
+            if kind == tdb.AUTHOR_STAFF and opener:
+                try:
+                    import api_server
+                    api_server._create_notification(
+                        int(ticket.get("guild_id") or 0), opener, "ticket_reply",
+                        f"💬 Reply on ticket #{int(ticket.get('number', 0) or 0):04d}",
+                        (message.content or "(attachment)")[:300],
+                        {"ticket_id": tid})
+                except Exception as exc:
+                    log.warning("Could not notify %s of ticket reply: %s", opener, exc)
+        except Exception as exc:
+            log.warning("Could not mirror ticket message %s: %s", message.id, exc)
 
     @commands.Cog.listener()
     async def on_ready(self):

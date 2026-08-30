@@ -42,6 +42,14 @@ class Config:
         else []
     )
 
+    # ── Home guild ──────────────────────────────
+    # The guild an account with no Discord of its own belongs to: where its
+    # tickets are opened and which guild's config answers for it. Deliberately an
+    # env var rather than a literal, so dev and prod can differ — and 0 means "not
+    # configured", which every caller must treat as "no Discord surface available"
+    # rather than as guild zero.
+    HOME_GUILD_ID: int = int(_optional("HOME_GUILD_ID", "0") or "0")
+
     # ── General settings ────────────────────────
     COMMAND_PREFIX: str = _optional("COMMAND_PREFIX", "!")
     OWNER_ID: int = int(_optional("BOT_OWNER_ID", "0") or "0")
@@ -156,6 +164,19 @@ if cfg.KSP_API_ENABLED and cfg.API_SECRET_KEY.strip() in _DEFAULT_API_SECRETS:
         "Or disable the KSP API with KSP_API_ENABLED=false."
     )
 
+# A non-placeholder but short/low-entropy key is still forgeable: the token
+# payload is base64-visible, so anyone holding a single token can brute-force a
+# weak HMAC key offline and then mint a token for any user. Require a real key.
+_MIN_API_SECRET_LEN = 32
+if cfg.KSP_API_ENABLED and len(cfg.API_SECRET_KEY.strip()) < _MIN_API_SECRET_LEN:
+    raise EnvironmentError(
+        f"API_SECRET_KEY is too short ({len(cfg.API_SECRET_KEY.strip())} chars); "
+        f"it must be at least {_MIN_API_SECRET_LEN}. It signs KSP session tokens, "
+        "and a short key can be brute-forced offline from any one token. Generate "
+        "a strong value:\n"
+        "    python -c \"import secrets; print(secrets.token_urlsafe(48))\""
+    )
+
 # The previous key only exists to widen the VERIFY accept list during rotation.
 # A placeholder value would widen it to a publicly known key (token forgery), and
 # a copy of the current key adds nothing — blank both out rather than serve them.
@@ -169,3 +190,15 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+
+# A browser front-end (CORS origins configured) is almost always served through
+# a reverse proxy, so if no trusted proxy is set every request's peer is the
+# proxy and they all share ONE rate-limit bucket — one user tripping a limit
+# then locks everyone out (self-DoS). Warn rather than fail: a same-host proxy
+# setup could legitimately omit this. (X-Forwarded-For is still ignored from an
+# untrusted peer, so this is never a spoofing risk — only a bucketing one.)
+if cfg.KSP_API_ENABLED and cfg.API_CORS_ORIGINS and not cfg.API_TRUSTED_PROXIES:
+    logging.getLogger("config").warning(
+        "API_CORS_ORIGINS is set but API_TRUSTED_PROXIES is empty. Behind a "
+        "reverse proxy this collapses per-IP rate limiting to a single shared "
+        "bucket (self-DoS). Set API_TRUSTED_PROXIES to the proxy IP(s).")

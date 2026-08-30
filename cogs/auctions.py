@@ -206,7 +206,9 @@ async def open_auction(bot, gid: int, issuer_id: int, issuer_name: str, mission:
     balance, that check and this debit aren't a single operation, so a concurrent
     request could otherwise escrow twice from the same funds. Raises ValueError on
     insufficient funds (caller surfaces it as the same 'insufficient balance')."""
-    if not await store.try_debit(gid, issuer_id, start_value):
+    if not await store.try_debit(gid, issuer_id, start_value,
+                                 category=store.TX_AUCTION_ESCROW,
+                                 detail=store.tx_detail(mission, "Auction opened")):
         raise ValueError("insufficient_balance")
     ends_at = (datetime.utcnow() + timedelta(hours=duration_hours)).isoformat()
     a = adb.create_auction(
@@ -232,15 +234,37 @@ async def open_auction(bot, gid: int, issuer_id: int, issuer_name: str, mission:
         adb.update_auction(gid, aid, mirrors=mirrors)
         a["mirrors"] = mirrors
     except Exception:
-        await store.add_balance(gid, issuer_id, start_value)  # refund escrow
+        await store.add_balance(gid, issuer_id, start_value,  # refund escrow
+                                category=store.TX_AUCTION_REFUND,
+                                detail="Auction could not be posted")
         adb.update_auction(gid, a["auction_id"], status=adb.CANCELLED)
         raise
     return a
 
 
+_close_locks: dict[str, asyncio.Lock] = {}
+
+
 async def close_auction(bot, gid: int, auction_id: str, *, ended_by: str = "time") -> None:
     """Close an auction: bind the winner to an active contract (or refund if no bids).
-    Idempotent — a second call after the status changed is a no-op."""
+    Idempotent — a second call after the status changed is a no-op.
+
+    Serialised per auction: the timer, the issuer's "End now" (Discord and web)
+    and a mirror button can all arrive together, and the status write below
+    lands *after* an awaited refund — see `contract_actions.serialized` for why
+    that is not safe to leave to luck."""
+    lock = _close_locks.get(auction_id)
+    if lock is None:
+        lock = _close_locks[auction_id] = asyncio.Lock()
+    async with lock:
+        try:
+            await _close_auction_locked(bot, gid, auction_id, ended_by=ended_by)
+        finally:
+            if not lock.locked() and not getattr(lock, "_waiters", None):
+                _close_locks.pop(auction_id, None)
+
+
+async def _close_auction_locked(bot, gid: int, auction_id: str, *, ended_by: str) -> None:
     a = adb.get_auction(gid, auction_id)
     if not a or a["status"] != adb.OPEN:
         return
@@ -252,9 +276,13 @@ async def close_auction(bot, gid: int, auction_id: str, *, ended_by: str = "time
 
     if winner_id:
         final = a["current_bid"]
+        # Ids are account ids and travel as the strings they are stored as —
+        # create_contract/add_balance str() them anyway, and an int() here on a
+        # web-origin id raised before the status write, leaving the auction OPEN
+        # forever with the issuer's escrow inside it.
         c = cdb.create_contract(
-            origin_gid, int(a["issuer_id"]), a["issuer_name"],
-            int(winner_id), a["current_bidder_name"],
+            origin_gid, str(a["issuer_id"]), a["issuer_name"],
+            str(winner_id), a["current_bidder_name"],
             a["mission"], final, a["fine"], a["due_date"],
             modlist=a.get("modlist"),
             mission_type=a.get("mission_type"),
@@ -264,7 +292,10 @@ async def close_auction(bot, gid: int, auction_id: str, *, ended_by: str = "time
         # Refund the part of the escrow above the winning bid.
         refund = a["start_value"] - final
         if refund > 0:
-            await store.add_balance(origin_gid, int(a["issuer_id"]), refund)
+            await store.add_balance(origin_gid, str(a["issuer_id"]), refund,
+                                    category=store.TX_AUCTION_REFUND,
+                                    detail="Escrow above the winning bid",
+                                    counterparty=str(winner_id or ""))
         a["status"] = adb.CLOSED
         adb.update_auction(origin_gid, auction_id, status=adb.CLOSED, result_contract_id=c["contract_id"])
         log.info("Auction %s closed (%s) → contract %s, winner %s for %d",
@@ -276,7 +307,7 @@ async def close_auction(bot, gid: int, auction_id: str, *, ended_by: str = "time
             e = _embed(c, origin_gid)
             e.description = t(origin_gid, "auc.won_dm", price=final, sym=sym)
             dm = await ca.deliver_to_player(
-                origin_gid, int(winner_id), embed=e,
+                origin_gid, str(winner_id), embed=e,
                 view=ContractWorkView(c["contract_id"], origin_gid, c.get("mission_type")))
             if dm is not None:
                 cdb.update_contract(origin_gid, c["contract_id"], dm_message_id=str(dm.id))
@@ -284,7 +315,9 @@ async def close_auction(bot, gid: int, auction_id: str, *, ended_by: str = "time
             log.warning("Could not notify auction winner %s: %s", winner_id, exc)
     else:
         # No bids — refund the full escrow and cancel.
-        await store.add_balance(origin_gid, int(a["issuer_id"]), a["start_value"])
+        await store.add_balance(origin_gid, str(a["issuer_id"]), a["start_value"],
+                                category=store.TX_AUCTION_REFUND,
+                                detail="Auction closed with no bids")
         a["status"] = adb.CANCELLED
         adb.update_auction(origin_gid, auction_id, status=adb.CANCELLED)
         log.info("Auction %s closed (%s) with no bids, escrow refunded", auction_id, ended_by)
@@ -327,36 +360,25 @@ class BidModal(discord.ui.Modal):
             await interaction.followup.send(tp(gid, uid, "auc.bid_low"), ephemeral=True)
             return
 
-        # Re-read fresh to validate against the latest lowest bid (mitigates races).
-        a = adb.get_auction(gid, self.aid)
-        if not a or a["status"] != adb.OPEN or a["ends_at"] <= datetime.utcnow().isoformat():
-            await interaction.followup.send(tp(gid, uid, "auc.bid_closed"), ephemeral=True)
+        # Validated and written inside one Firestore transaction (the same
+        # `try_place_bid` the website uses): two bids landing together used to
+        # both pass the ceiling against the same `current_bid`, and the later
+        # write won even when it was the worse bid.
+        res = await asyncio.to_thread(
+            adb.try_place_bid, gid, self.aid, uid, interaction.user.display_name,
+            amount, settings.AUCTION_ANTISNIPE_SECONDS)
+        if not res["ok"]:
+            reason = res["reason"]
+            if reason == "own":
+                await interaction.followup.send(tp(gid, uid, "auc.bid_issuer"), ephemeral=True)
+            elif reason == "too_high":
+                await interaction.followup.send(
+                    tp(gid, uid, "auc.bid_toohigh", max=res["ceiling"], sym=sym,
+                       step=res["step"]), ephemeral=True)
+            else:  # missing / closed / no_discord
+                await interaction.followup.send(tp(gid, uid, "auc.bid_closed"), ephemeral=True)
             return
-        if str(uid) == str(a["issuer_id"]):
-            await interaction.followup.send(tp(gid, uid, "auc.bid_issuer"), ephemeral=True)
-            return
-
-        step = a.get("min_decrement", 1)
-        ceiling = a["current_bid"] - step
-        if amount > ceiling:
-            await interaction.followup.send(
-                tp(gid, uid, "auc.bid_toohigh", max=ceiling, sym=sym, step=step), ephemeral=True)
-            return
-
-        fields = {
-            "current_bid": amount,
-            "current_bidder_id": str(uid),
-            "current_bidder_name": interaction.user.display_name,
-            "bid_count": a["bid_count"] + 1,
-        }
-        # Anti-snipe: a late bid pushes the end back so others can respond.
-        if settings.AUCTION_ANTISNIPE_SECONDS > 0:
-            now = datetime.utcnow()
-            end_dt = datetime.fromisoformat(a["ends_at"])
-            if (end_dt - now).total_seconds() < settings.AUCTION_ANTISNIPE_SECONDS:
-                fields["ends_at"] = (now + timedelta(seconds=settings.AUCTION_ANTISNIPE_SECONDS)).isoformat()
-        adb.update_auction(gid, self.aid, **fields)
-        a.update(fields)
+        a = res["auction"]
 
         await _edit_auction_message(interaction.client, a, int(a.get("guild_id") or gid), live=True)
         await interaction.followup.send(

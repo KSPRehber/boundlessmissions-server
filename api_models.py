@@ -18,7 +18,12 @@ class LinkResponse(BaseModel):
     # status:
     #   "ok"                → linked, token populated.
     #   "approval_required" → poll /auth/link/poll with challenge_id; the user must
-    #                         press the Log-in button in their Discord DM.
+    #                         press the Log-in button in their Discord DM, or approve
+    #                         in the account panel for a panel-minted code.
+    #   "totp_required"     → this account has an authenticator. POST the code to
+    #                         /auth/link/totp with challenge_id. No polling, no DM —
+    #                         which is why it works with DMs closed and for an
+    #                         account that has no Discord at all.
     #   "pending"           → still waiting on the user's approval; keep polling.
     status: str = "ok"
     token: str = ""
@@ -26,6 +31,143 @@ class LinkResponse(BaseModel):
     guild_id: str = ""
     user_id: str = ""
     challenge_id: Optional[str] = None
+
+# ── Website accounts (Google / email sign-in) ────────────────────────────────
+
+class WebSignInRequest(BaseModel):
+    id_token: str = Field(..., description="Firebase ID token from the browser SDK")
+
+class WebSignInResponse(BaseModel):
+    # "ok"            → signed in, token populated.
+    # "totp_required" → the account has a second factor; post the code to
+    #                   /web/auth/totp with challenge_id. NO token is issued here,
+    #                   because a token that works without the second factor is
+    #                   exactly what the second factor exists to prevent.
+    status: str = "ok"
+    challenge_id: str = ""
+    # Stripped by the website's BFF into the httpOnly session cookie, exactly as
+    # the link flow's token is — it must never reach browser JS.
+    token: str = ""
+    account_id: str = ""
+    display_name: str = ""
+    # True until the account has claimed its permanent username. The website sends
+    # the user to onboarding on this; the claim endpoint is the real gate.
+    needs_onboarding: bool = False
+
+class AccountProfile(BaseModel):
+    account_id: str
+    username: str = ""           # permanent, claimed once, "" until onboarded
+    display_name: str = ""
+    avatar_url: str = ""
+    email: str = ""
+    # Which sign-ins can reach this account. The website draws "link/unlink" from
+    # these; the account document is the authority.
+    has_discord: bool = False
+    has_password_login: bool = False
+    discord_id: str = ""
+    needs_onboarding: bool = False
+
+class ClaimUsernameRequest(BaseModel):
+    username: str = Field(..., min_length=1, max_length=40)
+
+class DisplayNameRequest(BaseModel):
+    display_name: str = Field(..., min_length=1, max_length=64)
+
+class AccountActionResult(BaseModel):
+    success: bool = True
+    message: str = ""
+    value: str = ""
+
+class KspLinkCodeResponse(BaseModel):
+    code: str
+    # Seconds remaining, not an absolute timestamp: the browser's clock is not ours
+    # to trust, and a countdown is what the panel actually renders.
+    expires_in: int
+
+class KspLinkPending(BaseModel):
+    # pending=False means there is nothing to approve right now.
+    pending: bool = False
+    challenge_id: str = ""
+    client_ip: str = ""
+    device_id: str = ""
+    requested_at: str = ""
+
+class KspLinkApproveRequest(BaseModel):
+    challenge_id: str
+    approve: bool = True
+
+# ── Two-factor authentication ────────────────────────────────────────────────
+
+class TwoFactorStatus(BaseModel):
+    enabled: bool = False
+    # A secret has been minted but no working code has proved it yet.
+    pending: bool = False
+    recovery_remaining: int = 0
+
+class TwoFactorBeginResponse(BaseModel):
+    # Three ways in: scan the QR, tap the link, or type the secret. `qr_svg` is a
+    # self-contained inline SVG (no script, no external refs) so the page can drop
+    # it straight in without a QR library or a CSP change; "" if rendering failed,
+    # which leaves the other two working.
+    secret: str
+    uri: str
+    qr_svg: str = ""
+
+class TwoFactorCodeRequest(BaseModel):
+    code: str = Field(..., min_length=4, max_length=24)
+
+class TwoFactorConfirmResponse(BaseModel):
+    success: bool = True
+    message: str = ""
+    # Returned exactly once, at enrolment or regeneration. Only hashes are stored.
+    recovery_codes: list[str] = []
+
+class TwoFactorLoginRequest(BaseModel):
+    challenge_id: str
+    code: str = Field(..., min_length=4, max_length=24)
+
+
+# ── Support tickets ──────────────────────────────────────────────────────────
+
+class TicketMessage(BaseModel):
+    message_id: str
+    author_name: str = ""
+    # "opener" | "staff" | "system" — what the UI needs to know to place a bubble.
+    author_kind: str = "system"
+    body: str = ""
+    attachments: list[dict] = []
+    created_at: str = ""
+
+class TicketSummary(BaseModel):
+    ticket_id: str
+    number: int = 0
+    kind: str = "other"
+    title: str = ""
+    status: str = "open"
+    created_at: str = ""
+    updated_at: str = ""
+    message_count: int = 0
+    unread: bool = False
+
+class TicketListResponse(BaseModel):
+    tickets: list[TicketSummary] = []
+
+class TicketThread(BaseModel):
+    ticket: TicketSummary
+    description: str = ""
+    messages: list[TicketMessage] = []
+
+class TicketCreateRequest(BaseModel):
+    kind: str = Field("other", max_length=20)
+    title: str = Field(..., min_length=1, max_length=150)
+    body: str = Field(..., min_length=1, max_length=4000)
+
+class TicketReplyRequest(BaseModel):
+    body: str = Field(..., min_length=1, max_length=4000)
+
+class DiscordLinkCodeResponse(BaseModel):
+    code: str
+    expires_in: int
 
 class DeviceStatusResponse(BaseModel):
     # status: "pending" (keep polling) | "approved" (device trusted, resume) |
@@ -95,9 +237,112 @@ class UserProfile(BaseModel):
     messages: int = 0
     unlocked_levels: list[int] = []
     currency_name: str = "KCoins"
+    # Unpaid contract fines, and the share of earnings currently going to them. Sent
+    # so the mod and the website can show it next to the balance: a player whose
+    # rewards arrive halved with no explanation reads it as the economy being broken.
+    debt: int = 0
+    debt_garnish_percent: int = 0
+    # Account preferences that only the server can act on, sent with the profile so
+    # a client can draw the switch without a second round trip. See
+    # `store.corp_pings_enabled`: this one decides whether a corp-channel delivery
+    # @-mentions the player.
+    corp_pings: bool = True
     # True only for the single BOT_OWNER_ID account. The website uses it to decide
     # whether to draw the Admin tab; every admin endpoint re-checks server-side.
     is_owner: bool = False
+
+
+class PreferencesUpdate(BaseModel):
+    """A partial update of the account preferences on `UserProfile`.
+
+    Every field is optional and `None` means "leave it alone", so a client that
+    knows about one preference cannot clear the ones it has never heard of by
+    omitting them — the same shape the settings screens already use, and the
+    reason this is not a full replacement of the block.
+    """
+    corp_pings: bool | None = None
+
+
+# ── Finance ──────────────────────────────────────────────────────────────────
+#
+# The wallet's history, for the mod's Finance panel and the website's account
+# page. Three shapes, because they answer three different questions and are
+# sized very differently:
+#
+#   `entries`  the recent movements, in detail — the list a player scrolls.
+#   `totals`   lifetime per-category sums. NOT derivable from `entries`: the
+#              store's ledger is a ring buffer, so a summary computed from the
+#              list would start shrinking once the oldest entries rolled off.
+#   `series`   one bucket per day, for the graph. Sent pre-bucketed rather than
+#              leaving the client to group timestamps, so all three front ends
+#              draw the same bars and none of them has to agree about timezones.
+
+class FinanceEntry(BaseModel):
+    """One movement of the wallet. `amount` is signed: negative money left."""
+    ts: float = 0.0
+    amount: int = 0
+    category: str = "other"
+    # The category's display name, resolved server-side. Sent with every entry so a
+    # client that predates a category still labels it rather than printing the raw
+    # key — the vocabulary can grow without a client update.
+    category_label: str = ""
+    detail: str = ""
+    # The other party's account id, when there was one, plus the name to show for
+    # it. The name is resolved server-side because only the bot has the member
+    # cache that turns a snowflake into the name people know someone by.
+    counterparty_id: str = ""
+    counterparty_name: str = ""
+
+
+class FinanceCategoryTotal(BaseModel):
+    category: str
+    label: str = ""
+    incoming: int = 0
+    outgoing: int = 0
+    count: int = 0
+
+
+class FinanceDay(BaseModel):
+    day: str = ""          # YYYY-MM-DD, UTC
+    ts: int = 0            # start-of-day epoch, for ordering without parsing
+    incoming: int = 0
+    outgoing: int = 0
+    net: int = 0
+
+
+class FinanceResponse(BaseModel):
+    balance: int = 0
+    currency_name: str = "KCoins"
+    debt: int = 0
+    debt_garnish_percent: int = 0
+    # Lifetime, across every category — the two headline numbers.
+    total_in: int = 0
+    total_out: int = 0
+    totals: list[FinanceCategoryTotal] = []
+    series: list[FinanceDay] = []
+    entries: list[FinanceEntry] = []
+    # How many entries the ledger currently holds (for paging), and the cap it
+    # holds them up to — the client says "showing the last N" rather than
+    # implying it has the player's whole history.
+    entry_count: int = 0
+    ledger_capacity: int = 0
+    min_transfer: int = 1
+
+
+class FinanceSendRequest(BaseModel):
+    to_user_id: str
+    amount: int = Field(gt=0)
+    note: str = ""
+
+
+class FinanceSendResult(BaseModel):
+    success: bool = False
+    message: str = ""
+    balance: int = 0
+    # What garnishment took out of the recipient's side, so the sender can be told
+    # the recipient did not receive the whole amount rather than being left to
+    # discover it. Zero for a recipient who owes nothing.
+    garnished: int = 0
 
 
 # ── Missions ─────────────────────────────────────────────────────────────────

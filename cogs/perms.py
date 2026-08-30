@@ -65,6 +65,32 @@ def is_mod_user(interaction: discord.Interaction) -> bool:
     return u.guild_permissions.kick_members or u.guild_permissions.administrator
 
 
+def holds_authority_anywhere(client: discord.Client, user_id: int) -> bool:
+    """True if this Discord id is the owner, or holds the mapped bot-admin or mod
+    role, or kick/administrator permission, in ANY guild the bot is in.
+
+    The per-interaction checks above answer "in this guild", which is right for a
+    guild-scoped command and wrong for a decision about the *account*: the web
+    console grants a guild admin their console from whichever guild the role is
+    held in (`api_server._admin_role_guild_ids`), so an authority check that only
+    looked at the guild an interaction happened in — or at nothing, in a DM —
+    could be sidestepped by asking the role holder to act somewhere else."""
+    from data import guild_config
+    if user_id == cfg.OWNER_ID:
+        return True
+    for g in getattr(client, "guilds", []) or []:
+        member = g.get_member(user_id)
+        if member is None:
+            continue
+        for key in ("admin", "mod"):
+            role = guild_config.resolve_role(g, key)
+            if role is not None and member.get_role(role.id) is not None:
+                return True
+        if member.guild_permissions.kick_members or member.guild_permissions.administrator:
+            return True
+    return False
+
+
 async def block_if_mod_only(interaction: discord.Interaction) -> bool:
     """Gate for gameplay commands the in-game KSP mod can perform itself.
 

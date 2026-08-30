@@ -93,8 +93,18 @@ def try_place_bid(guild_id: int, auction_id: str, bidder_id, bidder_name: str,
       {"ok": False, "reason": "missing"}
       {"ok": False, "reason": "closed"}
       {"ok": False, "reason": "own"}
+      {"ok": False, "reason": "no_discord"}
       {"ok": False, "reason": "too_high", "ceiling": <int>}
+
+    Auctions are a Discord game: the winner is handed a work view in their corp
+    channel or DM, and `close_auction` needs a member to do that. A website-only
+    account (`a_…` id) has no such surface, so its bid is refused here — inside the
+    storage function rather than only at the web endpoint — because a bidder the
+    closer cannot resolve used to make the auction unclosable and hold the issuer's
+    escrow forever.
     """
+    if not str(bidder_id).isdigit():
+        return {"ok": False, "reason": "no_discord"}
     ref = _col().document(auction_id)
     transaction = _db.transaction()
 

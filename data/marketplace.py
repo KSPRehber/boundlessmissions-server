@@ -12,7 +12,9 @@ Firestore structure (GLOBAL — the marketplace spans every server):
     marketplace_votes/{user_id} → { votes: { listing_id: 1 | -1 } }
     marketplace_reports/{listing_id}_{reporter_id} → { ...one report... }
 """
+import hashlib
 import logging
+import threading
 import uuid
 from datetime import datetime
 from typing import Any
@@ -263,6 +265,24 @@ def _votes_doc(user_id: int | str):
     return _db.collection("marketplace_votes").document(str(user_id))
 
 
+# set_vote is read-then-increment: the Increment is atomic, the read that decides
+# the delta is not. The endpoint runs it in a thread pool, so N identical votes
+# from one account arriving together each read "no previous vote" and each add
+# one — enough, at 25 in a burst, to push any listing through the auto-delist
+# floor. One account's votes are therefore serialised in-process: a fixed stripe
+# of locks keyed by the voter, so the dict is bounded and the same user always
+# lands on the same lock. This holds while the API is one process (the same
+# assumption every contract_actions transition rests on); a second worker would
+# need the read and the write inside one Firestore transaction instead.
+_VOTE_LOCK_STRIPES = 64
+_vote_locks = [threading.Lock() for _ in range(_VOTE_LOCK_STRIPES)]
+
+
+def _vote_lock(user_id: int | str) -> threading.Lock:
+    h = int(hashlib.sha1(str(user_id).encode()).hexdigest()[:8], 16)
+    return _vote_locks[h % _VOTE_LOCK_STRIPES]
+
+
 def get_user_votes(user_id: int | str) -> dict[str, int]:
     """Every vote this user has cast: {listing_id: 1 | -1}. Empty for a user who
     has never voted (no document), which is the common case."""
@@ -285,6 +305,14 @@ def set_vote(listing_id: str, user_id: int | str, vote: int) -> tuple[int, int] 
     a vote nobody is recorded as having cast.
     """
     vote = VOTE_UP if vote > 0 else (VOTE_DOWN if vote < 0 else VOTE_NONE)
+    with _vote_lock(user_id):
+        return _set_vote_locked(listing_id, user_id, vote)
+
+
+def _set_vote_locked(listing_id: str, user_id: int | str, vote: int) -> tuple[int, int] | None:
+    """The body of set_vote; the caller holds this user's vote lock, so `old` is
+    what the user's record really says and not what it said before a sibling
+    request wrote it."""
     ref = _col().document(listing_id)
     snap = ref.get()
     if not snap.exists:

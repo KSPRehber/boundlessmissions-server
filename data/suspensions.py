@@ -45,6 +45,7 @@ getting a few extra minutes.
 """
 
 import logging
+import math
 import time
 from datetime import datetime, timezone
 
@@ -131,7 +132,13 @@ def suspend(user_id: str, hours: float, reason: str, by: str) -> dict:
     second suspension issued while the first runs is a correction of it, not an
     addition to it. Returns the stored record."""
     user_id = str(user_id)
-    hours = max(MIN_HOURS, min(float(hours), MAX_HOURS))
+    # Reject a non-finite duration explicitly: NaN slips through min()/max()
+    # (every comparison with it is False) and inf would overflow `until`, so a
+    # hand-built request could otherwise store an un-liftable suspension.
+    hours = float(hours)
+    if not math.isfinite(hours):
+        hours = MIN_HOURS
+    hours = max(MIN_HOURS, min(hours, MAX_HOURS))
     now = time.time()
     until = now + hours * 3600.0
     rec = {

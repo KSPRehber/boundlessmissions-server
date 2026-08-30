@@ -155,14 +155,15 @@ GK Discord Bot/
 
 ### `cogs/`
 
-Every entry is a loaded extension except `perms.py` and `contract_views.py`,
-which are helper modules living here because they belong to this half of the
-codebase. `moderation.py` is loaded only when `ENABLE_MOD_COMMANDS` is set.
+Every entry is a loaded extension except `perms.py`, `targets.py` and
+`contract_views.py`, which are helper modules living here because they belong to
+this half of the codebase. `moderation.py` is loaded only when `ENABLE_MOD_COMMANDS` is set.
 
 | Module | Role |
 |--------|------|
 | `admin.py` | Admin and owner commands: channel/role mapping, announcements, cog reload, mimic, version and policy publishing, `/costs` |
 | `perms.py` | **Mimic-safe** permission helpers. Every gate must go through these |
+| `targets.py` | Helper. Turns a `member:` **or** a `username:` into the account id a mod command spends — the only way to reach a player with no Discord |
 | `economy.py` | KCoins — balance, pay, and the mod tools (give / fine / set) |
 | `xp.py` | Levelling, rank, leaderboard, and the `auto_save` loop that flushes the store |
 | `roles.py` | Self-assignable role menus |
@@ -186,6 +187,7 @@ codebase. `moderation.py` is loaded only when `ENABLE_MOD_COMMANDS` is set.
 | Module | Role |
 |--------|------|
 | `store.py` | The `store` singleton — user data, in-memory write buffer, auto-save |
+| `accounts.py` | Who a player *is*, separately from where they signed up — account ids, the Discord/Firebase indexes, usernames |
 | `contracts.py` | Contract CRUD against Firestore |
 | `marketplace.py` | Listings, votes, reports, the `recommended` sort |
 | `auctions.py` | Auction documents |
@@ -227,6 +229,31 @@ under `/mod`, and the rest at the top level (or under `COMMAND_GROUP`, if set).
 | **Admin** (`/admin …`) | `setchannel` · `setrole` · `announce` · `setprefix` · `linkas` · `publishversion` · `versioninfo` · `policyversion` · `costs` · `reload`† · `shutdown`† · `mimic`† · `unmimic`† |
 
 \* moderator or admin only  ·  † bot owner only
+
+### Reaching a player who has no Discord
+
+A Boundless account does not need a Discord one (see
+[Data & Persistence](#data--persistence)), so a moderator tool that could only take
+a `discord.Member` could not touch a website sign-up at all — there was no
+snowflake to type. Every command that targets a player therefore takes **two**
+optional fields and `cogs/targets.py` resolves either into an account id:
+
+| Field | For |
+|-------|-----|
+| `member:` | anyone in this server — the normal case, picked from Discord's own list |
+| `username:` | their permanent Boundless username, autocompleted from claimed names |
+
+`/balance` · `/rank` · `/rescues` · `/givemoney` · `/fine` · `/setbalance` ·
+`/setxp` · `/contractreset` all accept the pair. Naming **both** is refused
+rather than resolved, and on the four that *write* naming neither is refused too
+(on the read-only three it means "me"). A failed account lookup is refused as
+"try again", never reported as "no such player" — the distinction
+`accounts.owner_of_username` exists to preserve.
+
+The `member:` path is resolved through the same lookup rather than spending
+`member.id`, which fixes a quieter bug: a player who linked Discord onto an
+account they already had has a snowflake that maps *elsewhere*, so paying
+`member.id` credited a wallet the game never reads.
 
 ---
 
@@ -375,6 +402,14 @@ language preference live at the **top-level, guild-independent** `users/{user_id
 mirrored in an in-memory dict by `data/store.py`. The wallet spans every server:
 `store.get_user(guild_id, user_id)` still takes a `guild_id` for call-site
 compatibility but ignores it as a key.
+
+**A user id is an account id**, not necessarily a Discord snowflake.
+`data/accounts.py` makes a Discord-origin account's id *be* its snowflake and a
+website sign-up's id `a_<firebase_uid>`, so every existing document keys the same
+way and a player with no Discord still has somewhere to live. Two consequences
+for anything that touches a store key: never `int()` it (use
+`accounts.is_discord_account`, or `cogs/targets.board_name` for a leaderboard
+row), and never assume there is a Discord user behind it to mention or DM.
 
 **Guild-scoped state** — config, corps, weekly missions and selections,
 tickets — lives under `guilds/{guild_id}/…`. Contracts and notifications are
@@ -628,6 +663,7 @@ python test_suspensions.py
 python test_security_signing.py
 python test_security_invariants.py
 python test_auth_hardening.py
+python test_targets.py
 ```
 
 | Suite | Covers |
@@ -638,6 +674,7 @@ python test_auth_hardening.py
 | `test_security_signing.py` | Signed-URL behaviour, with real V4 signing done locally |
 | `test_security_invariants.py` | Source invariants and the sanitizer algorithm spec |
 | `test_auth_hardening.py` | Key rotation, device-gate fail-open, sweep defense |
+| `test_targets.py` | The moderator target resolver: username lookup, rebound snowflakes, and every refusal around them |
 
 `../run_security_tests.sh` runs the security-focused subset from the repo root —
 the three security suites above plus the website's own header and allow-list

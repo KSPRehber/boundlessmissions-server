@@ -52,6 +52,8 @@ costs the agreed fine. The issuer keeps the old behaviour, since withdrawing an 
 refunds only their own escrow.
 """
 
+import asyncio
+import functools
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -61,6 +63,7 @@ from data import contracts as cdb
 from data import guild_config
 from data import imports as imp
 from data.store import store
+import rewards
 
 log = logging.getLogger(__name__)
 
@@ -86,9 +89,9 @@ NOT_FOUND = "not_found"
 FORBIDDEN = "forbidden"
 BAD_STATE = "bad_state"
 BAD_REQUEST = "bad_request"
-NO_FUNDS = "insufficient_funds"
 UNAVAILABLE = "unavailable"
 USE_GIVE_UP = "use_give_up"
+DEBT_LIMIT = "debt_limit"
 
 
 @dataclass
@@ -110,6 +113,59 @@ def _fail(code: str, message: str, contract: dict | None = None) -> Result:
     return Result(ok=False, message=message, code=code, contract=contract)
 
 
+# ── One transition at a time per contract ────────────────────────────────────
+#
+# Several transitions await a wallet operation between reading the status and
+# writing the new one (give_up, pay_fine, the dispute clock, a moderator's
+# enforce). Today those awaits never actually yield — `store`'s lock is never
+# contended at an await point and firebase-admin calls block the loop — so two
+# copies could not interleave and double-pay. That is an accident of the current
+# code, not a property anyone chose: the first real await added before a status
+# write (a Discord DM, `asyncio.to_thread` around a Firestore call) reopens the
+# double payout that `api_server`'s submit lock closed. So every transition holds
+# a per-contract lock, the same shape as `_submit_locks`. In-process only, like
+# that one: the API is a single process.
+
+_locks: dict[str, asyncio.Lock] = {}
+
+
+class contract_lock:
+    """`async with contract_lock(contract_id):` — the per-contract lock every
+    transition runs under. Exposed so `api_server.submit_contract` holds the SAME
+    lock rather than a private one keyed on the same id: two lock namespaces that
+    never coordinate let a submit and a cancel of one contract interleave, which
+    resurrected a refunded contract as SUBMITTED and paid it a second time.
+    Non-reentrant — nothing under it may call a `@serialized` function."""
+
+    def __init__(self, contract_id):
+        self.key = str(contract_id)
+        self.lock: asyncio.Lock | None = None
+
+    async def __aenter__(self):
+        lock = _locks.get(self.key)
+        if lock is None:
+            lock = _locks[self.key] = asyncio.Lock()
+        self.lock = lock
+        await lock.acquire()
+        return self
+
+    async def __aexit__(self, *exc):
+        lock = self.lock
+        lock.release()
+        if not lock.locked() and not getattr(lock, "_waiters", None):
+            _locks.pop(self.key, None)
+        return False
+
+
+def serialized(fn):
+    """Run a `(gid, contract_id, ...)` transition under that contract's lock."""
+    @functools.wraps(fn)
+    async def wrapper(gid, contract_id, *args, **kwargs):
+        async with contract_lock(contract_id):
+            return await fn(gid, contract_id, *args, **kwargs)
+    return wrapper
+
+
 # ── Shared pieces ────────────────────────────────────────────────────────────
 
 def _load(gid: int, contract_id: str):
@@ -124,22 +180,109 @@ def _is_bot_issued(c: dict) -> bool:
     return str(c.get("issuer_id")) == str(_api()._get_bot_user_id())
 
 
+def _contract_label(c: dict) -> str:
+    """A one-line name for this contract, for a ledger entry to be readable by.
+
+    The mission text is what the player recognises — a contract id is what *we*
+    recognise — so it leads, cut to a phrase and falling back to the id only when
+    there is no text at all. The store truncates again on write; this cut is here
+    so the truncation happens at a word rather than mid-sentence.
+    """
+    return store.tx_detail(c.get("mission"),
+                           fallback="Contract " + str(c.get("contract_id") or "")[:12])
+
+
 def _notify(gid: int, user_id: int, notif_type: str, title: str, message: str,
             contract_id: str) -> None:
     """Best-effort in-game notification. Never let a notification failure roll back a
     transition that has already moved money — the state change is the important half."""
     try:
-        _api()._create_notification(gid, int(user_id), notif_type, title, message,
+        _api()._create_notification(gid, str(user_id), notif_type, title, message,
                                     {"contract_id": contract_id})
     except Exception as exc:
         log.warning("Could not notify %s about contract %s: %s", user_id, contract_id, exc)
 
 
-async def _pay_issuer(gid: int, c: dict, amount: int) -> None:
+async def _pay_issuer(gid: int, c: dict, *, refund: int = 0, income: int = 0) -> None:
     """Credit the issuer, unless the issuer is the bot — weekly/AI contracts have no
-    wallet to pay into, and crediting one inflates a balance nobody spends."""
-    if amount > 0 and not _is_bot_issued(c):
-        await store.add_balance(gid, int(c["issuer_id"]), amount)
+    wallet to pay into, and crediting one inflates a balance nobody spends.
+
+    The two halves are separated because only one of them is *earnings*. `refund` is
+    the issuer's own escrowed payment coming back, which garnishment must never touch
+    — an issuer who owes a fine elsewhere would otherwise lose half their own stake
+    every time a contract fell through. `income` is the fine they received, which is.
+    """
+    if _is_bot_issued(c):
+        return
+    uid = str(c["issuer_id"])
+    label = _contract_label(c)
+    if refund > 0:
+        await store.add_balance(gid, uid, refund, category=store.TX_CONTRACT_REFUND,
+                                detail=label)
+    if income > 0:
+        await store.add_balance(gid, uid, income, garnishable=True,
+                                category=store.TX_FINE_RECEIVED, detail=label,
+                                counterparty=str(c.get("contractor_id") or ""))
+
+
+async def _charge_fine(gid: int, c: dict, contractor_id: str, fine: int) -> tuple[int, int]:
+    """Collect what the contractor can pay and record the rest as a debt to the issuer.
+
+    Returns (collected, owed). Every fine in the system is collected through here, so
+    the partial-payment rule and the debt it leaves are stated once rather than in each
+    of the four paths that can charge one.
+
+    A bot-issued contract still creates a debt — the deterrent is the point — but files
+    it under an empty creditor id, since there is no wallet on the other side. See
+    `store.add_debt`.
+    """
+    if fine <= 0:
+        return 0, 0
+    collected = await store.debit_up_to(
+        gid, contractor_id, fine, category=store.TX_CONTRACT_FINE,
+        detail=_contract_label(c),
+        counterparty="" if _is_bot_issued(c) else str(c.get("issuer_id") or ""))
+    owed = fine - collected
+    if owed > 0:
+        creditor = "" if _is_bot_issued(c) else str(c["issuer_id"])
+        total = await store.add_debt(gid, contractor_id, creditor, owed)
+        log.info("Contract %s: %s owes %d of the %d fine (debt now %d)",
+                 c.get("contract_id"), contractor_id, owed, fine, total)
+    return collected, owed
+
+
+def _fine_paid_sentence(collected: int, owed: int, sym: str) -> str:
+    """What the *contractor* is told about a fine that was just charged.
+
+    A partial payment has to say so and say what happens next: a player whose balance
+    emptied and who was told only "fine paid" learns about the rest when their next
+    reward arrives halved, which reads as the economy being broken.
+    """
+    if collected <= 0 and owed <= 0:
+        return ""
+    if owed <= 0:
+        return f" You paid the {collected} {sym} fine."
+    pct = settings.DEBT_GARNISH_PERCENT
+    if collected <= 0:
+        return (f" You owe {owed} {sym}, which will come out of "
+                f"{pct}% of what you earn from here.")
+    return (f" You paid {collected} {sym} and owe {owed} {sym}, which will come out of "
+            f"{pct}% of what you earn from here.")
+
+
+def _fine_outcome_sentence(collected: int, owed: int, sym: str) -> str:
+    """What the *issuer* is told. Names the shortfall rather than hiding it — they are
+    the creditor, and the money arrives later in pieces they would not otherwise be
+    able to account for."""
+    if collected <= 0 and owed <= 0:
+        return "."
+    if owed <= 0:
+        return f" and paid the {collected} {sym} fine."
+    if collected <= 0:
+        return (f". They could not cover the {owed} {sym} fine; it is owed to you and "
+                f"collected from their later earnings.")
+    return (f" and paid {collected} {sym} of the fine. The remaining {owed} {sym} is "
+            f"owed to you and collected from their later earnings.")
 
 
 async def restore_rescue(gid: int, contract_id: str, c: dict) -> None:
@@ -222,17 +365,40 @@ def _clear_request(c: dict) -> None:
     c["pending_request"] = None
 
 
-def _other_party(c: dict, actor_id) -> int | None:
-    """The party who did *not* act, or None when that party is the bot."""
+def _xp_withheld_sentence(gate: str) -> str:
+    """Why a player-issued contract paid no XP — said out loud, for the reason the
+    debt and rating-floor code say things out loud: a reward that silently
+    vanishes arrives as a bug report rather than as a question."""
+    if gate == rewards.XP_GATE_COOLDOWN:
+        return (f" No XP: player-contract XP is paid at most once every "
+                f"{settings.CONTRACT_XP_COOLDOWN_MINUTES} minutes.")
+    if gate == rewards.XP_GATE_DAILY:
+        return (f" No XP: you have reached the {settings.CONTRACT_XP_HUMAN_DAILY_MAX} XP "
+                f"that player contracts can pay in {settings.CONTRACT_PAIR_WINDOW_HOURS} hours.")
+    if gate == rewards.XP_GATE_PAIR:
+        return (f" No XP: you and this issuer have completed more than "
+                f"{settings.CONTRACT_PAIR_XP_FREE_PER_DAY} contracts between you in "
+                f"{settings.CONTRACT_PAIR_WINDOW_HOURS} hours.")
+    return ""
+
+
+def _other_party(c: dict, actor_id) -> str | None:
+    """The party who did *not* act, or None when that party is the bot.
+
+    Returned as the account id string: a website account's id is `a_<uid>`, and
+    `cancel()` calls this after the status write and the escrow refund have landed,
+    so an `int()` here turned a completed cancel into a 500.
+    """
     actor = str(actor_id)
     other = c.get("issuer_id") if str(c.get("contractor_id")) == actor else c.get("contractor_id")
     if not other or str(other) == str(_api()._get_bot_user_id()):
         return None
-    return int(other)
+    return str(other)
 
 
 # ── Offer: accept / cancel ───────────────────────────────────────────────────
 
+@serialized
 async def accept(gid: int, contract_id: str, *, actor_id: int, actor_name: str) -> Result:
     """Contractor accepts a pending offer."""
     c, err = _load(gid, contract_id)
@@ -244,12 +410,24 @@ async def accept(gid: int, contract_id: str, *, actor_id: int, actor_name: str) 
     if c.get("status") != cdb.PENDING:
         return _fail(BAD_STATE, "Contract is not pending.", c)
 
+    # Not a lockout — garnishment is already collecting, and shutting a debtor out of
+    # the contract economy would remove the earnings it collects from. This only stops
+    # obligations piling up across MAX_ACTIVE_CONTRACTS_PER_USER contracts at once.
+    cap = settings.DEBT_MAX_OUTSTANDING
+    if cap > 0:
+        owed = store.debt_total(gid, str(actor_id))
+        if owed > cap:
+            return _fail(DEBT_LIMIT,
+                         f"You owe {owed} {settings.CURRENCY_SYMBOL} in unpaid fines "
+                         f"(limit {cap}). Earn it down before taking on new contracts.",
+                         c)
+
     cdb.update_contract(gid, contract_id, status=cdb.ACTIVE)
     c["status"] = cdb.ACTIVE
     log.info("Contract %s accepted by %s", contract_id, actor_name)
 
     if not _is_bot_issued(c):
-        _notify(gid, int(c["issuer_id"]), "contract_accepted", "🤝 Contract Accepted",
+        _notify(gid, str(c["issuer_id"]), "contract_accepted", "🤝 Contract Accepted",
                 f"{actor_name} accepted your contract \"{c['mission'][:80]}\".", contract_id)
 
     # Rescue: hand the rescuer the wreck snapshot and target so their client can spawn
@@ -268,6 +446,7 @@ async def accept(gid: int, contract_id: str, *, actor_id: int, actor_name: str) 
     return Result(ok=True, message="Contract accepted!", contract=c)
 
 
+@serialized
 async def cancel(gid: int, contract_id: str, *, actor_id: int, actor_name: str) -> Result:
     """Withdraw (issuer) or decline (contractor) a contract that is not yet finished.
 
@@ -294,19 +473,57 @@ async def cancel(gid: int, contract_id: str, *, actor_id: int, actor_name: str) 
     cdb.update_contract(gid, contract_id, status=cdb.CANCELLED)
     c["status"] = cdb.CANCELLED
 
-    await _pay_issuer(gid, c, c.get("payment", 0))
-    log.info("Contract %s cancelled by %s (escrow %s refunded to issuer %s)",
-             contract_id, actor_name, c.get("payment"), c.get("issuer_id"))
+    # An issuer withdrawing a contract the contractor has already ACCEPTED pays
+    # the agreed fine to the contractor — the mirror of `give_up`. Without it the
+    # issuer could preview the renders (`get_submission_preview`), decide the
+    # work was not worth paying for, and walk away at zero cost while the
+    # contractor's hours went unpaid. Declining a PENDING offer stays free: nobody
+    # has done anything yet. A bot issuer never pays (no wallet), and a bot
+    # contractor is never paid.
+    sym = settings.CURRENCY_SYMBOL
+    collected = owed = 0
+    contractor = str(c.get("contractor_id") or "")
+    fine = int(c.get("fine", 0) or 0)
+    if (status == cdb.ACTIVE and is_issuer and not is_contractor and fine > 0
+            and not _is_bot_issued(c) and contractor
+            and contractor != str(_api()._get_bot_user_id())):
+        issuer = str(c["issuer_id"])
+        label = _contract_label(c)
+        collected = await store.debit_up_to(
+            gid, issuer, fine, category=store.TX_CONTRACT_FINE, detail=label,
+            counterparty=contractor)
+        owed = fine - collected
+        if owed > 0:
+            await store.add_debt(gid, issuer, contractor, owed)
+        if collected > 0:
+            await store.add_balance(gid, contractor, collected, garnishable=True,
+                                    category=store.TX_FINE_RECEIVED, detail=label,
+                                    counterparty=issuer)
+
+    await _pay_issuer(gid, c, refund=c.get("payment", 0))
+    log.info("Contract %s cancelled by %s (escrow %s refunded to issuer %s, fine %d/%d to contractor)",
+             contract_id, actor_name, c.get("payment"), c.get("issuer_id"), collected, fine)
 
     other = _other_party(c, actor_id)
     if other:
+        extra = ""
+        if collected or owed:
+            extra = (f" You received the {collected} {sym} withdrawal fine."
+                     + (f" {owed} {sym} more is owed to you and comes out of their "
+                        f"later earnings." if owed else ""))
         _notify(gid, other, "contract_cancelled", "🚫 Contract Cancelled",
-                f"{actor_name} cancelled \"{c['mission'][:80]}\".", contract_id)
+                f"{actor_name} cancelled \"{c['mission'][:80]}\"." + extra, contract_id)
 
     await restore_rescue(gid, contract_id, c)
-    return Result(ok=True, message="Contract cancelled. Escrow refunded.", contract=c)
+    msg = "Contract cancelled. Escrow refunded."
+    if collected or owed:
+        msg = ("Contract withdrawn. Escrow refunded."
+               + _fine_paid_sentence(collected, owed, sym).replace("fine", "withdrawal fine", 1))
+    return Result(ok=True, message=msg, contract=c,
+                  data={"fine_collected": collected, "fine_owed": owed})
 
 
+@serialized
 async def give_up(gid: int, contract_id: str, *, actor_id: int, actor_name: str) -> Result:
     """Contractor backs out of a contract they accepted, paying the agreed fine.
 
@@ -325,13 +542,14 @@ async def give_up(gid: int, contract_id: str, *, actor_id: int, actor_name: str)
     fine = c.get("fine", 0)
     sym = settings.CURRENCY_SYMBOL
 
-    # Atomic check-and-deduct: a concurrent spend must not slip the give-up through on
-    # funds that are no longer there. The fine is charged regardless of who issued the
-    # contract — it is the agreed penalty, not a transfer.
-    if fine and not await store.try_debit(gid, int(actor_id), fine):
-        return _fail(NO_FUNDS, f"You need {fine} {sym} to pay the fine and give up.", c)
+    # Partial collection, not an all-or-nothing check. Refusing a contractor who cannot
+    # cover the fine did not protect anything: it left the contract ACTIVE with no way
+    # out, while the same player could submit junk, be refused, and have the dispute
+    # timeout take exactly this much three days later. So the honest exit was the only
+    # blocked one. What is short becomes a debt (see `_charge_fine`).
+    collected, owed = await _charge_fine(gid, c, str(actor_id), fine)
 
-    await _pay_issuer(gid, c, fine + c.get("payment", 0))
+    await _pay_issuer(gid, c, refund=c.get("payment", 0), income=collected)
     cdb.update_contract(gid, contract_id, status=cdb.CANCELLED,
                         completed_at=datetime.utcnow().isoformat())
     c["status"] = cdb.CANCELLED
@@ -339,18 +557,20 @@ async def give_up(gid: int, contract_id: str, *, actor_id: int, actor_name: str)
              contract_id, actor_name, fine, c.get("issuer_id"))
 
     if not _is_bot_issued(c):
-        _notify(gid, int(c["issuer_id"]), "contract_cancelled", "🏳️ Contract Given Up",
+        _notify(gid, str(c["issuer_id"]), "contract_cancelled", "🏳️ Contract Given Up",
                 f"{c.get('contractor_name', actor_name)} gave up on \"{c['mission'][:80]}\""
-                + (f" and paid the {fine} {sym} fine." if fine else "."), contract_id)
+                + _fine_outcome_sentence(collected, owed, sym), contract_id)
 
     await restore_rescue(gid, contract_id, c)
 
-    msg = f"Contract given up. You paid the {fine} {sym} fine." if fine else "Contract given up."
-    return Result(ok=True, message=msg, contract=c)
+    msg = "Contract given up." + _fine_paid_sentence(collected, owed, sym)
+    return Result(ok=True, message=msg, contract=c,
+                  data={"fine_collected": collected, "fine_owed": owed})
 
 
 # ── Review ───────────────────────────────────────────────────────────────────
 
+@serialized
 async def review(gid: int, contract_id: str, *, actor_id: int, actor_name: str,
                  approve: bool) -> Result:
     """Issuer approves a submission (→ completed, contractor paid) or refuses it
@@ -381,7 +601,7 @@ async def review(gid: int, contract_id: str, *, actor_id: int, actor_name: str,
     if not approve and status != cdb.SUBMITTED:
         return _fail(BAD_STATE, "Contract is not awaiting review.", c)
 
-    contractor_id = int(c["contractor_id"])
+    contractor_id = str(c["contractor_id"])
     sym = settings.CURRENCY_SYMBOL
 
     if not approve:
@@ -408,13 +628,43 @@ async def review(gid: int, contract_id: str, *, actor_id: int, actor_name: str,
                         pending_request=None)
     c["status"] = cdb.COMPLETED
     _clear_request(c)
-    await store.add_balance(gid, contractor_id, c["payment"])
+    await store.add_balance(gid, contractor_id, c["payment"], garnishable=True,
+                            category=store.TX_CONTRACT_PAYMENT,
+                            detail=_contract_label(c),
+                            counterparty=str(c.get("issuer_id") or ""))
+    # XP for a human-reviewed contract. The issuer is the sole judge of the work,
+    # so two friendly accounts cycling one contract were an XP pump and, through
+    # the level-up reward, a mint; `rewards.human_contract_xp` is the gate (cap,
+    # cooldown, per-pair limit) and the coins above are untouched by it. A
+    # bot-issued contract reviewed here (a moderator acting for the bot) is not
+    # a player deal and keeps its plain XP.
+    if _is_bot_issued(c):
+        xp_due, gate, flag_pair = rewards.contract_xp(c["payment"], bot_issued=True), "", False
+    else:
+        xp_due, gate, flag_pair = await rewards.human_contract_xp(
+            gid, contractor_id, str(c["issuer_id"]), c["payment"])
+    if flag_pair:
+        try:
+            await _api().flag_suspicion(
+                gid, contractor_id, c.get("contractor_name", ""), "contract_reciprocity",
+                f"{c.get('contractor_name', contractor_id)} and "
+                f"{c.get('issuer_name', c.get('issuer_id'))} (`{c.get('issuer_id')}`) have "
+                f"completed more than {settings.CONTRACT_PAIR_XP_FREE_PER_DAY} player-issued "
+                f"contracts between them in {settings.CONTRACT_PAIR_WINDOW_HOURS} hours "
+                f"(latest: \"{c['mission'][:80]}\", {c['payment']} {sym}). XP for the pair "
+                f"is withheld; coins still settle.", severity="medium")
+        except Exception as exc:  # noqa: BLE001 - a flag must never roll back an approval
+            log.warning("Could not flag contract reciprocity on %s: %s", contract_id, exc)
+    if gate:
+        log.info("Contract %s: XP withheld from %s (%s)", contract_id, contractor_id, gate)
+    xp, _leveled = await rewards.grant_xp(gid, contractor_id, xp_due, reason="Mission approved")
     _notify(gid, contractor_id, "review_result", "✅ Mission Approved!",
             (f"{c.get('issuer_name', 'The issuer')} dropped the dispute on "
              f"\"{c['mission'][:80]}\" and accepted your work. "
              if was_disputed else
              f"Your submission for \"{c['mission'][:80]}\" was approved. ")
-            + f"+{c['payment']} {sym} paid.", contract_id)
+            + f"+{c['payment']} {sym} paid."
+            + (f" +{xp} XP." if xp else _xp_withheld_sentence(gate)), contract_id)
     await _dm_review_approved(gid, contractor_id, c)
 
     # Rescue: return the kerbals and the craft carrying them to the issuer. This also
@@ -431,10 +681,10 @@ async def review(gid: int, contract_id: str, *, actor_id: int, actor_name: str,
     # Flag design: the full-res flag was gated behind approval; queue it for the
     # issuer's in-game flag picker now that it is paid for.
     if c.get("mission_type") == cdb.FLAG_DESIGN and c.get("flag_fullres_url"):
-        imp.enqueue(gid, int(c["issuer_id"]), source="flag", ref_id=contract_id,
+        imp.enqueue(gid, str(c["issuer_id"]), source="flag", ref_id=contract_id,
                     craft_name=c["mission"], flag_url=c["flag_fullres_url"],
                     craft_filename=c.get("flag_filename") or "flag.png")
-        _notify(gid, int(c["issuer_id"]), "flag_delivered", "🚩 Flag Delivered",
+        _notify(gid, str(c["issuer_id"]), "flag_delivered", "🚩 Flag Delivered",
                 "Your custom flag is queued. Open KSP at the Space Center to install it "
                 "into your flag picker.", contract_id)
 
@@ -451,6 +701,7 @@ async def review(gid: int, contract_id: str, *, actor_id: int, actor_name: str,
 DISPUTE_ACTIONS = ("pay_fine", "sue", "settle", "more_time")
 
 
+@serialized
 async def dispute(gid: int, contract_id: str, *, actor_id: int, actor_name: str,
                   action: str, new_date: str = "") -> Result:
     """Contractor resolves a refused submission: settle / more_time / pay_fine / sue.
@@ -473,28 +724,35 @@ async def dispute(gid: int, contract_id: str, *, actor_id: int, actor_name: str,
         return _fail(BAD_REQUEST, f"Unknown dispute action: {action}", c)
 
     sym = settings.CURRENCY_SYMBOL
-    contractor_id = int(c["contractor_id"])
+    contractor_id = str(c["contractor_id"])
 
     # ── Pay Fine ── the contractor concedes: fine to the issuer, escrow released.
     if action == "pay_fine":
         fine = c.get("fine", 0)
-        if fine and not await store.try_debit(gid, contractor_id, fine):
-            return _fail(NO_FUNDS, "Insufficient balance to pay the fine.", c)
-        await _pay_issuer(gid, c, fine + c.get("payment", 0))
+        # Partial, for the same reason `give_up` is: refusing a contractor who cannot
+        # cover it only parked the contract in dispute until the timeout took this
+        # exact amount anyway. Conceding is now always possible; the shortfall is a debt.
+        collected, owed = await _charge_fine(gid, c, contractor_id, fine)
+        await _pay_issuer(gid, c, refund=c.get("payment", 0), income=collected)
         cdb.update_contract(gid, contract_id, status=cdb.COMPLETED,
                             completed_at=datetime.utcnow().isoformat(),
                             pending_request=None)
         c["status"] = cdb.COMPLETED
         _clear_request(c)
         if not _is_bot_issued(c):
-            _notify(gid, int(c["issuer_id"]), "review_result", "💰 Fine Paid",
-                    f"{c.get('contractor_name', actor_name)} paid the fine for "
-                    f"\"{c['mission'][:80]}\". +{fine + c.get('payment', 0)} {sym}.",
+            _notify(gid, str(c["issuer_id"]), "review_result", "💰 Fine Paid",
+                    f"{c.get('contractor_name', actor_name)} settled the fine for "
+                    f"\"{c['mission'][:80]}\". +{collected + c.get('payment', 0)} {sym}."
+                    + (f" {owed} {sym} is still owed and comes out of their later "
+                       f"earnings." if owed else ""),
                     contract_id)
         # The kerbals were never brought home — hand the issuer their wreck back.
         await restore_rescue(gid, contract_id, c)
-        log.info("Contract %s: %s paid the fine", contract_id, actor_name)
-        return Result(ok=True, message="Fine paid. Contract closed.", contract=c)
+        log.info("Contract %s: %s paid %d of the %d fine", contract_id, actor_name,
+                 collected, fine)
+        return Result(ok=True,
+                      message="Contract closed." + _fine_paid_sentence(collected, owed, sym),
+                      contract=c, data={"fine_collected": collected, "fine_owed": owed})
 
     # ── Sue ── escalate to moderators.
     if action == "sue":
@@ -512,7 +770,7 @@ async def dispute(gid: int, contract_id: str, *, actor_id: int, actor_name: str,
         if _is_bot_issued(c):
             return _fail(BAD_REQUEST, "AI contracts cannot be settled.", c)
         _open_request(gid, contract_id, c, REQUEST_SETTLE)
-        _notify(gid, int(c["issuer_id"]), "dispute_request", "🤝 Settlement Requested",
+        _notify(gid, str(c["issuer_id"]), "dispute_request", "🤝 Settlement Requested",
                 f"{c.get('contractor_name', actor_name)} asks to settle "
                 f"\"{c['mission'][:80]}\" with no exchange.", contract_id)
         # Best-effort: the request already exists on the contract, so a failed DM costs
@@ -553,7 +811,7 @@ async def dispute(gid: int, contract_id: str, *, actor_id: int, actor_name: str,
     cdb.update_contract(gid, contract_id, more_time_requests=used + 1)
     c["more_time_requests"] = used + 1
     _open_request(gid, contract_id, c, REQUEST_MORE_TIME, new_date)
-    _notify(gid, int(c["issuer_id"]), "dispute_request", "⏰ Extension Requested",
+    _notify(gid, str(c["issuer_id"]), "dispute_request", "⏰ Extension Requested",
             f"{c.get('contractor_name', actor_name)} asks to move the deadline of "
             f"\"{c['mission'][:80]}\" to {new_date}.", contract_id)
     await _dm_more_time_request(gid, contract_id, c, new_date)
@@ -573,6 +831,7 @@ def _open_request_of(c: dict, kind: str) -> dict | None:
     return req if req and req.get("kind") == kind else None
 
 
+@serialized
 async def settle_response(gid: int, contract_id: str, *, actor_id: int, actor_name: str,
                           approve: bool) -> Result:
     """Issuer answers a settlement request: drop the contract with no exchange."""
@@ -590,7 +849,7 @@ async def settle_response(gid: int, contract_id: str, *, actor_id: int, actor_na
     if not approve:
         cdb.update_contract(gid, contract_id, pending_request=None)
         _clear_request(c)
-        _notify(gid, int(c["contractor_id"]), "review_result", "❌ Settlement Refused",
+        _notify(gid, str(c["contractor_id"]), "review_result", "❌ Settlement Refused",
                 f"The issuer refused to settle \"{c['mission'][:80]}\".", contract_id)
         log.info("Contract %s: settlement refused by %s", contract_id, actor_name)
         return Result(ok=True, message="Settlement refused.", contract=c)
@@ -598,8 +857,10 @@ async def settle_response(gid: int, contract_id: str, *, actor_id: int, actor_na
     cdb.update_contract(gid, contract_id, status=cdb.CANCELLED, pending_request=None)
     c["status"] = cdb.CANCELLED
     _clear_request(c)
-    await _pay_issuer(gid, c, c.get("payment", 0))
-    _notify(gid, int(c["contractor_id"]), "review_result", "🤝 Settled",
+    # A settlement is "no fine, no payment" — the issuer's own escrow coming back,
+    # never income, so garnishment must not touch it.
+    await _pay_issuer(gid, c, refund=c.get("payment", 0))
+    _notify(gid, str(c["contractor_id"]), "review_result", "🤝 Settled",
             f"\"{c['mission'][:80]}\" was settled. No fine, no payment.", contract_id)
     # Settled means the rescue never happened — return the issuer's stranded vessel.
     await restore_rescue(gid, contract_id, c)
@@ -607,6 +868,7 @@ async def settle_response(gid: int, contract_id: str, *, actor_id: int, actor_na
     return Result(ok=True, message="Settled. Escrow refunded.", contract=c)
 
 
+@serialized
 async def more_time_response(gid: int, contract_id: str, *, actor_id: int, actor_name: str,
                              approve: bool, new_date: str = "") -> Result:
     """Issuer answers a deadline-extension request.
@@ -633,7 +895,7 @@ async def more_time_response(gid: int, contract_id: str, *, actor_id: int, actor
     if not approve:
         cdb.update_contract(gid, contract_id, pending_request=None)
         _clear_request(c)
-        _notify(gid, int(c["contractor_id"]), "review_result", "❌ Extension Refused",
+        _notify(gid, str(c["contractor_id"]), "review_result", "❌ Extension Refused",
                 f"Your extension request for \"{c['mission'][:80]}\" was refused.", contract_id)
         log.info("Contract %s: extension refused by %s", contract_id, actor_name)
         return Result(ok=True, message="Extension refused.", contract=c)
@@ -647,7 +909,7 @@ async def more_time_response(gid: int, contract_id: str, *, actor_id: int, actor
     c["status"] = cdb.ACTIVE
     c["due_date"] = granted
     _clear_request(c)
-    _notify(gid, int(c["contractor_id"]), "review_result", "⏰ Deadline Extended",
+    _notify(gid, str(c["contractor_id"]), "review_result", "⏰ Deadline Extended",
             f"\"{c['mission'][:80]}\" is active again, due {granted}.", contract_id)
     log.info("Contract %s extended to %s by %s", contract_id, granted, actor_name)
     return Result(ok=True, message=f"Deadline extended to {granted}.", contract=c,
@@ -656,16 +918,18 @@ async def more_time_response(gid: int, contract_id: str, *, actor_id: int, actor
 
 # ── The dispute clock ────────────────────────────────────────────────────────
 
+@serialized
 async def expire_dispute(gid: int, contract_id: str) -> Result:
     """Collect the fine on a dispute nobody resolved in time.
 
     Called by the sweep in `cogs/contracts.py`, never by a player, so it takes no actor
     — the *absence* of an action is what triggers it.
 
-    Uses `debit_up_to` rather than `try_debit`, deliberately. A contractor who cannot
-    cover the fine would otherwise fail this check forever and keep the contract parked
-    in dispute, which is precisely the stall being closed. Taking what they have and
-    closing it matches what a moderator does with Enforce Fine.
+    Collects through `_charge_fine`, so what the contractor cannot cover is billed to
+    them as a debt rather than forgiven. Taking what they have and closing matches what
+    a moderator does with Enforce Fine, and what the contractor could have chosen
+    themselves via Give Up or Pay Fine — this path exists only because they chose
+    nothing.
     """
     c, err = _load(gid, contract_id)
     if err:
@@ -685,34 +949,142 @@ async def expire_dispute(gid: int, contract_id: str) -> Result:
     if datetime.utcnow() < deadline:
         return _fail(BAD_STATE, "Dispute has not timed out yet.", c)
 
+    # An open settle / extension request at the deadline means the contractor DID
+    # act and the issuer never answered — fining them here made the issuer's
+    # silence the contractor's penalty, and "don't answer" the cheapest way for an
+    # issuer to collect a fine. The clock still does not pause (settings.py says
+    # why: a pause is a stall); instead the unanswered request goes to the
+    # moderators, who can settle, extend or enforce the fine with the facts in
+    # front of them. Where moderator review is not configured, the request is
+    # cleared and the clock restarts ONCE (`request_grace_used`), so an issuer who
+    # keeps not answering still gets the agreed penalty on the next window rather
+    # than the contractor stalling forever.
+    req = c.get("pending_request") or None
+    if req and not c.get("request_grace_used"):
+        kind = req.get("kind") or "request"
+        posted = await _escalate_to_mods(gid, contract_id, c,
+                                         opener_id=str(c["contractor_id"]))
+        if posted:
+            cdb.update_contract(gid, contract_id, status=cdb.MOD_REVIEW,
+                                pending_request=None, request_grace_used=True,
+                                escalated_by="unanswered_request")
+            c["status"] = cdb.MOD_REVIEW
+            c["request_grace_used"] = True
+            _clear_request(c)
+            _notify(gid, str(c["contractor_id"]), "review_result", "⚖️ Sent to Moderators",
+                    f"Your {kind.replace('_', ' ')} request on \"{c['mission'][:80]}\" "
+                    f"went unanswered, so the case was handed to the moderators instead "
+                    f"of collecting the fine.", contract_id)
+            if not _is_bot_issued(c):
+                _notify(gid, str(c["issuer_id"]), "review_result", "⚖️ Sent to Moderators",
+                        f"You did not answer the {kind.replace('_', ' ')} request on "
+                        f"\"{c['mission'][:80]}\" in time, so the moderators will decide it.",
+                        contract_id)
+            log.info("Contract %s: dispute timed out with an unanswered %s request; "
+                     "escalated to moderators", contract_id, kind)
+            return Result(ok=True, message="Unanswered request escalated to moderators.",
+                          contract=c, data={"escalated": True})
+        now = datetime.utcnow().isoformat()
+        cdb.update_contract(gid, contract_id, disputed_at=now, pending_request=None,
+                            request_grace_used=True)
+        c["disputed_at"] = now
+        c["request_grace_used"] = True
+        _clear_request(c)
+        if not _is_bot_issued(c):
+            _notify(gid, str(c["issuer_id"]), "review_result", "⏱️ Request Unanswered",
+                    f"You did not answer the {kind.replace('_', ' ')} request on "
+                    f"\"{c['mission'][:80]}\". The dispute clock has restarted once; "
+                    f"if it runs out again the fine is collected.", contract_id)
+        log.info("Contract %s: dispute timed out with an unanswered %s request and no "
+                 "moderator channel; clock restarted once", contract_id, kind)
+        return _fail(BAD_STATE, "Unanswered request; dispute clock restarted once.", c)
+
     sym = settings.CURRENCY_SYMBOL
     fine = c.get("fine", 0)
-    collected = await store.debit_up_to(gid, int(c["contractor_id"]), fine) if fine else 0
-    await _pay_issuer(gid, c, collected + c.get("payment", 0))
+    collected, owed = await _charge_fine(gid, c, str(c["contractor_id"]), fine)
+    await _pay_issuer(gid, c, refund=c.get("payment", 0), income=collected)
     cdb.update_contract(gid, contract_id, status=cdb.COMPLETED,
                         completed_at=datetime.utcnow().isoformat(),
                         pending_request=None, closed_by="dispute_timeout")
     c["status"] = cdb.COMPLETED
     _clear_request(c)
 
-    _notify(gid, int(c["contractor_id"]), "review_result", "⏱️ Dispute Timed Out",
+    _notify(gid, str(c["contractor_id"]), "review_result", "⏱️ Dispute Timed Out",
             f"\"{c['mission'][:80]}\" sat in dispute for "
             f"{settings.DISPUTE_AUTO_FINE_DAYS} days, so the fine was collected "
-            f"automatically. -{collected} {sym}.", contract_id)
+            f"automatically. -{collected} {sym}."
+            + (f" {owed} {sym} could not be covered and is owed to the issuer, "
+               f"collected from your later earnings." if owed else ""), contract_id)
     if not _is_bot_issued(c):
-        _notify(gid, int(c["issuer_id"]), "review_result", "⏱️ Dispute Timed Out",
+        _notify(gid, str(c["issuer_id"]), "review_result", "⏱️ Dispute Timed Out",
                 f"The dispute on \"{c['mission'][:80]}\" expired. You received "
-                f"{collected + c.get('payment', 0)} {sym}.", contract_id)
+                f"{collected + c.get('payment', 0)} {sym}."
+                + (f" A further {owed} {sym} is owed to you and comes out of their "
+                   f"later earnings." if owed else ""), contract_id)
 
     await restore_rescue(gid, contract_id, c)
-    log.info("Contract %s: dispute timed out, collected %d of %d fine",
-             contract_id, collected, fine)
+    log.info("Contract %s: dispute timed out, collected %d of %d fine (%d owed)",
+             contract_id, collected, fine, owed)
     return Result(ok=True, message=f"Dispute timed out. Fine collected ({collected}).",
-                  contract=c, data={"fine_collected": collected})
+                  contract=c, data={"fine_collected": collected, "fine_owed": owed})
+
+
+@serialized
+async def expire_overdue(gid: int, contract_id: str) -> Result:
+    """Push an ACTIVE contract past its due date into dispute.
+
+    Like `expire_dispute`, this is called by a sweep and never by a player — the
+    *absence* of a submission is what triggers it — so it takes no actor.
+
+    It deliberately charges nothing. Missing a deadline is not the same as conceding:
+    the contractor still has settle, more time, pay the fine and sue available to
+    them, and this only starts the clock that makes one of those happen. Anything
+    else would fine a player for a deadline they might have had a good reason to
+    miss, with no chance to say so.
+    """
+    c, err = _load(gid, contract_id)
+    if err:
+        return err
+    if c.get("status") != cdb.ACTIVE:
+        return _fail(BAD_STATE, "Contract is not active.", c)
+
+    due = (c.get("due_date") or "").strip()
+    try:
+        due_date = datetime.strptime(due, "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        # No usable due date — nothing to measure lateness against. Left alone rather
+        # than swept, since guessing one would dispute a contract that may be fine.
+        return _fail(BAD_REQUEST, "Contract has no valid due date.", c)
+
+    today = datetime.now(timezone(timedelta(hours=3))).date()
+    if (today - due_date).days <= settings.CONTRACT_OVERDUE_GRACE_DAYS:
+        return _fail(BAD_STATE, "Contract is not overdue yet.", c)
+
+    # Through open_dispute_fields, like every other path into DISPUTED: it is what
+    # resets the per-dispute more-time allowance, which a hand-written status
+    # write here used to skip — so a contractor who had used their one extension
+    # before was told "already asked" on the fresh dispute.
+    fields = open_dispute_fields()
+    cdb.update_contract(gid, contract_id, **fields)
+    c.update(fields)
+
+    _notify(gid, str(c["contractor_id"]), "review_result", "⌛ Deadline Passed",
+            f"\"{c['mission'][:80]}\" was due {due} and has not been submitted, so it "
+            f"has gone to dispute. Settle, ask for more time, pay the fine or sue — "
+            f"left alone, the fine collects itself in "
+            f"{settings.DISPUTE_AUTO_FINE_DAYS} days.", contract_id)
+    if not _is_bot_issued(c):
+        _notify(gid, str(c["issuer_id"]), "review_result", "⌛ Deadline Passed",
+                f"\"{c['mission'][:80]}\" was due {due} and was never submitted. "
+                f"It is now in dispute.", contract_id)
+
+    log.info("Contract %s went overdue (due %s) and was pushed to dispute", contract_id, due)
+    return Result(ok=True, message="Contract overdue; dispute opened.", contract=c)
 
 
 # ── Moderator resolution ─────────────────────────────────────────────────────
 
+@serialized
 async def mod_resolve(gid: int, contract_id: str, *, actor_id: int, actor_name: str,
                       enforce: bool) -> Result:
     """Moderator closes an escalated dispute.
@@ -734,8 +1106,8 @@ async def mod_resolve(gid: int, contract_id: str, *, actor_id: int, actor_name: 
     if not enforce:
         cdb.update_contract(gid, contract_id, status=cdb.CANCELLED)
         c["status"] = cdb.CANCELLED
-        await _pay_issuer(gid, c, payment)
-        _notify(gid, int(c["contractor_id"]), "review_result", "⚖️ Fine Cancelled",
+        await _pay_issuer(gid, c, refund=payment)
+        _notify(gid, str(c["contractor_id"]), "review_result", "⚖️ Fine Cancelled",
                 f"Moderators cancelled the fine for \"{c['mission'][:80]}\".", contract_id)
         await restore_rescue(gid, contract_id, c)
         log.info("Contract %s: %s cancelled the fine", contract_id, actor_name)
@@ -743,19 +1115,65 @@ async def mod_resolve(gid: int, contract_id: str, *, actor_id: int, actor_name: 
                       data={"fine_collected": 0})
 
     # Take whatever the contractor can actually pay and pass exactly that on, so the
-    # issuer is never credited coins that were never debited.
-    collected = await store.debit_up_to(gid, int(c["contractor_id"]), c.get("fine", 0))
-    await _pay_issuer(gid, c, collected + payment)
+    # issuer is never credited coins that were never debited. The shortfall is billed
+    # rather than dropped — a moderator enforcing a fine has decided it is owed, which
+    # is precisely the case debt exists for.
+    collected, owed = await _charge_fine(gid, c, str(c["contractor_id"]), c.get("fine", 0))
+    await _pay_issuer(gid, c, refund=payment, income=collected)
     cdb.update_contract(gid, contract_id, status=cdb.COMPLETED,
                         completed_at=datetime.utcnow().isoformat())
     c["status"] = cdb.COMPLETED
-    _notify(gid, int(c["contractor_id"]), "review_result", "⚖️ Fine Enforced",
+    _notify(gid, str(c["contractor_id"]), "review_result", "⚖️ Fine Enforced",
             f"Moderators enforced the fine for \"{c['mission'][:80]}\". "
-            f"-{collected} {settings.CURRENCY_SYMBOL}.", contract_id)
+            f"-{collected} {settings.CURRENCY_SYMBOL}."
+            + (f" {owed} {settings.CURRENCY_SYMBOL} is owed and comes out of your "
+               f"later earnings." if owed else ""), contract_id)
     await restore_rescue(gid, contract_id, c)
-    log.info("Contract %s: %s enforced the fine (%d collected)", contract_id, actor_name, collected)
+    log.info("Contract %s: %s enforced the fine (%d collected, %d owed)",
+             contract_id, actor_name, collected, owed)
     return Result(ok=True, message=f"Fine enforced ({collected}). Escrow refunded.",
-                  contract=c, data={"fine_collected": collected})
+                  contract=c, data={"fine_collected": collected, "fine_owed": owed})
+
+
+@serialized
+async def mod_review_submission(gid: int, contract_id: str, *, actor_id: int,
+                                actor_name: str, approve: bool) -> Result:
+    """Moderator decides a bot-issued submission the AI reviewer could not.
+
+    `api_server._ai_review_submission` no longer pays a weekly mission when nobody
+    reviewed it (key missing, budget spent, model error, quota): the contract stays
+    SUBMITTED, a ticket is opened, and this is the button in that ticket. Approve
+    runs the same payout `_auto_accept_contract` gives an AI approval; refuse opens
+    the ordinary dispute. **Authorization is the caller's job**, exactly as for
+    `mod_resolve`.
+    """
+    c, err = _load(gid, contract_id)
+    if err:
+        return err
+    if not _is_bot_issued(c):
+        return _fail(BAD_REQUEST, "Only bot-issued submissions are reviewed here; the "
+                                  "issuer reviews their own.", c)
+    if c.get("status") != cdb.SUBMITTED:
+        return _fail(BAD_STATE, f"This submission is {c.get('status')}, not awaiting review.", c)
+    contractor_id = str(c["contractor_id"])
+    if approve:
+        r = await _api()._auto_accept_contract(
+            gid, contractor_id, contract_id, c, reason=f"Approved by moderator {actor_name}.")
+        if not r.success:
+            return _fail(BAD_STATE, r.message, c)
+        c["status"] = cdb.COMPLETED
+        log.info("Contract %s: held submission approved by %s", contract_id, actor_name)
+        return Result(ok=True, message=r.message, contract=c)
+    fields = open_dispute_fields()
+    cdb.update_contract(gid, contract_id, review_reason=f"Refused by moderator {actor_name}.",
+                        **fields)
+    c.update(fields)
+    _notify(gid, contractor_id, "review_result", "⚠️ Submission Refused",
+            f"A moderator refused your submission for \"{c['mission'][:80]}\". Settle, "
+            f"ask for more time, pay the fine or sue.", contract_id)
+    await _dm_dispute_options(gid, contract_id, contractor_id)
+    log.info("Contract %s: held submission refused by %s", contract_id, actor_name)
+    return Result(ok=True, message="Submission refused. Dispute opened.", contract=c)
 
 
 # ── Date helpers ─────────────────────────────────────────────────────────────
@@ -803,26 +1221,52 @@ async def deliver_to_player(gid: int, user_id: int, *, content: str | None = Non
     not notify by itself, so the player is mentioned; the DM fallback drops the
     mention, which is redundant there. Returns the sent message, or None when
     neither surface worked.
+
+    A player who has turned corp pings off (`store.corp_pings_enabled`, set from
+    the mod's Settings panel) still gets the mention *text* — the post has to say
+    who it is addressed to, and a corp channel has other members reading it — but
+    it is sent with `allowed_mentions=none`, so Discord does not notify them. The
+    message itself is never withheld: every caller pairs this with `_notify`, so
+    the in-game feed carries it either way, and dropping the Discord copy would
+    hide a contract from the mods and corp members who can also see the channel.
+    The DM fallback is untouched: a DM is the delivery, not a ping, and it is only
+    ever reached when there is no corp channel to have posted in.
     """
     bot = _bot()
     if bot is None:
         return None
     from cogs.corps import find_user_corp
-    mention = f"<@{int(user_id)}>"
+
+    # An account id is only a Discord snowflake when the account HAS a Discord.
+    # A website-only player has neither a mention nor a corp channel, and both
+    # surfaces below are Discord's — so skip the delivery rather than attempt it
+    # with an id Discord cannot resolve. Their notification feed already carries
+    # the same message: every caller pairs `_notify` with this.
+    did = str(user_id) if str(user_id).isdigit() else ""
+    if not did:
+        return None
+
+    mention = f"<@{did}>"
     try:
-        corp = find_user_corp(gid, int(user_id))
+        corp = find_user_corp(gid, did)
         ch_id = int(corp.get("channel_id") or 0) if corp else 0
         if ch_id:
             # The corp may live in another guild — resolve at the bot level.
             channel = bot.get_channel(ch_id)
             if channel is None:
                 channel = await bot.fetch_channel(ch_id)
+            import discord
+            # None, not AllowedMentions(users=True): `send` reads None as "use the
+            # client default", so the ping-on path is byte-for-byte what this call
+            # did before the preference existed.
+            allowed = (None if store.corp_pings_enabled(gid, did)
+                       else discord.AllowedMentions.none())
             return await channel.send(content=f"{mention} {content}" if content else mention,
-                                      embed=embed, view=view)
+                                      embed=embed, view=view, allowed_mentions=allowed)
     except Exception as exc:
         log.warning("Corp-channel delivery to %s failed, trying DM: %s", user_id, exc)
     try:
-        u = bot.get_user(int(user_id)) or await bot.fetch_user(int(user_id))
+        u = bot.get_user(int(did)) or await bot.fetch_user(int(did))
         return await u.send(content=content, embed=embed, view=view)
     except Exception as exc:
         log.warning("Could not DM %s: %s", user_id, exc)
@@ -868,7 +1312,7 @@ async def _dm_settle_request(gid: int, contract_id: str, c: dict) -> bool:
         e = discord.Embed(title=f"🤝 {t(gid, 'ct.settle_request')}",
                           description=t(gid, 'ct.settle_desc', name=c['contractor_name']),
                           color=discord.Color.light_grey())
-        msg = await deliver_to_player(gid, int(c["issuer_id"]), embed=e,
+        msg = await deliver_to_player(gid, str(c["issuer_id"]), embed=e,
                                       view=SettleApprovalView(contract_id, gid))
         return msg is not None
     except Exception as exc:
@@ -885,7 +1329,7 @@ async def _dm_more_time_request(gid: int, contract_id: str, c: dict, new_date: s
                           description=t(gid, 'ct.moretime_desc', name=c['contractor_name'],
                                         old=c['due_date'], new=new_date),
                           color=discord.Color.blue())
-        msg = await deliver_to_player(gid, int(c["issuer_id"]), embed=e,
+        msg = await deliver_to_player(gid, str(c["issuer_id"]), embed=e,
                                       view=MoreTimeApprovalView(contract_id, gid, new_date))
         return msg is not None
     except Exception as exc:
@@ -893,7 +1337,8 @@ async def _dm_more_time_request(gid: int, contract_id: str, c: dict, new_date: s
         return False
 
 
-async def _escalate_to_mods(gid: int, contract_id: str, c: dict, *, opener_id: int) -> bool:
+async def _escalate_to_mods(gid: int, contract_id: str, c: dict, *, opener_id: int,
+                            view=None) -> bool:
     """Post the case for moderator review, preferring a private ticket (both parties
     plus mods) and falling back to the shared mod channel.
 
@@ -911,6 +1356,9 @@ async def _escalate_to_mods(gid: int, contract_id: str, c: dict, *, opener_id: i
         e = _embed(c, gid)
         e.title = f"⚖️ {t(gid, 'ct.mod_review')}"
         e.color = discord.Color.purple()
+        # The buttons the moderators get: enforce/cancel a fine by default, or
+        # approve/refuse for a held bot-issued submission.
+        view = view or ModReviewView(contract_id, gid)
         # Why the submission was refused, so mods can judge whether the refusal was wrong.
         reason = c.get("review_reason")
         if reason:
@@ -926,8 +1374,8 @@ async def _escalate_to_mods(gid: int, contract_id: str, c: dict, *, opener_id: i
                 from cogs.tickets import create_ticket
                 guild = bot.get_guild(gid)
                 if guild is not None:
-                    other_id = (int(c["issuer_id"]) if str(opener_id) == str(c.get("contractor_id"))
-                                else int(c["contractor_id"]))
+                    other_id = (str(c["issuer_id"]) if str(opener_id) == str(c.get("contractor_id"))
+                                else str(c["contractor_id"]))
                     ch = await create_ticket(
                         bot, guild, opener_id=opener_id, kind="other",
                         title="Contract dispute (escalated)",
@@ -936,7 +1384,7 @@ async def _escalate_to_mods(gid: int, contract_id: str, c: dict, *, opener_id: i
                         color=discord.Color.purple(),
                         extra_user_ids=[other_id],
                         extra_embeds=[e],
-                        extra_view=ModReviewView(contract_id, gid),
+                        extra_view=view,
                     )
                     if ch is not None:
                         return True
@@ -946,7 +1394,7 @@ async def _escalate_to_mods(gid: int, contract_id: str, c: dict, *, opener_id: i
         ch = guild_config.resolve_channel(bot, gid, "contract_mod")
         if ch is None:
             return False
-        await ch.send(embed=e, view=ModReviewView(contract_id, gid))
+        await ch.send(embed=e, view=view)
         return True
     except Exception as exc:
         log.warning("Could not escalate contract %s to mods: %s", contract_id, exc)

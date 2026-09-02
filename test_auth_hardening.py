@@ -251,17 +251,55 @@ import api_server
 api_server._LINK_FAILURES.clear()
 api_server._RATE_BUCKETS.clear()
 req = lambda ip: types.SimpleNamespace(client=types.SimpleNamespace(host=ip), headers={})
-for _ in range(api_server._LINK_FAIL_MAX - 1):
-    api_server._note_failed_link_guess("10.9.9.9")
-api_server._guard_link_attempt(req("10.9.9.9"))
-check("below threshold: the address may still try", True)
-api_server._note_failed_link_guess("10.9.9.9")
+
+# The per-address half of the link guard — the bucket AND the ten-minute lockout —
+# now applies only when `API_TRUSTED_PROXIES` is set, because `_client_ip` otherwise
+# returns the socket peer, which behind Caddy is ONE address for every KSP client in
+# the world. Unconditional, forty wrong codes from anywhere locked out linking for
+# the entire community: a one-attacker kill switch, which is the self-DoS the code's
+# own comment already worried about for the global cap.
+#
+# Drives API_TRUSTED_PROXY_NETS, which is what the gate now reads (WR4): entries are
+# parsed as networks so ranges are expressible, and an all-unparseable config reads as
+# empty. Both fields are set together so the live behaviour and anything reading the raw
+# strings stay consistent.
+import ipaddress as _ipaddress
+from config import cfg as _cfg
+_saved_proxies = _cfg.API_TRUSTED_PROXIES
+_saved_nets = _cfg.API_TRUSTED_PROXY_NETS
+_cfg.API_TRUSTED_PROXIES = {"127.0.0.1"}
+_cfg.API_TRUSTED_PROXY_NETS = [_ipaddress.ip_network("127.0.0.1/32")]
 try:
+    for _ in range(api_server._LINK_FAIL_MAX - 1):
+        api_server._note_failed_link_guess("10.9.9.9")
     api_server._guard_link_attempt(req("10.9.9.9"))
-    locked = False
-except Exception as exc:
-    locked = getattr(exc, "status_code", None) == 429
-check("at threshold: the address is refused (429)", locked)
+    check("below threshold: the address may still try", True)
+    api_server._note_failed_link_guess("10.9.9.9")
+    try:
+        api_server._guard_link_attempt(req("10.9.9.9"))
+        locked = False
+    except Exception as exc:
+        locked = getattr(exc, "status_code", None) == 429
+    check("at threshold: the address is refused (429)", locked)
+finally:
+    _cfg.API_TRUSTED_PROXIES = _saved_proxies
+    _cfg.API_TRUSTED_PROXY_NETS = _saved_nets
+
+# ...and with no trusted proxy configured the per-address lockout must NOT fire,
+# since every caller would share one address and one attacker would lock out all.
+api_server._RATE_BUCKETS.clear()
+_cfg.API_TRUSTED_PROXIES = set()
+_cfg.API_TRUSTED_PROXY_NETS = []
+try:
+    api_server._guard_link_attempt(req("10.9.9.9"))   # still over the fail threshold
+    collapsed_ok = True
+except Exception:
+    collapsed_ok = False
+finally:
+    _cfg.API_TRUSTED_PROXIES = _saved_proxies
+    _cfg.API_TRUSTED_PROXY_NETS = _saved_nets
+check("with no trusted proxy the shared address is not locked out for everyone",
+      collapsed_ok)
 api_server._guard_link_attempt(req("10.9.9.8"))
 check("another address is unaffected", True)
 check("no global purge exists any more", not hasattr(api_server, "_FAILED_LINK_GUESSES"))
@@ -281,7 +319,11 @@ conf = open(os.path.join(BOT, "config.py"), encoding="utf-8").read()
 check("no required Header(...) left on authorization (401 not 422)",
       'authorization: str = Header(...)' not in api)
 check("every verify call site uses _accept_secrets()",
-      len(re.findall(r"verify_session_token\([^)]*_accept_secrets\(\)", api)) >= 1
+      # The call is now `await asyncio.to_thread(verify_session_token, token, secrets_)`
+    # (the token check moved off the event loop), so `_accept_secrets()` can no longer
+    # appear inside the call parens. Assert the property instead of the old spelling:
+    # the accept list is what is passed, and no hardcoded secret is.
+    bool(re.search(r"secrets_\s*=\s*_accept_secrets\(\)[\s\S]{0,300}?verify_session_token", api))
       and "verify_session_token(authorization[7:], _get_api_secret())" not in api
       and "verify_session_token(token, _get_api_secret())" not in api)
 check("signing still uses the current key only",

@@ -24,7 +24,10 @@ Three details are load-bearing:
     credentials should not ride along in something fetched to draw a name.
   • **A used code cannot be used again.** `last_counter` is stored and the check
     refuses anything at or below it, so a code shoulder-surfed inside its 30-second
-    window is already spent by the time it is retyped.
+    window is already spent by the time it is retyped. The read that decides and
+    the write that spends are one Firestore transaction (`_transact`): done as
+    two calls, every copy of the same code fired inside one round-trip read the
+    old counter and all passed, which is a replayable OTP wearing a 2FA badge.
   • **Recovery codes are stored hashed and single-use** — the only way back in when
     the phone is gone, and the reason enabling TOTP is not a way to lose an account.
 """
@@ -38,9 +41,25 @@ import struct
 import time
 from datetime import datetime, timezone
 
+from firebase_admin import firestore
+
 from data.store import _db
 
 log = logging.getLogger(__name__)
+
+
+def _transact(fn):
+    """Run `fn(txn)` inside a Firestore transaction and return what it returns.
+
+    Same pattern as `accounts.claim_username`. Every read `fn` does must go
+    through `ref.get(transaction=txn)` and every write through `txn.set` /
+    `txn.delete`, which is what makes "the value I read" and "the value I wrote
+    on the strength of it" one indivisible step: a second writer that got there
+    first makes the SDK re-run `fn` against the fresh state (up to its default
+    five attempts) and raise when it gives up. Callers catch that and fail
+    closed — a code that could not be checked is a code that was not accepted.
+    """
+    return firestore.transactional(fn)(_db.transaction())
 
 # RFC 6238 defaults, which is what every authenticator app assumes.
 DIGITS = 6
@@ -214,15 +233,31 @@ def is_enabled(account_id) -> bool:
 
 
 def begin_enroll(account_id, account_name: str) -> dict | None:
-    """Mint a secret and hold it unconfirmed. Returns {secret, uri}.
+    """Mint a secret and hold it unconfirmed. Returns {secret, uri}, or None.
 
     Nothing is enforced until `confirm_enroll` sees a working code — enabling on
     the strength of a secret nobody has proved they can read would lock people out
     of their own accounts with a QR they never scanned.
+
+    None means "nothing was started", for two reasons the caller does not need to
+    tell apart: the record could not be read, or 2FA is already **on**. Both
+    exist for the same reason. This used to `set()` a fresh unconfirmed record
+    without looking, which made it the one code-free way to turn an enabled
+    factor off — and whoever then confirmed a code from *their own* authenticator
+    owned the account's second factor, recovery codes included. The read and the
+    write are one transaction so an enrolment cannot slip in between
+    `confirm_enroll`'s check and its enable either. The route refuses "already
+    on" with a fail-closed `is_enabled` first; this is the backstop for the read
+    blip that check would otherwise turn into a clobber.
     """
+    ref = _col().document(str(account_id))
     secret = generate_secret()
-    try:
-        _col().document(str(account_id)).set({
+
+    def _start(txn) -> bool:
+        snap = ref.get(transaction=txn)
+        if snap.exists and (snap.to_dict() or {}).get("enabled"):
+            return False
+        txn.set(ref, {
             "account_id": str(account_id),
             "secret": secret,
             "enabled": False,
@@ -230,8 +265,15 @@ def begin_enroll(account_id, account_name: str) -> dict | None:
             "recovery_hashes": [],
             "last_counter": 0,
         })
+        return True
+
+    try:
+        started = _transact(_start)
     except Exception as exc:
         log.warning("Could not begin 2FA enrolment for %s: %s", account_id, exc)
+        return None
+    if not started:
+        log.warning("Refused to restart 2FA enrolment for %s: it is already on", account_id)
         return None
     return {"secret": secret, "uri": provisioning_uri(secret, account_name)}
 
@@ -282,48 +324,60 @@ def verify(account_id, code: str) -> tuple[bool, str]:
     """Check a code at sign-in. Accepts a TOTP code or a recovery code.
 
     A matched TOTP counter is recorded so the same code cannot be presented twice,
-    and a matched recovery code is removed — both are one-shot by design.
+    and a matched recovery code is removed — both are one-shot by design, and
+    both happen in the same transaction as the read that judged them. Without
+    that, N copies of one valid code arriving inside a Firestore round-trip all
+    read the old `last_counter` (or the still-present recovery hash) and all
+    passed — measured at 10/10 for a TOTP code and 8/8 for a recovery code.
+
+    A write that fails is a code that was not accepted: the earlier version
+    logged a failed counter write and let the sign-in through anyway, which is
+    exactly the state in which the code is still good for a replay.
     """
     ref = _col().document(str(account_id))
-    try:
-        snap = ref.get()
-    except Exception as exc:
-        log.warning("Could not read 2FA for %s: %s", account_id, exc)
-        return False, "Couldn't check that just now. Try again."
-    if not snap.exists or not (snap.to_dict() or {}).get("enabled"):
-        return False, "Two-factor authentication isn't set up on this account."
-
-    d = snap.to_dict() or {}
-    secret = str(d.get("secret") or "")
-    last = int(d.get("last_counter", 0) or 0)
-
-    counter = match_counter(secret, code) if secret else None
-    if counter is not None:
-        if counter <= last:
-            # Correct, but already spent. Refusing is the point: otherwise a code
-            # read over someone's shoulder stays good for the rest of its window.
-            return False, "That code has already been used. Wait for the next one."
-        try:
-            ref.set({"last_counter": counter, "last_used_at": _now()}, merge=True)
-        except Exception as exc:
-            log.warning("Could not record 2FA counter for %s: %s", account_id, exc)
-        return True, "ok"
-
-    # Not a TOTP code — try the recovery list.
     hashed = _hash_code(code)
-    remaining = list(d.get("recovery_hashes") or [])
-    if hashed in remaining:
-        remaining.remove(hashed)
-        try:
-            ref.set({"recovery_hashes": remaining,
-                     "last_used_at": _now()}, merge=True)
-        except Exception as exc:
-            log.warning("Could not spend recovery code for %s: %s", account_id, exc)
-            return False, "Couldn't check that just now. Try again."
-        log.warning("Account %s signed in with a recovery code (%d left)",
-                    account_id, len(remaining))
-        return True, f"Recovery code accepted. {len(remaining)} left."
 
+    def _spend(txn) -> tuple[str, int]:
+        snap = ref.get(transaction=txn)
+        d = snap.to_dict() or {}
+        if not snap.exists or not d.get("enabled"):
+            return "off", 0
+        secret = str(d.get("secret") or "")
+        last = int(d.get("last_counter", 0) or 0)
+
+        counter = match_counter(secret, code) if secret else None
+        if counter is not None:
+            if counter <= last:
+                # Correct, but already spent. Refusing is the point: otherwise a
+                # code read over someone's shoulder stays good for the rest of
+                # its window.
+                return "replay", 0
+            txn.set(ref, {"last_counter": counter, "last_used_at": _now()}, merge=True)
+            return "totp", 0
+
+        # Not a TOTP code — try the recovery list.
+        remaining = list(d.get("recovery_hashes") or [])
+        if hashed in remaining:
+            remaining.remove(hashed)
+            txn.set(ref, {"recovery_hashes": remaining, "last_used_at": _now()}, merge=True)
+            return "recovery", len(remaining)
+        return "wrong", 0
+
+    try:
+        outcome, left = _transact(_spend)
+    except Exception as exc:
+        log.warning("Could not check 2FA code for %s: %s", account_id, exc)
+        return False, "Couldn't check that just now. Try again."
+
+    if outcome == "off":
+        return False, "Two-factor authentication isn't set up on this account."
+    if outcome == "replay":
+        return False, "That code has already been used. Wait for the next one."
+    if outcome == "totp":
+        return True, "ok"
+    if outcome == "recovery":
+        log.warning("Account %s signed in with a recovery code (%d left)", account_id, left)
+        return True, f"Recovery code accepted. {left} left."
     return False, "That code isn't right."
 
 
@@ -356,6 +410,60 @@ def regenerate_recovery_codes(account_id, code: str) -> tuple[bool, str, list[st
         log.warning("Could not regenerate recovery codes for %s: %s", account_id, exc)
         return False, "Couldn't do that just now. Try again.", []
     return True, "New recovery codes generated. The old ones no longer work.", codes
+
+
+class TwoFactorUnavailable(RuntimeError):
+    """The 2FA store could not be read. Callers deciding something destructive must
+    treat this as "unknown", never as "no factor"."""
+
+
+def has_record(account_id) -> bool:
+    """Whether ANY enrolment document exists — enabled or half-finished.
+
+    Distinct from `is_enabled`, and the right question before `move`: `begin_enroll`
+    writes a document with enabled=False, so an account that merely started an
+    enrolment has no enabled factor but does have a record that `move` will refuse
+    to overwrite. Fails **closed** (True on a read error): the caller uses this to
+    decide whether a destructive move is safe.
+    """
+    try:
+        return _col().document(str(account_id)).get().exists
+    except Exception as exc:
+        # Raise rather than answer True. Failing closed is the right *decision* —
+        # a destructive move must not proceed on a read we could not make — but
+        # conflating "yes" with "I could not tell" at the point a message is chosen
+        # told the user to turn off a second factor the other account does not
+        # have, which changes nothing and gives them no reason to retry.
+        log.warning("Could not read the 2FA record for %s: %s", account_id, exc)
+        raise TwoFactorUnavailable(str(exc)) from exc
+
+
+def move(from_account_id, to_account_id) -> bool:
+    """Carry an enrolled second factor from one account id to another.
+
+    For `accounts.join_accounts`, which destroys one of two identity records: the
+    factor is a property of the person, so it has to follow them, and a join used
+    to leave it behind on the dropped id where nothing would ever read it again —
+    silently turning 2FA off for someone who had deliberately turned it on.
+
+    Copies rather than re-enrols, so the authenticator app the user already has
+    keeps working, and the recovery codes they wrote down stay valid. Refuses to
+    overwrite an existing factor on the destination: the caller decides that case,
+    because either choice disables a factor its owner still trusts.
+    """
+    src = str(from_account_id)
+    dst = str(to_account_id)
+    if src == dst:
+        return True
+    snap = _col().document(src).get()
+    if not snap.exists:
+        return False
+    if _col().document(dst).get().exists:
+        raise ValueError(f"{dst} already has a second factor")
+    _col().document(dst).set(snap.to_dict() or {})
+    _col().document(src).delete()
+    log.warning("Moved 2FA enrolment from %s to %s", src, dst)
+    return True
 
 
 def purge(account_id) -> None:
@@ -394,44 +502,52 @@ def create_login_challenge(account_id, payload: dict | None = None) -> str | Non
 
 
 def resolve_login_challenge(challenge_id: str, code: str) -> tuple[str | None, str, dict]:
-    """Spend a challenge with a valid code. Returns (account_id, message).
+    """Spend a challenge with a valid code. Returns (account_id, message, payload).
 
     Attempts are counted on the challenge itself and capped: a 6-digit code is
     only a million guesses, so without this the challenge window is a brute-force
-    opportunity rather than a checkpoint.
+    opportunity rather than a checkpoint. The attempt is *reserved* — read,
+    compared to the cap and incremented in one transaction — **before** the code
+    is judged, not recorded afterwards if it was wrong: counted afterwards, forty
+    guesses fired together all read `attempts = 0`, were all judged, and left the
+    counter at 1. Reserving first means the sixth concurrent guess is refused
+    whatever the timing. A right guess deletes the challenge, so the slot it
+    reserved never matters. A code that could not be checked (Firestore blip
+    inside `verify`) costs a slot too — a retry is cheap, a free retry is not.
     """
     ref = _challenges().document(str(challenge_id))
+
+    def _claim(txn) -> tuple[str, dict]:
+        snap = ref.get(transaction=txn)
+        if not snap.exists:
+            return "gone", {}
+        d = snap.to_dict() or {}
+        if time.time() > d.get("expires_at", 0):
+            txn.delete(ref)
+            return "expired", {}
+        attempts = int(d.get("attempts", 0) or 0)
+        if attempts >= 5:
+            # Left in place rather than deleted: it is dead either way (every
+            # later read lands here), but deleting it turns the next guess's
+            # answer into "expired", and the 5-minute expiry above removes it
+            # anyway. A blocked challenge should keep saying it is blocked.
+            return "exhausted", {}
+        txn.set(ref, {"attempts": attempts + 1}, merge=True)
+        return "ok", d
+
     try:
-        snap = ref.get()
+        state, d = _transact(_claim)
     except Exception as exc:
         log.warning("Could not read 2FA challenge: %s", exc)
         return None, "Couldn't check that just now. Try again.", {}
-    if not snap.exists:
+    if state in ("gone", "expired"):
         return None, "That sign-in expired. Start again.", {}
-
-    d = snap.to_dict() or {}
-    if time.time() > d.get("expires_at", 0):
-        try:
-            ref.delete()
-        except Exception:
-            pass
-        return None, "That sign-in expired. Start again.", {}
-
-    attempts = int(d.get("attempts", 0) or 0)
-    if attempts >= 5:
-        try:
-            ref.delete()
-        except Exception:
-            pass
+    if state == "exhausted":
         return None, "Too many wrong codes. Start again.", {}
 
     account_id = str(d.get("account_id") or "")
     ok, message = verify(account_id, code)
     if not ok:
-        try:
-            ref.set({"attempts": attempts + 1}, merge=True)
-        except Exception:
-            pass
         return None, message, {}
 
     try:

@@ -66,7 +66,12 @@ class Config:
 
     # ── KSP API Server ──────────────────────────
     KSP_API_ENABLED: bool = _optional("KSP_API_ENABLED", "true").lower() not in ("false", "0", "no", "off")
-    API_HOST: str = _optional("API_HOST", "0.0.0.0")
+    # Loopback by default. This API carries session tokens in plaintext and is
+    # meant to sit behind Caddy on the same host; `0.0.0.0` put it on every
+    # interface the moment the firewall was wrong, and made exposure the default
+    # rather than something an operator typed. Set API_HOST=0.0.0.0 deliberately
+    # if the proxy really is on another machine.
+    API_HOST: str = _optional("API_HOST", "127.0.0.1")
     API_PORT: int = int(_optional("API_PORT", "5022"))
     API_SECRET_KEY: str = _optional("API_SECRET_KEY", "")
     # Previous signing key, accepted for VERIFICATION only during a rotation
@@ -129,8 +134,35 @@ class Config:
     # X-Forwarded-For for rate limiting. Leave empty when clients connect the API
     # directly — the header is attacker-controlled and is ignored unless the peer
     # is a configured proxy.
+    # Entries may be single addresses ("127.0.0.1") OR CIDR ranges
+    # ("35.191.0.0/16"), because ranges are what the real deployment needs and the
+    # exact-string form could not express them. The bot's own peer is Caddy — one
+    # stable address — but website traffic arrives through Google front-ends and a
+    # Cloud Run egress, which are RANGES. With only exact strings, a list naming Caddy
+    # plus one guessed address stops `_client_ip`'s walk on a Google address and returns
+    # THAT for every website visitor: the collapsed single bucket the whole trusted-proxy
+    # mechanism exists to prevent, now armed rather than merely absent. So the setting
+    # was unusable for its main purpose, which is why it has stayed empty — and empty
+    # disables eleven per-IP limiters.
+    #
+    # A malformed entry is DROPPED with a warning rather than raising: a typo in one
+    # range must not stop the bot booting, and the failure direction (that hop is not
+    # trusted, so the walk stops there) is the safe one.
     _raw_proxies = _optional("API_TRUSTED_PROXIES", "")
     API_TRUSTED_PROXIES: set[str] = {p.strip() for p in _raw_proxies.split(",") if p.strip()}
+
+    @staticmethod
+    def _parse_proxy_networks(raw: set[str]) -> list:
+        import ipaddress
+        nets = []
+        for entry in raw:
+            try:
+                nets.append(ipaddress.ip_network(entry, strict=False))
+            except ValueError:
+                print(f"[config] Ignoring unparseable API_TRUSTED_PROXIES entry: {entry!r}")
+        return nets
+
+    API_TRUSTED_PROXY_NETS: list = []
 
     # Optional direct TLS for the in-process API server. Set BOTH to serve HTTPS
     # straight from uvicorn (no proxy). Leave empty when terminating TLS at a
@@ -147,6 +179,10 @@ class Config:
 
 
 cfg = Config()
+# Parsed once at import, after the instance exists. Kept alongside the raw strings
+# rather than replacing them so the startup warning below can still print what was
+# configured, and so an operator reading the value sees what they typed.
+cfg.API_TRUSTED_PROXY_NETS = Config._parse_proxy_networks(cfg.API_TRUSTED_PROXIES)
 
 # The API secret signs every KSP session token. A blank or placeholder value
 # means the signing key is publicly known, letting anyone forge a token for any
@@ -183,6 +219,34 @@ if cfg.KSP_API_ENABLED and len(cfg.API_SECRET_KEY.strip()) < _MIN_API_SECRET_LEN
 if (cfg.API_SECRET_KEY_PREVIOUS.strip() in _DEFAULT_API_SECRETS
         or cfg.API_SECRET_KEY_PREVIOUS == cfg.API_SECRET_KEY):
     cfg.API_SECRET_KEY_PREVIOUS = ""
+
+# ── The security-gate register ───────────────────────────────────────────────
+#
+# Every flag that weakens a security control in exchange for developer
+# convenience is registered HERE, and the startup banner is derived from this
+# table rather than from its own hand-written list. That list had drifted: it
+# named three gates while five existed, so `KSP_CHEAT_DISQUALIFY_ENABLED=false`
+# and `DEBUG_ENDPOINTS_ENABLED=true` ran silently — the failure mode this banner
+# exists to prevent, reintroduced by the banner itself being incomplete.
+#
+# Each entry is (env name, current value, the value that is SAFE). Note that the
+# safe value is not always True: `DEBUG_ENDPOINTS_ENABLED` is the one that is
+# dangerous when *on*, which is precisely why a plain "which of these are False"
+# list could never have covered it.
+#
+# Adding a gate flag anywhere in this file without adding it here is the bug.
+def insecure_gates() -> list[str]:
+    """The registered gates that are not in their secure state, for the banner."""
+    register = (
+        ("KSP_VERSION_CHECK_ENABLED", cfg.KSP_VERSION_CHECK_ENABLED, True),
+        ("KSP_DEVICE_BINDING_ENABLED", cfg.KSP_DEVICE_BINDING_ENABLED, True),
+        ("KSP_2FA_ENABLED", cfg.KSP_2FA_ENABLED, True),
+        ("KSP_CHEAT_DISQUALIFY_ENABLED", cfg.KSP_CHEAT_DISQUALIFY_ENABLED, True),
+        ("DEBUG_ENDPOINTS_ENABLED", cfg.DEBUG_ENDPOINTS_ENABLED, False),
+    )
+    return [f"{name}={str(value).lower()}"
+            for name, value, safe in register if value != safe]
+
 
 # Configure root logger once here so every module inherits it
 logging.basicConfig(

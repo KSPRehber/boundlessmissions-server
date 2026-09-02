@@ -21,6 +21,7 @@ import discord
 from discord.ui import View, Button, DynamicItem, button
 from i18n import t
 import settings
+from data import accounts
 from data import contracts as cdb
 from data import mission_constraints as mc
 from data import orbit_constraints as oc
@@ -50,7 +51,7 @@ def _crew_requirement_text(constraints: dict) -> str | None:
     if mx == 0:
         count = "uncrewed, nobody aboard"
     elif mn and mx:
-        count = f"exactly {mn} aboard" if mn == mx else f"{mn}–{mx} aboard"
+        count = f"exactly {mn} aboard" if mn == mx else f"{mn}-{mx} aboard"
     elif mx:
         count = f"up to {mx} aboard"
     elif mn:
@@ -85,7 +86,7 @@ def _ls_endurance_text(c: dict, constraints: dict) -> str | None:
     longest = per_kerbal / lo
     shortest = per_kerbal / hi
     if hi > lo:
-        return f"{name} · ~{shortest:.0f}–{longest:.0f} d for {lo}–{hi} kerbals"
+        return f"{name} · ~{shortest:.0f}-{longest:.0f} d for {lo}-{hi} kerbals"
     return f"{name} · ~{longest:.0f} d for {lo} kerbal" + ("s" if lo != 1 else "")
 
 def _rescue_terms_text(c: dict) -> str | None:
@@ -146,8 +147,22 @@ def _actor(interaction: discord.Interaction) -> tuple[int, str]:
     business identity is exactly what the admin mimic system exists to do, so an admin
     mimicking a player acts as that player here. Checks about *authority* — moderator
     powers — must still go through `perms`, which unwraps the swap.
+
+    The id is resolved to an ACCOUNT id, because that is what the contract, auction
+    and wallet documents are keyed on. Comparing the raw snowflake to a stored
+    `contractor_id` fails two ways for a player who linked Discord onto an account
+    they already had: every button (Accept, Refuse, Give Up, Review, Settle, More
+    Time, Pay Fine, Sue) told the legitimate owner "not yours", and the two NEGATIVE
+    checks — "you cannot bid on your own auction", "you cannot be your own
+    contractor" — failed OPEN, because a snowflake never equals an `a_…` id.
+
+    Falls back to the snowflake when the lookup cannot be completed. That is the
+    identity answer for everybody who has never linked, so the fallback is right for
+    almost all callers; refusing instead would break every button during a blip.
     """
-    return interaction.user.id, interaction.user.display_name
+    resolved = accounts.account_for_discord(interaction.user.id)
+    return (resolved if resolved is not None else interaction.user.id,
+            interaction.user.display_name)
 
 
 async def _require_mod(interaction: discord.Interaction) -> bool:
@@ -177,23 +192,54 @@ async def _reject(interaction: discord.Interaction, result: ca.Result) -> None:
     await interaction.followup.send(f"❌ {result.message}", ephemeral=True)
 
 
+# Discord's per-field limit. A value past it does not truncate on their side: the
+# whole message is a 400, and every caller of _embed swallows that — so an offer
+# with an over-long mission simply never reached the contractor's channel.
+_FIELD_MAX = 1024
+# Mission text is capped at creation on every path today (api_models
+# ContractCreateRequest / create_rescue_contract), but a document written before
+# the cap can carry more, and the constraint heuristic must never see it whole.
+_MISSION_DERIVE_MAX = 500
+
+
+def _fit_field(text) -> str:
+    text = str(text or "")
+    return text if len(text) <= _FIELD_MAX else text[:_FIELD_MAX - 1] + "…"
+
+
 def _embed(c, guild_id):
     is_flag = c.get("mission_type") == cdb.FLAG_DESIGN
     title = f"🚩 {t(guild_id, 'ct.title')}" if is_flag else f"📜 {t(guild_id, 'ct.title')}"
     e = discord.Embed(title=title, color=discord.Color.gold())
     sym = settings.CURRENCY_SYMBOL
-    e.add_field(name=t(guild_id, "ct.mission"), value=c["mission"], inline=False)
-    e.add_field(name=t(guild_id, "ct.issuer"), value=c["issuer_name"], inline=True)
-    e.add_field(name=t(guild_id, "ct.contractor"), value=c["contractor_name"], inline=True)
+    # The mission text and both display names are written by players, and an embed
+    # field renders markdown — a masked link here reaches both parties and, when
+    # this embed is reused for a moderator ticket (contract_actions._escalate_to_mods),
+    # whoever holds the console. Escaped once, at the shared source.
+    _esc = discord.utils.escape_markdown
+    mission_text = c.get("mission") or ""
+    # Fit first, then escape: escaping first spends the field budget on backslashes
+    # and lets the truncation cut a `\*` pair in half, which renders as a stray
+    # backslash and can re-open the markdown the escaping was there to close.
+    e.add_field(name=t(guild_id, "ct.mission"),
+                value=_esc(_fit_field(mission_text)), inline=False)
+    e.add_field(name=t(guild_id, "ct.issuer"),
+                value=_esc(str(c["issuer_name"])), inline=True)
+    e.add_field(name=t(guild_id, "ct.contractor"),
+                value=_esc(str(c["contractor_name"])), inline=True)
     e.add_field(name=t(guild_id, "ct.payment"), value=f"**{c['payment']}** {sym}", inline=True)
     e.add_field(name=t(guild_id, "ct.fine"), value=f"**{c['fine']}** {sym}", inline=True)
     e.add_field(name=t(guild_id, "ct.due"), value=c["due_date"], inline=True)
     e.add_field(name=t(guild_id, "ct.status"), value=f"`{c['status']}`", inline=True)
 
     # Crew-aboard requirement and (once a craft has been submitted) its min–max
-    # life-support endurance for that crew. Constraints come off the contract when
-    # present, else are derived from the mission text.
-    constraints = c.get("constraints") or mc.extract_heuristic(c.get("mission", ""))
+    # life-support endurance for that crew. Constraints come off the contract; every
+    # creation path stores them now (an empty dict is a real answer, "no limits").
+    # Only a document from before that — no field at all — is derived here, and from
+    # a bounded slice: this runs on the event loop each time the contract is drawn.
+    constraints = c.get("constraints")
+    if constraints is None:
+        constraints = mc.extract_heuristic(mission_text[:_MISSION_DERIVE_MAX])
     crew_txt = _crew_requirement_text(constraints)
     if crew_txt:
         e.add_field(name="👨‍🚀 Crew", value=crew_txt, inline=True)
@@ -204,7 +250,7 @@ def _embed(c, guild_id):
     # An orbit the mission text names ("reach a polar orbit around Kerbin"). Enforced
     # at submit time either way; shown here because a requirement the contractor only
     # meets by accident is not a requirement they were told about.
-    orbit_c = oc.extract_heuristic(c.get("mission", ""))
+    orbit_c = oc.extract_heuristic(mission_text[:_MISSION_DERIVE_MAX])
     if not oc.is_empty(orbit_c):
         e.add_field(name="🛰 Orbit",
                     value=", ".join(oc.label(r) for r in orbit_c["requirements"]),
@@ -225,6 +271,85 @@ def _embed(c, guild_id):
     # The clean full-res image stays gated until the contract completes.
     if is_flag and c.get("flag_preview_url"):
         e.set_image(url=c["flag_preview_url"])
+
+    # A rescue rides its wreck's blueprint the same way, for the same reason: the
+    # rescuer may well read the offer in Discord before they ever open the game, and
+    # "how big is it, has it got an engine left" is not in the mission text. The
+    # blueprint takes the image slot because it is the half you can read at a glance;
+    # an embed has only one, so the orbit diagram is a link beside it rather than
+    # dropped. Both absent on every rescue issued before they existed, and on one
+    # whose render failed — hence the plain `.get` guards rather than a branch on
+    # mission_type, which would promise a picture that may not be there.
+    bp_url = c.get("rescue_blueprint_url")
+    if not is_flag and bp_url:
+        e.set_image(url=bp_url)
+    orbit_url = c.get("rescue_orbit_url")
+    if orbit_url:
+        # Named for what the picture actually shows: a wreck stranded on a surface has
+        # no orbit, and its diagram is a landing marker.
+        label = ("Where it is" if c.get("rescue_orbit_surface")
+                 else "Orbit & telemetry")
+        e.add_field(name="🛰 Wreck", value=f"[{label}]({orbit_url})", inline=True)
+
+    return e
+
+
+def submission_review_embed(c, guild_id: int) -> discord.Embed:
+    """The issuer's review card for a contract that is waiting on their decision.
+
+    The contract embed plus what the submission itself added: when it landed, the
+    renders, the telemetry diagram and the *names* of the craft files. Names only —
+    a `.craft` object is private and `ReviewAcceptButton` is what signs and reveals
+    it, because the craft is the deliverable and handing it over before the issuer
+    has accepted would let them take the work and refuse it.
+
+    Lives here rather than in the cog because the buttons that act on this card live
+    here, and a card drawn somewhere else would drift from what they do — the same
+    reason `_embed` is shared by every offer/dispute view above.
+    """
+    e = _embed(c, guild_id)
+    e.title = f"📤 {t(guild_id, 'ct.review_title')}"
+    e.color = discord.Color.blurple()
+
+    if c.get("submitted_at"):
+        e.add_field(name="📤 Submitted", value=str(c["submitted_at"])[:19], inline=True)
+
+    files = c.get("submitted_files") or []
+    # A submission's images are uploaded public (the issuer has to be able to judge
+    # them before deciding); the craft object is not. Split on the same test the
+    # accept button uses so the two cannot disagree about what is gated.
+    def _is_craft(f) -> bool:
+        return str(f.get("filename", "")).lower().endswith(".craft")
+
+    craft_files = [f for f in files if _is_craft(f)]
+    shots = [f for f in files if not _is_craft(f)]
+
+    if shots:
+        # Only an actual image goes in the image slot, and only a real URL: a
+        # submission can carry a log or a text note, and Discord rejects the whole
+        # message for an empty or non-http `image.url` rather than ignoring it.
+        preview = next((f for f in shots
+                        if str(f.get("content_type", "")).startswith("image/")
+                        and str(f.get("url", "")).startswith("http")), None)
+        if preview:
+            e.set_image(url=preview["url"])
+        links = "\n".join(cdb.file_link(f, icon="🖼️") for f in shots)
+        e.add_field(name="🖼️ Screenshots", value=links[:_FIELD_MAX], inline=False)
+    if craft_files:
+        names = "\n".join(f"🚀 {cdb.md_filename(f.get('filename') or '')}"
+                           for f in craft_files)
+        e.add_field(name="📁 Craft Files (revealed on accept)",
+                    value=names[:_FIELD_MAX], inline=False)
+
+    # Orbit diagrams are rendered and stored at submit time; the corp-channel post
+    # attaches them as files, but here a link is all that is cheap — this card is one
+    # of several in an ephemeral list and must not re-download megabytes per contract.
+    tele = c.get("telemetry_image_urls") or (
+        [c["telemetry_image_url"]] if c.get("telemetry_image_url") else [])
+    if tele:
+        links = " · ".join(f"[Craft {i + 1}]({u})" for i, u in enumerate(tele) if u)
+        if links:
+            e.add_field(name="🛰 Orbital Telemetry", value=links[:_FIELD_MAX], inline=False)
 
     return e
 
@@ -416,14 +541,16 @@ class ReviewAcceptButton(DynamicItem[Button], template=r"ct_rv_acc:" + _ID_PATTE
             # The craft object is private; this Discord link is the secondary
             # "also download here" convenience (the in-game import queue is the
             # primary, always-fresh path), so sign it with the 7-day max TTL.
+            # cdb.file_link escapes/caps the client-chosen name (see md_filename).
             flist = "\n".join(
-                f"🚀 [{s['filename']}]({cdb.sign_stored(s['url'], ttl=cdb.SIGNED_URL_MAX_TTL)})"
+                cdb.file_link(s, icon="🚀",
+                              url=cdb.sign_stored(s['url'], ttl=cdb.SIGNED_URL_MAX_TTL))
                 for s in craft_files)
-            e.add_field(name="📁 Craft Files", value=flist, inline=False)
+            e.add_field(name="📁 Craft Files", value=flist[:1024], inline=False)
         screenshots = [s for s in files if not s['filename'].lower().endswith('.craft')]
         if screenshots:
-            flist = "\n".join(f"🖼️ [{s['filename']}]({s['url']})" for s in screenshots)
-            e.add_field(name="🖼️ Screenshots", value=flist, inline=False)
+            flist = "\n".join(cdb.file_link(s, icon="🖼️") for s in screenshots)
+            e.add_field(name="🖼️ Screenshots", value=flist[:1024], inline=False)
         # Flag-design: reveal the clean full-res flag now that it's paid for. The
         # object is private; sign it (7-day max TTL) for the embed image + link, which
         # Discord fetches on post. The in-game flag-picker delivery is the durable path.
@@ -904,7 +1031,7 @@ class FlagSubmitView(View):
         for i, f in enumerate(self.files):
             status = "✅" if i in self.active_indices else "❌"
             pointer = "▶️" if i == self.current_idx else "  "
-            lines.append(f"{pointer} {status} 🖼️ `{f['filename']}`")
+            lines.append(f"{pointer} {status} 🖼️ `{cdb.md_filename(f['filename'])}`")
 
         desc = "\n".join(lines)
         return discord.Embed(title="🚩 Select the flag to submit", description=desc,
@@ -959,12 +1086,15 @@ class FlagSubmitView(View):
         await self._submit_flag(interaction, c, selected_files)
 
     async def _submit_flag(self, interaction: discord.Interaction, c: dict, selected_files: list[dict]):
-        """Flag-design submission: keep the clean image gated, surface only a
-        watermarked preview, and DM the issuer for review. Flag contracts are
-        always human-issued, so there's no AI auto-review path."""
-        from datetime import datetime
-        import flag_preview
+        """Flag-design submission from Discord: pick the image out of the uploads this
+        view offered, then hand it to the one transition.
 
+        Everything that *happens* — the gated full-res, the watermarked preview, the
+        atomic ACTIVE→SUBMITTED claim, the issuer's notification and review embed —
+        lives in `ca.submit_flag`, so the website's upload form and this button are
+        the same act. What stays here is Discord's alone: reading the attachment and
+        redrawing the designer's own contract panel.
+        """
         img = next((f for f in selected_files if f["content_type"].startswith("image/")), None)
         if not img:
             await interaction.followup.send("❌ No image found to submit as the flag.", ephemeral=True)
@@ -977,37 +1107,16 @@ class FlagSubmitView(View):
             await interaction.followup.send("❌ Could not read your uploaded flag. Try again.", ephemeral=True)
             return
 
-        # Full-res stays gated: stored PRIVATE (a bare path), surfaced only through a
-        # signed URL once the contract completes (the embed/preview serve points sign
-        # it). Only the watermarked preview below is public and shown until accept.
-        fullres_url = await cdb.upload_private_to_storage(self.cid, img["filename"], raw,
-                                                          img.get("content_type", "image/png"))
-        preview_url = await cdb.upload_to_storage(
-            self.cid, "flag_preview.png", flag_preview.make_watermarked(raw), "image/png")
-
-        cdb.update_contract(self.gid, self.cid, status=cdb.SUBMITTED,
-                            submitted_files=[], flag_filename=img["filename"],
-                            flag_fullres_url=fullres_url, flag_preview_url=preview_url,
-                            submitted_at=datetime.utcnow().isoformat())
-        c = cdb.get_contract(self.gid, self.cid)
-
-        try:
-            e = _embed(c, self.gid)
-            e.title = f"📬 {t(self.gid, 'ct.review_title')}"
-            e.color = discord.Color.orange()
-            e.add_field(
-                name="🚩 Flag",
-                value="Preview is watermarked; the full-res flag is delivered to your "
-                      "in-game flag picker on acceptance.",
-                inline=False)
-            msg = await ca.deliver_to_player(self.gid, int(c["issuer_id"]), embed=e,
-                                             view=ContractReviewView(self.cid, self.gid))
-            if msg is not None:
-                cdb.update_contract(self.gid, self.cid, issuer_review_msg_id=str(msg.id))
-        except Exception as exc:
-            log.error("Could not deliver flag review to issuer: %s", exc)
+        uid, name = _actor(interaction)
+        r = await ca.submit_flag(self.gid, self.cid, actor_id=uid, actor_name=name,
+                                 image=raw, filename=img["filename"],
+                                 content_type=img.get("content_type") or "image/png")
+        if not r.ok:
+            await _reject(interaction, r)
+            return
 
         # Update the designer's contract panel.
+        c = r.contract or c
         if c.get("dm_message_id"):
             try:
                 orig = await interaction.channel.fetch_message(int(c["dm_message_id"]))

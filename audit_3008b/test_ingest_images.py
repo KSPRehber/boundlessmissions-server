@@ -65,9 +65,9 @@ msg = type("M", (), {"attachments": [], "embeds": [E(f"http://127.0.0.1:{port}/i
 images = asyncio.run(shots._extract_all_images(msg))
 srv.shutdown()
 check("embed image URLs are restricted to Discord CDN / proxy hosts before fetching",
-      not hits, f"bot fetched {hits[0][0]!r} on 127.0.0.1:{port} and got {len(images[0][1])} bytes back "
+      not hits, (f"bot fetched {hits[0][0]!r} on 127.0.0.1:{port} and got {len(images[0][1])} bytes back "
       f"(SSRF; a user controls embed.image.url by posting a link — the fetched bytes go to Gemini, "
-      f"whose description of them is posted publicly)")
+      f"whose description of them is posted publicly)") if hits else "")
 ex = between(src("cogs/screenshots.py"), "async def _extract_all_images", "async def _run_gemini")
 check("embed fetch bounds the response size", "content_length" in ex or "read(" in ex and "iter_chunked" in ex,
       "`await resp.read()` with no cap: a link to a multi-GB file is read into memory")

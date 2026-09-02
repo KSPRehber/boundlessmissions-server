@@ -154,7 +154,7 @@ def _notify_level_up(guild_id: int, user_id: int, level: int, total_xp: int,
     try:
         body = f"You reached **Level {level}**."
         if reason:
-            body = f"{reason} — {body}"
+            body = f"{reason}. {body}"
         body += (f"\nTotal XP: {total_xp:,} · Next level: "
                  f"{xp_for_level(level + 1):,} XP")
         if reward:

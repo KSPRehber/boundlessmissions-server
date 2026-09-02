@@ -13,6 +13,7 @@ from discord.ui import View, Select, Button, Modal, TextInput
 from config import cfg
 from cogs import perms
 from api_auth import generate_link_code
+from data import accounts
 from data import mod_version as mver
 from data import policy as policy
 from data import guild_config
@@ -116,7 +117,10 @@ class _GuildChannelSelect(discord.ui.ChannelSelect):
         ch = self.values[0]
         key = self.parent_view.selected_key
         guild_id = self.parent_view.guild.id
-        guild_config.set_channel(guild_id, key, ch.id)
+        try:
+            guild_config.set_channel(guild_id, key, ch.id)
+        except guild_config.GuildConfigUnavailable as exc:
+            return await _refuse_unsaved(interaction, exc)
         log.info("%s set channel '%s' -> %s in guild %s",
                  interaction.user, key, ch.id, guild_id)
         self.parent_view._rebuild()
@@ -146,13 +150,33 @@ async def _backfill_after_setchannel(interaction: discord.Interaction, guild_id:
         log.error("Auction back-fill failed for guild %s: %s", guild_id, exc)
 
 
+async def _refuse_unsaved(interaction: discord.Interaction, exc: Exception) -> None:
+    """Tell the admin the mapping was NOT saved.
+
+    `guild_config._persist` refuses to write while the boot read has not completed,
+    because memory is not a safe source of truth then. It used to refuse by returning,
+    so every one of these callbacks went on to redraw the embed with the mapping shown
+    as set and log that it had been mapped — and it was gone at the next restart. The
+    panel must not claim a change it does not have.
+    """
+    log.error("Guild config change refused: %s", exc)
+    msg = f"❌ Not saved. {exc}"
+    if interaction.response.is_done():
+        await interaction.followup.send(msg, ephemeral=True)
+    else:
+        await interaction.response.send_message(msg, ephemeral=True)
+
+
 class _ClearChannelButton(Button):
     def __init__(self, parent: SetChannelView):
         self.parent_view = parent
         super().__init__(label="Clear this channel", style=discord.ButtonStyle.red, row=2)
 
     async def callback(self, interaction: discord.Interaction):
-        guild_config.clear_channel(self.parent_view.guild.id, self.parent_view.selected_key)
+        try:
+            guild_config.clear_channel(self.parent_view.guild.id, self.parent_view.selected_key)
+        except guild_config.GuildConfigUnavailable as exc:
+            return await _refuse_unsaved(interaction, exc)
         log.info("%s cleared channel '%s' in guild %s",
                  interaction.user, self.parent_view.selected_key, self.parent_view.guild.id)
         self.parent_view._rebuild()
@@ -216,7 +240,10 @@ class _SetChannelByIdModal(Modal, title="Set channel by ID / mention"):
                 f"❌ **{guild_config.CHANNEL_TYPES[key][0]}** must be {want}.",
                 ephemeral=True)
 
-        guild_config.set_channel(guild.id, key, ch.id)
+        try:
+            guild_config.set_channel(guild.id, key, ch.id)
+        except guild_config.GuildConfigUnavailable as exc:
+            return await _refuse_unsaved(interaction, exc)
         log.info("%s set channel '%s' -> %s (by ID) in guild %s",
                  interaction.user, key, ch.id, guild.id)
         self.parent_view._rebuild()
@@ -298,8 +325,9 @@ class _RoleKeySelect(Select):
     async def callback(self, interaction: discord.Interaction):
         self.parent_view.selected_key = self.values[0]
         self.parent_view._rebuild()
+        # content=None clears any refusal notice _GuildRoleSelect left behind.
         await interaction.response.edit_message(
-            embed=self.parent_view.build_embed(), view=self.parent_view)
+            content=None, embed=self.parent_view.build_embed(), view=self.parent_view)
 
 
 class _GuildRoleSelect(discord.ui.RoleSelect):
@@ -315,12 +343,40 @@ class _GuildRoleSelect(discord.ui.RoleSelect):
 
     async def callback(self, interaction: discord.Interaction):
         role = self.values[0]
-        guild_config.set_role(self.parent_view.guild.id, self.parent_view.selected_key, role.id)
+        key = self.parent_view.selected_key
+        # The level titles and the notification ping are handed out by a button any
+        # member can press, so a role mapped to one of those keys must confer
+        # nothing — otherwise /admin setrole (which a mapped bot-admin role can run,
+        # and which needs no Discord permission of its own) becomes a way to grant
+        # any Discord role below the bot to anybody. The mod/admin/bug_report keys
+        # are deliberately not checked: those are *meant* to name a role with power,
+        # and nothing self-assigns them.
+        if perms.is_self_assignable_key(key):
+            # Permission bits first, then the shape those cannot express: a role with
+            # no bits at all can still be the key to a private channel. Checked here,
+            # at map time, rather than on every grant — walking every channel is far
+            # too expensive for a button press, and the mapping is what creates the
+            # exposure.
+            refusal = (perms.role_grants_authority(role)
+                       or perms.role_opens_private_channel(self.parent_view.guild, role))
+            if refusal:
+                await interaction.response.edit_message(
+                    content=f"❌ Not mapped. {refusal}",
+                    embed=self.parent_view.build_embed(), view=self.parent_view)
+                log.warning("%s tried to map self-assignable role key '%s' -> %s "
+                            "in guild %s; refused: %s",
+                            interaction.user, key, role.id,
+                            self.parent_view.guild.id, refusal)
+                return
+        try:
+            guild_config.set_role(self.parent_view.guild.id, self.parent_view.selected_key, role.id)
+        except guild_config.GuildConfigUnavailable as exc:
+            return await _refuse_unsaved(interaction, exc)
         log.info("%s mapped role '%s' -> %s in guild %s",
                  interaction.user, self.parent_view.selected_key, role.id, self.parent_view.guild.id)
         self.parent_view._rebuild()
         await interaction.response.edit_message(
-            embed=self.parent_view.build_embed(), view=self.parent_view)
+            content=None, embed=self.parent_view.build_embed(), view=self.parent_view)
 
 
 class _ClearRoleButton(Button):
@@ -329,12 +385,15 @@ class _ClearRoleButton(Button):
         super().__init__(label="Clear this mapping", style=discord.ButtonStyle.red, row=2)
 
     async def callback(self, interaction: discord.Interaction):
-        guild_config.clear_role(self.parent_view.guild.id, self.parent_view.selected_key)
+        try:
+            guild_config.clear_role(self.parent_view.guild.id, self.parent_view.selected_key)
+        except guild_config.GuildConfigUnavailable as exc:
+            return await _refuse_unsaved(interaction, exc)
         log.info("%s cleared role '%s' in guild %s",
                  interaction.user, self.parent_view.selected_key, self.parent_view.guild.id)
         self.parent_view._rebuild()
         await interaction.response.edit_message(
-            embed=self.parent_view.build_embed(), view=self.parent_view)
+            content=None, embed=self.parent_view.build_embed(), view=self.parent_view)
 
 
 def is_admin():
@@ -488,12 +547,23 @@ class Admin(commands.Cog, name="Admin"):
     @is_owner()
     async def linkas(self, interaction: discord.Interaction, target: discord.Member) -> None:
         await interaction.response.defer(ephemeral=True)
+        # The account the target signs in as, not their snowflake — the same
+        # resolution `/linkcode` does, for the same reason: a Discord user joined
+        # onto a web account plays on that account, and a session minted on the
+        # bare snowflake would be a session on an orphan wallet that no console
+        # suspension of the real account covers.
+        account_id = await asyncio.to_thread(accounts.account_for_discord, target.id)
+        if account_id is None:
+            await interaction.followup.send(
+                "⚠️ Couldn't reach the account service to resolve that user's account. "
+                "No code was issued. Try again in a moment.", ephemeral=True)
+            return
         code = await asyncio.to_thread(
-            generate_link_code, interaction.guild_id, target.id, target.display_name
+            generate_link_code, interaction.guild_id, account_id, target.display_name
         )
         embed = discord.Embed(
             title="🔧 Admin KSP Link Code",
-            description=f"Linking as **{target.display_name}** (`{target.id}`).\n\nEnter this code in KSP:\n\n# `{code}`\n\n⏰ Expires in 10 minutes.",
+            description=f"Linking as **{target.display_name}** (`{account_id}`).\n\nEnter this code in KSP:\n\n# `{code}`\n\n⏰ Expires in 10 minutes.",
             color=discord.Color.orange(),
         )
         embed.set_footer(text=f"Issued by {interaction.user}; session will run as {target.display_name}")
@@ -605,10 +675,15 @@ class Admin(commands.Cog, name="Admin"):
             )
             return
 
-        rec = await asyncio.to_thread(
-            mver.publish_version, version, digest, download_url, set_latest,
-            str(interaction.user), dll_bytes
-        )
+        try:
+            rec = await asyncio.to_thread(
+                mver.publish_version, version, digest, download_url, set_latest,
+                str(interaction.user), dll_bytes
+            )
+        except ValueError as exc:
+            # publish_version now enforces the https rule the web console always had.
+            await interaction.followup.send(f"❌ {exc}", ephemeral=True)
+            return
 
         # If this became the latest, poke every live client to re-check now so
         # already-running clients gate without waiting for a restart.
@@ -765,6 +840,18 @@ class Admin(commands.Cog, name="Admin"):
     @is_admin()
     async def costs(self, interaction: discord.Interaction) -> None:
         snap = cost_guard.snapshot()
+        # An unloaded wallet is the one thing here that silently changes what the
+        # bot DOES rather than what it costs, so it is reported first and in plain
+        # words: while it holds, every balance reads zero and every money write is
+        # refused rather than saved.
+        from data.store import store as _store
+        wallet_warning = (
+            None if _store.loaded else
+            ("⚠️ **The wallet is not loaded"
+             + (" because the cost guard froze Firebase" if _store.budget_blocked else "")
+             + ".** Balances read as zero and every money change is refused. "
+               "It reloads by itself once the guard drops below FROZEN.")
+        )
 
         def human_bytes(n: float) -> str:
             for unit in ("B", "KB", "MB", "GB"):
@@ -848,7 +935,8 @@ class Admin(commands.Cog, name="Admin"):
             title=f"💸 Service spend: {snap['month']}",
             color=color,
             description=(
-                f"**Guard:** {state}"
+                (wallet_warning + "\n\n" if wallet_warning else "")
+                + f"**Guard:** {state}"
                 + ("" if snap["enabled"] else "  ·  ⚠️ caps disabled")
                 + f"\n**Source:** {source}\n\n"
                 f"**🤖 Gemini** (falls back to heuristics)\n{fmt_budget(g)}\n\n"

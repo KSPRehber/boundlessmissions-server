@@ -26,6 +26,7 @@ from discord.ext import commands
 from discord.ui import View, Button, DynamicItem, Select, Modal, TextInput
 
 import settings
+from cogs import perms
 from data.store import _db
 from data import tickets as tdb
 from data import guild_config
@@ -39,6 +40,133 @@ log = logging.getLogger(__name__)
 
 # ── Ticket kinds ──────────────────────────────────────────────────────────────
 # key → (emoji, human label, modal title, [(field_label, placeholder, long?)])
+# Discord's hard limit is 50 channels per category; stop a little short so a
+# moderator has room to work while clearing the backlog.
+TICKET_CATEGORY_SOFT_MAX = 45
+# Bulk, non-urgent openings (announcements) stop well short, so a large role cannot
+# consume the room moderation intake needs.
+TICKET_CATEGORY_BULK_MAX = 30
+
+# Ticket openings allowed per guild per hour, across every door. In-process, like
+# every other limit here; see api_server._limit_ticket_open for the per-user and
+# per-address halves, which stay at the endpoints because they need the caller.
+TICKET_GUILD_PER_HOUR = 20
+_GUILD_OPENINGS: dict[int, list[float]] = {}
+
+
+# The category filling up is a TERMINAL state: nothing closes a ticket but the
+# button on it, so once the ceiling is reached every intake door in the guild —
+# moderation reports, contract reports, bug reports, the device-sharing report and
+# the anti-cheat flag — answers "the ticket system isn't set up" until a human
+# presses Close. That was only ever written to the log. Alerted once an hour per
+# guild rather than once ever: the condition persists, so a single alert that gets
+# missed leaves the guild down, while one per refusal would itself be the flood.
+_CAPACITY_ALERT_INTERVAL = 3600.0
+_CAPACITY_ALERTED: dict[int, float] = {}
+
+# The Discord modal's own per-user allowance.
+#
+# `api_server._limit_ticket_open` is the budget every HTTP door shares — 3 an hour
+# per user, plus the per-address bucket, plus the per-guild breaker — and its
+# docstring states the invariant: the breaker "has to cover *every* door into that
+# category, or the alts simply use the one without it." The public "Open a Ticket"
+# button was that door. It reached `create_ticket` directly, so it skipped the
+# per-user allowance entirely while still *spending* the guild-wide breaker: one
+# member pressing it TICKET_GUILD_PER_HOUR times refused every other intake path in
+# the server — moderation reports, contract reports, bug reports and the anti-cheat
+# flag — for the rest of the hour.
+#
+# Kept here rather than reusing `_limit_ticket_open`: that one wants a `Request` for
+# its per-address bucket, and an interaction has no address. Same allowance as the
+# HTTP doors so neither is the cheap way in.
+TICKET_MODAL_PER_USER_PER_HOUR = 3
+_MODAL_OPENINGS: dict[int, list[float]] = {}
+
+
+def _allow_modal_opening(user_id: int) -> bool:
+    """Record a modal-opened ticket against this user's hourly allowance."""
+    import time as _time
+    now = _time.time()
+    hits = [t for t in _MODAL_OPENINGS.get(user_id, []) if now - t < 3600.0]
+    if len(hits) >= TICKET_MODAL_PER_USER_PER_HOUR:
+        _MODAL_OPENINGS[user_id] = hits
+        return False
+    hits.append(now)
+    _MODAL_OPENINGS[user_id] = hits
+    return True
+
+
+async def _alert_category_full(client, guild, category, kind: str, *,
+                               reason: str = "category_full") -> None:
+    """Tell somebody that ticket intake is refusing. Best effort, never raises —
+    this runs on the path that is already failing.
+
+    Two reasons reach here, and they need different words because they need
+    different actions. `category_full` is terminal: nothing closes a ticket but the
+    button on it, so intake stays down until a human presses Close. `budget_spent`
+    is the hourly per-guild breaker, which clears by itself — but while it is spent
+    every intake door is refused just the same, and it is the branch somebody
+    *driving* the breaker actually hits, so it cannot stay log-only."""
+    import time as _time
+    now = _time.time()
+    last = _CAPACITY_ALERTED.get(guild.id, 0.0)
+    if now - last < _CAPACITY_ALERT_INTERVAL:
+        return
+    _CAPACITY_ALERTED[guild.id] = now
+
+    if reason == "budget_spent":
+        title = "⚠️ Ticket intake is rate limited"
+        body = (f"**{guild.name}** has opened {TICKET_GUILD_PER_HOUR} tickets in the "
+                f"last hour, which is the per-guild ceiling. Every ticket path in "
+                f"that server is refused until the hour rolls — reports, bug reports "
+                f"and the anti-cheat flag included; a `{kind}` ticket was just turned "
+                f"away.\n\nThis clears by itself. If it keeps happening, somebody is "
+                f"probably driving it: check who has been opening tickets.")
+    else:
+        title = "⚠️ Ticket system is full"
+        body = (f"The ticket category **{getattr(category, 'name', '?')}** in "
+                f"**{guild.name}** is full ({len(getattr(category, 'channels', ()))} "
+                f"channels). Every ticket path in that server is now refused — reports, "
+                f"bug reports and the anti-cheat flag included; a `{kind}` ticket was "
+                f"just turned away.\n\nClose some tickets to bring intake back.")
+
+    # The moderators of the affected guild are the ones who can fix it, so try
+    # them first; the owner is told either way, since a guild with no mod channel
+    # mapped would otherwise still fail silently.
+    try:
+        chan = guild_config.resolve_channel(client, guild.id, "contract_mod")
+        mod_role = guild_config.resolve_role(guild, "mod")
+        if chan is not None:
+            await chan.send(
+                content=(mod_role.mention if mod_role else None),
+                embed=discord.Embed(
+                    title=title,
+                    description=body,
+                    color=discord.Color.red()),
+                allowed_mentions=discord.AllowedMentions(roles=True))
+    except Exception as exc:
+        log.warning("Could not post the ticket-capacity alert in guild %s: %s",
+                    guild.id, exc)
+
+    try:
+        from api_server import _tell_owner
+        await _tell_owner(title, body)
+    except Exception as exc:
+        log.warning("Could not DM the owner about the full ticket category: %s", exc)
+
+
+def _allow_guild_opening(guild_id: int) -> bool:
+    """Record an opening against this guild's hourly budget; False when spent."""
+    import time as _time
+    now = _time.time()
+    hits = [t for t in _GUILD_OPENINGS.get(guild_id, []) if now - t < 3600.0]
+    if len(hits) >= TICKET_GUILD_PER_HOUR:
+        _GUILD_OPENINGS[guild_id] = hits
+        return False
+    hits.append(now)
+    _GUILD_OPENINGS[guild_id] = hits
+    return True
+
 TICKET_KINDS = {
     "user": (
         "🚨", "Report a user", "🚨 Report a User",
@@ -129,6 +257,7 @@ async def create_ticket(
     extra_view: View | None = None,
     files: list[discord.File] | None = None,
     ping_mods: bool = True,
+    reserve_capacity: bool = True,
     notify_role_key: str | None = None,
 ) -> discord.TextChannel | None:
     """Create a private ticket channel under TICKET_CATEGORY_ID and post the opening
@@ -195,6 +324,51 @@ async def create_ticket(
         if member:
             overwrites[member] = discord.PermissionOverwrite(
                 view_channel=True, send_messages=True, attach_files=True)
+
+    # Discord allows 50 channels per CATEGORY (not 500 per guild), and every ticket
+    # lands in this one — so the category, not the guild, is the ceiling that gets
+    # hit. Past it `create_text_channel` simply 400s and every ticket path dies at
+    # once: moderation reports, bug reports, the anti-cheat flag. Refusing a few
+    # short of full turns "everything is silently broken" into a message a moderator
+    # can act on, and leaves headroom to open the ones that matter while they clear
+    # the backlog. The rate limits in api_server._limit_ticket_open are what stop
+    # the category filling in the first place; this is the backstop.
+    # `reserve_capacity=False` is for the bulk announcement path, which opens one
+    # ticket per role member. It is not moderation intake, and letting it run to the
+    # cap would leave the category full — at which point reports, bug reports and the
+    # anti-cheat flag all fail until someone clears the backlog by hand. So it stops
+    # earlier and leaves the last slots for the tickets that need a human.
+    # The per-guild opening budget lives HERE, not at the endpoints, because it is a
+    # property of the category rather than of any one door. It was applied at four
+    # API endpoints and missed the two easiest — this modal (the primary, most-used
+    # door: any guild member, one button and a form) and the sue escalation — so the
+    # attack it was added against was still open through the front entrance. A
+    # breaker one caller can be added without is not a breaker.
+    #
+    # Bulk openings are exempt: they have their own, lower ceiling below, and an
+    # announcement is one authorised action rather than N unsolicited ones.
+    if reserve_capacity and not _allow_guild_opening(guild.id):
+        log.warning("Ticket budget for guild %s is spent; refusing a %s ticket.",
+                    guild.id, kind)
+        # Alerted, not just logged. This is the branch an attacker drives — spending
+        # the hourly budget is far cheaper than filling the category — and it refuses
+        # the anti-cheat flag along with everything else, so a log line nobody reads
+        # was exactly the wrong amount of noise.
+        await _alert_category_full(client, guild, category, kind, reason="budget_spent")
+        return None
+
+    limit = TICKET_CATEGORY_SOFT_MAX if reserve_capacity else TICKET_CATEGORY_BULK_MAX
+    if len(getattr(category, "channels", ())) >= limit:
+        log.error("Ticket category %r in guild %s is full (%d channels) — refusing to "
+                  "open a %s ticket. Close some tickets to restore the ticket system.",
+                  getattr(category, "name", "?"), guild.id,
+                  len(category.channels), kind)
+        # Only moderation intake alerts. The bulk announcement path stops 15 short
+        # of the real ceiling on purpose, so hitting *its* limit is the design
+        # working, not the ticket system going down.
+        if reserve_capacity:
+            await _alert_category_full(client, guild, category, kind)
+        return None
 
     num = await asyncio.to_thread(_next_ticket_number, guild.id)
     chan_name = f"ticket-{num:04d}"
@@ -396,10 +570,25 @@ class TicketModal(Modal):
         subject = self._inputs[0].value.strip()
         details = self._inputs[1].value.strip() if len(self._inputs) > 1 else ""
 
+        # Escaped at the display layer, not on the way in: an embed description
+        # renders full Discord markdown, masked links included, and this one is read
+        # in a private channel by moderators — the audience a
+        # `[boundlessmissions.com/admin](https://evil.tld)` is aimed at. Only the
+        # rendering is changed; nothing here stores the raw text.
         first_label = fields[0][0]
-        desc = f"**{first_label}**\n{subject}\n\n"
+        esc = discord.utils.escape_markdown
+        desc = f"**{first_label}**\n{esc(subject)}\n\n"
         if len(fields) > 1:
-            desc += f"**{fields[1][0]}**\n{details}"
+            desc += f"**{fields[1][0]}**\n{esc(details)}"
+
+        # Charged before the channel is opened, because opening one spends the
+        # guild-wide breaker every other intake door depends on.
+        if not _allow_modal_opening(interaction.user.id):
+            await interaction.followup.send(
+                f"⏳ You've opened {TICKET_MODAL_PER_USER_PER_HOUR} tickets in the last "
+                "hour, which is the limit. Add anything else to a ticket you already "
+                "have open, or wait a little and try again.", ephemeral=True)
+            return
 
         channel = await create_ticket(
             interaction.client, interaction.guild,
@@ -632,8 +821,12 @@ class Tickets(commands.Cog, name="Tickets"):
     @app_commands.command(name="ticketpanel",
                           description="Post the 'Open a Ticket' panel in the ticket channel")
     @app_commands.default_permissions(administrator=True)
+    @app_commands.check(lambda interaction: perms.is_admin_user(interaction))
     async def ticketpanel(self, interaction: discord.Interaction):
-        """(Admin) Post a fresh ticket panel message."""
+        """(Admin) Post a fresh ticket panel message.
+
+        The `check` is the real gate: `default_permissions` is only what Discord
+        shows by default, and a server admin can hand the command to any role."""
         ch_id = guild_config.get_channel_id(interaction.guild_id, "ticket_panel")
         if not ch_id:
             await interaction.response.send_message(
@@ -654,6 +847,15 @@ class Tickets(commands.Cog, name="Tickets"):
             return
         await interaction.response.send_message(
             f"✅ Ticket panel posted in {channel.mention}.", ephemeral=True)
+
+    async def cog_app_command_error(self, interaction: discord.Interaction,
+                                    error: app_commands.AppCommandError) -> None:
+        if isinstance(error, app_commands.CheckFailure):
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "❌ You don't have permission to use this command.", ephemeral=True)
+        # Anything else is left to the bot-wide handler, which discord.py runs
+        # after this one regardless (`CommandTree._dispatch_error`).
 
 
 async def setup(bot: commands.Bot):

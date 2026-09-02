@@ -52,6 +52,17 @@ def _env_id(key: str) -> int | None:
 # raise this too or legitimate renders will be rejected as too large.
 BLUEPRINT_SCALE = 2
 
+# ── Image decode ceiling ─────────────────────────────────────────────────────
+#
+# The most pixels the bot will ever *decode* from an image a client sent. The
+# byte caps bound what arrives on the wire, not what it becomes: a 13000×13000
+# PNG is ~1 MB compressed and ~680 MB as RGBA, and Pillow's own default only
+# starts to object at 89 MP. Every path that decodes user bytes (achievement /
+# checkpoint photos, the avatar, the AI-review shrink, the flag watermark) reads
+# the header first and refuses past this. A 4K screenshot is 8 MP and the largest
+# blueprint render (4096×2200) is 9 MP, so 30 MP is room to spare, not a squeeze.
+MAX_IMAGE_PIXELS = 30_000_000
+
 
 # ── Cost Guard: paid-service spending caps ───────────────────────────────────
 #
@@ -188,6 +199,16 @@ TICKET_PANEL_CHANNEL_ID: int | None = 1518238266686443660
 LEVEL_XP_BASE = 100
 LEVEL_XP_EXPONENT = 1.5
 
+# The most XP a record may hold; every setter (`store.award_xp`, `store.set_xp`,
+# and through them `/setxp` and the console's `xp_set`) clamps to it. A billion
+# is level ~46,000 on the formula above — nobody earns it, so it costs no real
+# player anything, and it keeps the number a Firestore int64 and a leaderboard
+# column can print. `level_from_xp` is closed-form and cheap at any value now,
+# but before it was, `/setxp amount:9007199254740991` (the largest integer a
+# Discord option carries) walked ~2e9 levels one at a time inside `store._lock`
+# on the event loop and stopped the whole bot; the cap is the second fence.
+MAX_XP = 1_000_000_000
+
 # Whether to announce level-ups in Discord at all. Off still writes the player's
 # own notification feed — that one is how a player with no Discord hears about it.
 ANNOUNCE_LEVEL_UP = True
@@ -287,6 +308,24 @@ CORP_CATEGORY_ID = 1492379906925924352
 # ── Contracts ────────────────────────────────────────────────────────────────
 
 # Max active contracts a user can have at once (as either issuer or contractor)
+# How many contracts one account may create an hour. Creation escrows a coin,
+# writes several documents and spends an AI classification, while cancelling a
+# PENDING contract refunds the coin — so the loop is otherwise free. Sized well
+# above any human's rate of issuing work by hand.
+CONTRACT_CREATE_PER_HOUR = 20
+
+# How often one account may list its contracts. The list reads that account's whole
+# history, so its cost grows with the history and a poll loop is how one account
+# turns its own past into everybody's Firestore bill.
+#
+# Sized against the real client cadence, which is NOT "on panel open" as first
+# assumed: GeneKermanMod resets lastRescueReconcile on every scene change, so a
+# launch-recover loop fetches 15-25 times an hour; RefreshContracts runs on every
+# contract notification, and with the browser UI open that is two fetches per
+# event; and contract notifications are produced by *other people*, so a bucket
+# sized to one player's own activity can be spent by strangers sending offers.
+CONTRACT_LIST_PER_HOUR = 600
+
 MAX_ACTIVE_CONTRACTS_PER_USER = 10
 
 # Channel ID where mod escalations ("sue" button) are posted.
@@ -311,6 +350,22 @@ CONTRACT_ALLOW_SELF = False
 # fined (the contractor acted; the issuer did not), and where moderator review is not
 # configured the clock restarts exactly once — see contract_actions.expire_dispute.
 DISPUTE_AUTO_FINE_DAYS = 3
+
+# How long a contract may sit in MOD_REVIEW before it resolves itself.
+#
+# MOD_REVIEW was the one status with no clock and no sweeper, which made it the exact
+# state DISPUTE_AUTO_FINE_DAYS exists to prevent, one hop later: a contractor facing a
+# fine could press Sue (free, unilateral) — or simply not answer a settle request, which
+# the dispute grace path escalates here — and nothing would ever happen again. Every
+# transition out of MOD_REVIEW is refused, so the issuer's escrow and a contract slot for
+# both parties were locked until a moderator acted, forever if none did.
+#
+# It times out to the SAME outcome as an unanswered dispute (the fine collects) rather
+# than to a neutral cancel, and that direction is the whole point: if suing and waiting
+# ended with no fine, suing would strictly beat paying and every contractor would do it.
+# Much longer than the dispute window because a human moderator has to find the ticket,
+# and unlike the dispute clock nobody can act to stop it except a third party.
+MOD_REVIEW_TIMEOUT_DAYS = 7
 
 # A contractor gets one deadline-extension request per dispute. Without this they can
 # keep asking with a new date every time one is refused, which is stalling by another
@@ -441,10 +496,37 @@ MARKETPLACE_AUTO_DELIST_MIN_VOTES = 40
 # is free and the floor removes a craft, so a same-day sign-up's vote is the
 # cheapest grief on the site. 0 disables the check.
 MARKETPLACE_VOTE_MIN_ACCOUNT_AGE_DAYS = 3
+# XP that lets an account skip the age wait above. `> 0` was too cheap a door: a
+# single message or one trivial action clears it, so an alt farm could vote the
+# same day it registered. This is a small but real amount of play.
+MARKETPLACE_VOTE_MIN_XP = 250
+# How many votes a listing needs before its score is allowed to move it in the
+# "highest rated" and "recommended" sorts. The rating *floor* already needs
+# MARKETPLACE_AUTO_DELIST_MIN_VOTES before it will remove a craft; the sorts had
+# no such requirement, so a handful of fresh accounts could put a listing at the
+# top of the site's default discovery tab. Below this a listing still appears —
+# it simply ranks as unrated rather than as acclaimed.
+# How much agreement a listing needs before its score counts at face value in the
+# "highest rated" and "recommended" sorts. NOT a threshold: a hard cliff at the
+# removal quorum (40) switched the sorts off altogether, because no craft on a
+# market this size ever collects forty votes — every listing scored 0 and the
+# landing tab silently became "Newest". This is the `k` in `net * votes/(votes+k)`,
+# so a craft with k votes counts at half its score and one with 4k at 80%: enough
+# damping that a handful of alt upvotes is worth a fraction of face value, with no
+# count at which the ranking changes character. See api_server._ranked_score.
+MARKETPLACE_RANK_CONFIDENCE = 8
 # Quicksend payloads (`gifts/`) nobody has acted on are deleted after this many
 # days; an accepted gift is imported within minutes and a declined vessel's
 # return is fetched the next time its owner plays.
 GIFT_FILE_MAX_AGE_DAYS = 30
+# How long the crew hand-over ledger (`data/crew_ledger.py`) remembers that a
+# player's own kerbals left their save to a particular friend. It is what lets an
+# honest quicksend *return* strip its ownership tag instead of taking the
+# impersonation refusal, so the window is "how long a borrowed ship might plausibly
+# stay borrowed" and not a security parameter: expiring early costs a returning
+# player their crew's tag (the pre-existing §3.11 behaviour), never a kerbal, and
+# expiring late only ever lets someone's own name come home to them.
+CREW_LEDGER_TTL_DAYS = 90
 
 
 # ── Weekly Missions ──────────────────────────────────────────────────────────
@@ -522,6 +604,19 @@ KSP_API_PORT = 5022
 # code lifetime, so it costs nothing defensively.
 KSP_LINK_RATELIMIT_PER_IP = 10       # link/2FA attempts per IP per minute
 KSP_LINK_RATELIMIT_GLOBAL = 600      # global backstop per minute (anti self-DoS)
+
+# Global backstop for the two login-approval POLL routes, which are anonymous, take no
+# `Depends`, and have no per-challenge attempt counter — so when API_TRUSTED_PROXIES is
+# empty (its default, and the live value) the conditional per-IP bucket leaves them with
+# NO bound at all, while each request does an uncached Firestore read on the shared event
+# loop. That is the anonymous-Firestore-amplification shape a previous pass rated HIGH.
+#
+# Sized from the real caller, not from an abuse argument: a client polls once a second
+# only while a human is at the approval prompt, and a link challenge lives 3 minutes. So
+# 1200/min is ~20 people linking simultaneously, continuously — far above any plausible
+# community and far below what could drive the cost guard. Global on purpose, exactly
+# like KSP_LINK_RATELIMIT_GLOBAL: it is the bound that must survive an empty proxy list.
+KSP_POLL_RATELIMIT_GLOBAL = 1200
 
 # ── KSP anti-exploit: flight-telemetry consistency ───────────────────────────
 # The KSP client is untrusted: a modified DLL could report a vessel as "ORBITING

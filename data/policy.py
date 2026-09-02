@@ -21,11 +21,23 @@ Document shape:
 """
 
 import logging
+import threading
+import time
 from datetime import datetime, timezone
 
 from data.store import _db
 
 log = logging.getLogger(__name__)
+
+# Memoised for the same reason as data/mod_version's registry: `config/policy` is
+# one rarely-changing document read on the anonymous `/version/check`, so an
+# uncached read here is a metered Firestore operation per unauthenticated request.
+# Short TTL as a backstop for an edit made outside this process; `invalidate()` is
+# what makes a bump through the console take effect immediately. Failures are not
+# cached — the fallback below already answers safely without help from a cache.
+_CACHE_TTL = 60.0
+_cache_lock = threading.Lock()
+_cache: dict = {"at": 0.0, "doc": None}
 
 # Baseline policy version. Shipped clients accept version 1, so the re-consent
 # gate stays dormant until an admin publishes a higher version.
@@ -36,10 +48,32 @@ def _doc():
     return _db.collection("config").document("policy")
 
 
-def get_config() -> dict:
-    """Current policy document (empty dict if nothing has been published yet)."""
+def get_config(*, fresh: bool = False) -> dict:
+    """Current policy document (empty dict if nothing has been published yet).
+
+    Answered from a 60-second in-process cache; `invalidate()` clears it, and
+    `set_version` refreshes it. `fresh=True` forces a read.
+    """
+    if not fresh:
+        with _cache_lock:
+            doc, at = _cache["doc"], float(_cache["at"])
+        if doc is not None and (time.time() - at) < _CACHE_TTL:
+            return dict(doc)
     snap = _doc().get()
-    return snap.to_dict() if snap.exists else {}
+    data = snap.to_dict() if snap.exists else {}
+    with _cache_lock:
+        _cache["doc"] = dict(data)
+        _cache["at"] = time.time()
+    return dict(data)
+
+
+def invalidate() -> None:
+    """Drop the memoised policy document. Called by the console after a bump, so
+    a forced re-consent reaches clients on their next check rather than after the
+    TTL."""
+    with _cache_lock:
+        _cache["doc"] = None
+        _cache["at"] = 0.0
 
 
 def get_version() -> int:
@@ -70,4 +104,7 @@ def set_version(version: int, updated_by: str, summary: str | None = None,
     data["updated_at"] = datetime.now(timezone.utc).isoformat()
     data["updated_by"] = updated_by
     ref.set(data)
+    with _cache_lock:                 # the writer knows the new document
+        _cache["doc"] = dict(data)
+        _cache["at"] = time.time()
     return data

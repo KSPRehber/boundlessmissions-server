@@ -16,7 +16,7 @@ from firebase_admin import firestore
 from data.store import (
     _db, _storage_bucket, safe_filename, safe_content_type,
     upload_private, signed_url, sign_stored, is_storage_path,
-    SIGNED_URL_MAX_TTL,
+    SIGNED_URL_MAX_TTL, display_filename, md_filename,
 )
 
 log = logging.getLogger(__name__)
@@ -60,6 +60,7 @@ def create_contract(
     life_support: str | None = None,
     ls_endurance_days: float = 0.0,
     ls_crew_capacity: int = 0,
+    constraints: dict | None = None,
 ) -> ContractData:
     cid = uuid.uuid4().hex[:12]
     now = datetime.utcnow().isoformat()
@@ -96,6 +97,12 @@ def create_contract(
         doc["rescue_pid"] = rescue_pid
         doc["issuer_vessel_removed"] = True
         doc["delivered_vessel_node_url"] = None
+    # Part/crew limits decided at creation. Stored — even when empty — so every
+    # later render reads them off the document instead of re-deriving them from
+    # the mission text: a contract is drawn many more times than it is written
+    # (offer, dispute, review, ticket), each time on the bot's event loop.
+    if constraints is not None:
+        doc["constraints"] = constraints
     # Life-support provisioning of the craft this contract is about. On a rescue it is
     # known at creation (the wreck already exists and was scanned); on a normal contract
     # it arrives with the submitted craft instead, and is written then.
@@ -159,7 +166,20 @@ def delete_stored_file(path: str) -> bool:
         return False
 
 
-def iter_user_contracts(guild_id: int, user_id: int) -> list[ContractData]:
+# The non-terminal statuses an escrow figure has to look at: every contract in
+# one of these still has the issuer's payment locked up (see api_server's
+# `_escrow_held`). Named separately from ACTIVE_STATUSES even though the members
+# are the same today, because the two answer different questions — "is this
+# contract still running" and "is this money still held" — and a status that
+# stops counting against the activity cap need not stop holding coins.
+ESCROW_STATUSES: set[str] = {PENDING, ACTIVE, SUBMITTED, DISPUTED, MOD_REVIEW}
+
+
+def iter_user_contracts(guild_id: int, user_id: int, *,
+                        statuses: set[str] | None = None,
+                        limit: int | None = None,
+                        roles: tuple[str, ...] = ("contractor_id", "issuer_id"),
+                        ) -> list[ContractData]:
     """All contracts where the user is issuer or contractor, deduped by id.
 
     Uses two single-field-equality queries (each served by Firestore's automatic
@@ -167,14 +187,66 @@ def iter_user_contracts(guild_id: int, user_id: int) -> list[ContractData]:
     contract in the guild and OR-filtering in Python. The returned set is
     identical to the old `where("status","in",...).stream()` + Python filter,
     minus the status filter, which callers apply in-memory.
+
+    Both keyword arguments default to the old behaviour — every contract the
+    account has ever been party to — because the history view genuinely wants
+    that. They exist for the callers that do not: a contract history only grows
+    (a completed or cancelled contract is kept), so an unfiltered read is one
+    metered Firestore read per contract the account has EVER had, on every call,
+    and an endpoint that makes one per request turns a few thousand cheap
+    create→cancel cycles into a walk up the shared budget to `cost_guard`'s
+    FROZEN — which stops the bot for everybody, not for the caller. This is the
+    same fix `count_active` already carries, and for the same reason.
+
+      * `statuses` filters in the *query* (`status in [...]`), so the documents
+        never leave Firestore and are never billed.
+      * `limit` caps each of the two queries, so the read is bounded at 2×limit
+        documents and the returned list at `limit`. It is a cost ceiling, not a
+        page: there is no cursor, and a caller that hits it is seeing an
+        arbitrary subset. Only pass it where a partial answer is better than an
+        unbounded read (a summary line), never where it would silently change a
+        total the player is shown as exact.
+      * `roles` picks which side(s) to query. It exists because `limit` applies to
+        EACH query and the merge then truncates to `limit` overall, keeping the
+        first side's rows — so a caller that only cares about one side was paying
+        its whole budget for rows it discards. `_escrow_held` wants issuer rows
+        only; asking for both meant a player with a few hundred PENDING offers
+        *made to them* (deliberately uncapped) filled the 500 with contractor rows
+        and had their escrow reported low, or as zero.
     """
     uid = str(user_id)
     col = _col(guild_id)
+    want = set(statuses) if statuses else None
     by_id: dict[str, ContractData] = {}
-    for field in ("contractor_id", "issuer_id"):
-        for doc in col.where(field, "==", uid).stream():
+    for field in roles:
+        q = col.where(field, "==", uid)
+        try:
+            if want:
+                # A disjunction of equalities, exactly as count_active does it —
+                # Firestore merges single-field indexes for this and needs no
+                # composite one. Sorted for a stable query shape.
+                q = q.where("status", "in", sorted(want))
+            if limit is not None and limit > 0:
+                q = q.limit(int(limit))
+            docs = list(q.stream())
+        except Exception as exc:
+            # A deployment that refuses the `in` clause must still get an answer:
+            # fall back to the plain single-field query and filter in Python. The
+            # limit is kept, so the fallback is still bounded — it is the cost
+            # ceiling that must never be the thing that gets dropped.
+            log.warning("iter_user_contracts fell back to an unfiltered query for "
+                        "%s (%s): %s", uid, field, exc)
+            q = col.where(field, "==", uid)
+            if limit is not None and limit > 0:
+                q = q.limit(int(limit))
+            docs = [d for d in q.stream()
+                    if not want or (d.to_dict() or {}).get("status") in want]
+        for doc in docs:
             by_id[doc.id] = doc.to_dict()
-    return list(by_id.values())
+    rows = list(by_id.values())
+    if limit is not None and limit > 0:
+        del rows[int(limit):]
+    return rows
 
 
 def list_by_status(status: str) -> list[ContractData]:
@@ -187,12 +259,62 @@ def list_by_status(status: str) -> list[ContractData]:
     return [doc.to_dict() for doc in _col().where("status", "==", status).stream()]
 
 
+ACTIVE_STATUSES = (PENDING, ACTIVE, SUBMITTED, DISPUTED, MOD_REVIEW)
+
+
+def list_by_issuer(issuer_id: str) -> list[ContractData]:
+    """Every contract issued by one id, in any status.
+
+    Single-field equality, so Firestore's automatic index serves it and no
+    composite index is needed. Written for the `issuer_id == "0"` repair (see
+    `cogs.contracts.repair_bot_issuer`), which is why it does not filter status:
+    the repair has to see the terminal ones to report them, even though it only
+    rewrites the rest."""
+    return [doc.to_dict() for doc in _col().where("issuer_id", "==", str(issuer_id)).stream()]
+
+
 def count_active(guild_id: int, user_id: int) -> int:
-    active_statuses = {PENDING, ACTIVE, SUBMITTED, DISPUTED, MOD_REVIEW}
-    return sum(
-        1 for c in iter_user_contracts(guild_id, user_id)
-        if c.get("status") in active_statuses
-    )
+    """How many non-terminal contracts this account is a party to.
+
+    Filtered in the *query* rather than in Python. It used to call
+    `iter_user_contracts`, which streams a user's whole history — and a history
+    only grows, since a cancelled or completed contract is kept. Every create paid
+    that cost (the cap is checked before writing), so the read cost of the Nth
+    contract was O(N) and of accumulating N was O(N²): a few thousand
+    create→cancel cycles were enough to walk the shared Firestore budget up to the
+    cost guard's FROZEN level, which stops the whole bot.
+
+    Both filters are equalities (`in` is a disjunction of them), so Firestore
+    serves this by merging single-field indexes and no composite index is needed.
+    If a deployment nonetheless refuses it, fall back to the old full read rather
+    than fail a contract action — the cap is worth more than the saving.
+    """
+    uid = str(user_id)
+    col = _col(guild_id)
+    # A PENDING contract is an *offer*. For the issuer it is a real obligation —
+    # their payment is escrowed — but for the person it was offered TO it is
+    # something a stranger did to them, and it used to fill their allowance:
+    # anyone could spend ten coins offering a victim ten contracts and lock them
+    # out of weekly missions, auction bids and issuing work of their own, with the
+    # auction close-time re-check even cancelling a win they had already made. So
+    # the offeree's side counts only what they actually accepted.
+    per_field = {
+        "issuer_id": list(ACTIVE_STATUSES),
+        "contractor_id": [s for s in ACTIVE_STATUSES if s != PENDING],
+    }
+    try:
+        by_id: set[str] = set()
+        for field, statuses in per_field.items():
+            for doc in (col.where(field, "==", uid)
+                           .where("status", "in", statuses).stream()):
+                by_id.add(doc.id)
+        return len(by_id)
+    except Exception as exc:
+        log.warning("count_active fell back to a full history read for %s: %s", uid, exc)
+        return sum(1 for c in iter_user_contracts(guild_id, user_id)
+                   if c.get("status") in set(ACTIVE_STATUSES)
+                   and not (c.get("status") == PENDING
+                            and str(c.get("contractor_id")) == uid))
 
 
 # ── Reports ──────────────────────────────────────────────────────────────────
@@ -299,6 +421,57 @@ async def upload_private_to_storage(contract_id: str, filename: str, data: bytes
         raise RuntimeError("Firebase Storage not configured")
     path = f"contracts/{contract_id}/{safe_filename(filename, 'file')}"
     return upload_private(path, data, content_type)
+
+
+async def upload_submission_file(contract_id: str, party_id: str, filename: str,
+                                 data: bytes, content_type: str = "application/octet-stream",
+                                 public: bool = False,
+                                 path_out: list[str] | None = None) -> str:
+    """Store a file a *client* named — a submitted craft, a screenshot, an
+    uploaded flag — under a slot the server chooses.
+
+    `contracts/{cid}/` is shared by both parties and by the server's own objects
+    (`rescue_vessel.cfg`, the issuer's stored wreck; `vessel_node.cfg`; the orbit
+    diagrams), and `safe_filename` keeps any plain basename — so a rescuer whose
+    "screenshot" was called `rescue_vessel.cfg` used to replace the wreck that
+    `_restore_issuer_vessel` later hands back to the issuer, and make it public
+    on the way. The path here is `contracts/{cid}/submitted/{party}/{uuid}_{name}`:
+    the party segment keeps the two sides apart, the uuid keeps one party's files
+    apart from each other, and `submitted/` keeps all of it out of the server's
+    namespace. `if_generation_match=0` is the belt to those braces — it makes the
+    write itself refuse to replace an object that exists, whatever the path.
+
+    Returns the public URL for `public=True` (screenshots, shown in embeds and the
+    web review), else the bare bucket path of a private object (crafts, flags),
+    which readers resolve through `sign_stored`."""
+    if _storage_bucket is None:
+        raise RuntimeError("Firebase Storage not configured")
+    party = safe_filename(str(party_id), "party")
+    path = (f"contracts/{contract_id}/submitted/{party}/"
+            f"{uuid.uuid4().hex[:8]}_{safe_filename(filename, 'file')}")
+    if path_out is not None:
+        # The caller needs the PATH to be able to delete this again: a public object
+        # is returned as a URL, and `delete_stored_file` refuses anything carrying a
+        # scheme, so the return value of a public upload cannot remove it. The uuid
+        # in the path is minted here, so only this function can hand it back.
+        path_out.append(path)
+    blob = _storage_bucket.blob(path)
+    blob.upload_from_string(data, content_type=safe_content_type(content_type),
+                            if_generation_match=0)
+    if not public:
+        log.info("Uploaded private submission object %s (%d bytes)", path, len(data) if data else 0)
+        return path
+    blob.make_public()
+    log.info("Uploaded %s to Storage", path)
+    return blob.public_url
+
+
+def file_link(f: dict, icon: str = "📎", url: str | None = None) -> str:
+    """One `icon [name](url)` line for a stored submission file in a Discord
+    embed. The name goes through `md_filename` so it can neither close the link
+    text nor run past an embed field: entries written before the display name
+    was sanitised at upload still carry the client's raw string."""
+    return f"{icon} [{md_filename(f.get('filename') or '')}]({url or f.get('url') or ''})"
 
 
 async def download_url(url: str) -> bytes:

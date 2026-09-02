@@ -103,6 +103,13 @@ class TwoFactorStatus(BaseModel):
     # A secret has been minted but no working code has proved it yet.
     pending: bool = False
     recovery_remaining: int = 0
+    # Whether enrolling requires re-proving a Firebase credential first, and with
+    # which provider. The client cannot work this out for itself: a Discord-origin
+    # account has no Firebase identity at all and must not be asked for one (that
+    # would put 2FA out of reach of most of the player base), while a
+    # password-registered account cannot re-prove itself through a Google popup.
+    # "" = no re-auth needed, "google" / "password" = which one to ask for.
+    reauth: str = ""
 
 class TwoFactorBeginResponse(BaseModel):
     # Three ways in: scan the QR, tap the link, or type the secret. `qr_svg` is a
@@ -115,6 +122,27 @@ class TwoFactorBeginResponse(BaseModel):
 
 class TwoFactorCodeRequest(BaseModel):
     code: str = Field(..., min_length=4, max_length=24)
+    # A fresh Firebase ID token, required to *enable* a factor (see
+    # api_server.web_2fa_begin). Optional on the model because the same shape is
+    # used by the paths that already prove themselves with a working code.
+    id_token: str = Field(default="", max_length=4096)
+
+
+class TwoFactorBeginRequest(BaseModel):
+    """Starting an enrolment re-proves the primary credential.
+
+    Removing a factor already requires a working code, on the stated grounds that
+    "a borrowed signed-in browser must not be able to strip the protection that
+    exists for exactly that case". Adding one had no such requirement, and adding
+    is the worse direction: an attacker holding a borrowed session could enrol
+    their own authenticator, keep the recovery codes, and lock the real owner out
+    of their account permanently — neither removal path would help, because both
+    need a code the owner never had.
+    """
+    # Empty is valid for an account with no Firebase identity (a Discord-origin
+    # account signs in by link code, not through Firebase) — the server decides,
+    # see api_server._require_fresh_firebase.
+    id_token: str = Field(default="", max_length=4096)
 
 class TwoFactorConfirmResponse(BaseModel):
     success: bool = True
@@ -315,6 +343,20 @@ class FinanceResponse(BaseModel):
     currency_name: str = "KCoins"
     debt: int = 0
     debt_garnish_percent: int = 0
+    # Money that has left the wallet but has not been spent: the payment on every
+    # contract this player issued that has not settled yet, plus the start value of
+    # every auction of theirs still open. It is sent separately from `balance`
+    # because the two answer different questions — the balance is what can be spent
+    # now, the escrow is what is already committed — and because a player who has
+    # just issued a contract otherwise sees only that their balance dropped.
+    #
+    # Deliberately *not* derivable from `totals`: an escrow that ends by paying the
+    # contractor is recorded on the contractor's ledger, never on the issuer's, so
+    # the issuer's own history cannot say how much of what they escrowed is still
+    # locked. It is derived from the contracts themselves (see `_escrow_held`).
+    escrow: int = 0
+    escrow_contracts: int = 0
+    escrow_auctions: int = 0
     # Lifetime, across every category — the two headline numbers.
     total_in: int = 0
     total_out: int = 0
@@ -462,6 +504,15 @@ class ContractSummary(BaseModel):
     created_at: Optional[str] = None
     is_bot_issued: bool = False
     is_outgoing: bool = False  # True when the current user is the issuer (sent, not received)
+    # The two parties' immutable ACCOUNT ids. Sent because the client has to decide
+    # crew ownership on a transfer, and `issuer_name`/`contractor_name` are display
+    # names — self-chosen, mutable and not unique, so deciding on them let anyone
+    # take a victim's name and have the victim's own kerbals adopted onto an
+    # arriving vessel (see data/imports.enqueue's owner_id). Names stay for display;
+    # ids are what the decision keys on. No new disclosure: the same ids are already
+    # public in the corp/player pickers.
+    issuer_id: str = ""
+    contractor_id: str = ""
     modlist: Optional[str] = None  # Comma-separated mod folder names from issuer's KSP client
     # Classification (from mission)
     mission_type: str = "active_vessel"
@@ -480,6 +531,23 @@ class ContractSummary(BaseModel):
     # Wreck snapshot URL — only set for the rescuer (contractor) on an accepted
     # rescue, so their client can spawn/respawn the stranded vessel on demand.
     rescue_vessel_node_url: Optional[str] = None
+    # What the wreck looks like, and where it actually is: the blueprint sheet the
+    # issuer's client rendered at issuance, and the orbit diagram the server drew from
+    # the telemetry captured with it. Ap/Pe numbers say how high, never which orbit,
+    # and the mission text says nothing at all about how big the ship is or what is
+    # left of it — both are what a rescuer plans against, so they are carried on the
+    # offer as well as on the accepted contract.
+    #
+    # Both are PUBLIC storage URLs (see _store_rescue_schematics) and both are absent
+    # on every rescue issued before this existed and from every older client. Absent
+    # means "no schematic", never an error: a client that has neither draws nothing.
+    rescue_blueprint_url: Optional[str] = None
+    rescue_orbit_url: Optional[str] = None
+    # The wreck was landed/splashed when it was handed over, so the diagram shows a
+    # surface marker rather than an orbit and must not be captioned as one. Distinct
+    # from rescue_target.mode, which is where the crew must be *delivered* — a wreck
+    # in orbit can be a surface-delivery rescue and vice versa.
+    rescue_orbit_surface: bool = False
     # The issuer's local vessel GUID for the craft they handed over. Sent back only
     # to the issuer, and only so their client can verify the removal actually took:
     # the contract existing at all means the ship is no longer theirs, so a copy
@@ -508,12 +576,38 @@ class ContractListResponse(BaseModel):
     contracts: list[ContractSummary]
 
 
+class ContractFlagResponse(BaseModel):
+    """The deliverable of a `flag_design` contract, as the website may see it.
+
+    One field carries the whole gate: `watermarked` says which image this is.
+    Until the contract completes — i.e. is paid for — `url` is the public,
+    stamped, downscaled preview; afterwards it is a signed URL to the clean
+    full-res file the issuer bought. A client must never infer that from the
+    status it happens to be holding, which can be stale by a review.
+    """
+    url: Optional[str] = None
+    filename: str = ""
+    watermarked: bool = True
+
+
 class PartCatalogUpload(BaseModel):
     """The KSP client's full installed part list, used to resolve loosely-typed
     part mentions in mission limits to real parts. `hash` lets the client skip
     re-uploading an unchanged catalog."""
-    hash: str
-    parts: list[dict] = []  # each: {"name": <internal>, "title": <display>}
+    # Bounded at the model, because the handler's `[:8000]` slice bounds the entry
+    # *count* only — the strings inside were unbounded, so a body just under the
+    # request ceiling produced a ~78 MB catalog that then failed its (>1 MiB)
+    # Firestore write and lived on in memory alone, permanently. See
+    # api_server.upload_part_catalog, which also caps each name and title.
+    hash: str = Field(max_length=128)
+    # Deliberately NOT capped at the working limit (8000): the handler truncates to
+    # that and returns 200, and turning the truncation into a 422 would fail the
+    # upload outright on the heavily-modded installs this project exists for —
+    # PartCatalogUploader sends the whole LoadedPartsList, logs a warning and never
+    # retries for the session, so a refusal costs part resolution and marketplace
+    # compatibility silently. This bound is a defence against an absurd payload, not
+    # a behaviour any real install meets.
+    parts: list[dict] = Field(default_factory=list, max_length=30000)  # {"name":…, "title":…}
 
 
 class PartCatalogResponse(BaseModel):
@@ -544,13 +638,74 @@ class CorpInfo(BaseModel):
 class CorpListResponse(BaseModel):
     corps: list[CorpInfo]
 
+
+# ── Friends ──────────────────────────────────────────────────────────────────
+# One card shape for all three lists (friends, requests in and out): the client
+# draws the same row and only the buttons under it differ, so splitting the model
+# by list would guarantee they drift apart.
+
+class FriendInfo(BaseModel):
+    user_id: str
+    name: str
+    # The claimed Boundless username — the handle a friend request is addressed
+    # to. Sent alongside the display name because those are two different things
+    # for a Discord player, whose card says their nickname while their username is
+    # what someone else has to type to find them.
+    username: str = ""
+    avatar_url: Optional[str] = None
+    level: int = 0
+    # Epoch seconds: when the friendship began, or when the request was sent.
+    at: float = 0.0
+    # Whether this player has a Discord behind them. Presentation only — the
+    # friendship itself does not care, and nothing may gate on it.
+    discord: bool = False
+
+class FriendListResponse(BaseModel):
+    friends: list[FriendInfo] = []
+    incoming: list[FriendInfo] = []
+    outgoing: list[FriendInfo] = []
+    max_friends: int = 0
+
+class FriendRequestPayload(BaseModel):
+    """Ask by username (what a website account is found by) or by account id
+    (what the in-game roster picker already holds). Exactly one is used;
+    `username` wins when both arrive, since it is the one a human typed."""
+    username: str = Field(default="", max_length=64)
+    user_id: str = Field(default="", max_length=64)
+
+class FriendActionResult(BaseModel):
+    success: bool
+    message: str
+    # "requested" | "accepted" | "" — lets a client tell "sent, now wait" apart
+    # from "that completed a handshake, you are friends now" without parsing the
+    # sentence it also shows.
+    state: str = ""
+
+# The ceiling on a client-sent mod list, shared by the contract and auction models.
+# See the note at its use site: measured against real heavy installs, not guessed.
+MODLIST_MAX_LENGTH = 8000
+
+
 class ContractCreateRequest(BaseModel):
     contractor_id: str  # Corp owner's user ID
     mission: str = Field(..., min_length=3, max_length=500)
     payment: int = Field(..., gt=0)
     fine: int = Field(default=0, ge=0)
     due_date: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$")
-    modlist: Optional[str] = None  # Comma-separated list of loaded assembly names
+    # Bounded: this string is stored on the contract and echoed to the offeree on
+    # every poll. Unbounded it was both an amplifier and — over Firestore's 1 MiB
+    # document limit — a way to make `create_contract` fail *after* the escrow had
+    # been debited.
+    #
+    # 8000, not 2000. The original bound was reasoned from "a real KSP mod list is a
+    # few hundred folder names" without measuring one. Measured on this machine's own
+    # dev installs, `ModlistJanitor` (which sends every GameData folder, not just the
+    # ones contributing parts) produces 1924 characters on FAK1 — 96% of a 2000-char
+    # cap, on a modpack that is not unusual by community standards. A 200-folder
+    # install simply exceeded it, and the failure was a bare FastAPI 422 with nothing
+    # in the mod's UI to explain it. This is still three orders of magnitude under
+    # the Firestore limit the bound exists to stay beneath.
+    modlist: Optional[str] = Field(default=None, max_length=MODLIST_MAX_LENGTH)  # Comma-separated list of loaded assembly names
     # "auto" keeps the existing AI classification; "craft_build" / "active_vessel"
     # force the type and skip AI. (Rescue contracts use the separate multipart
     # /contracts/create_rescue endpoint.)
@@ -568,7 +723,20 @@ class AuctionCreateRequest(BaseModel):
     fine: int = Field(default=0, ge=0)
     due_date: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$")
     duration_hours: int = Field(..., gt=0)
-    modlist: Optional[str] = None  # mods required / limited to
+    # Bounded: this string is stored on the contract and echoed to the offeree on
+    # every poll. Unbounded it was both an amplifier and — over Firestore's 1 MiB
+    # document limit — a way to make `create_contract` fail *after* the escrow had
+    # been debited.
+    #
+    # 8000, not 2000. The original bound was reasoned from "a real KSP mod list is a
+    # few hundred folder names" without measuring one. Measured on this machine's own
+    # dev installs, `ModlistJanitor` (which sends every GameData folder, not just the
+    # ones contributing parts) produces 1924 characters on FAK1 — 96% of a 2000-char
+    # cap, on a modpack that is not unusual by community standards. A 200-folder
+    # install simply exceeded it, and the failure was a bare FastAPI 422 with nothing
+    # in the mod's UI to explain it. This is still three orders of magnitude under
+    # the Firestore limit the bound exists to stay beneath.
+    modlist: Optional[str] = Field(default=None, max_length=MODLIST_MAX_LENGTH)  # mods required / limited to
     # craft_build / active_vessel / flag_design — inherited by the winner's contract.
     # Other values (or null) are ignored, leaving the contract untyped.
     contract_type: Optional[str] = None
@@ -664,6 +832,15 @@ class MarketplaceListResult(BaseModel):
     # shows `message` on success, so the note has to be its own field.
     reward: int = 0
     reward_note: str = ""
+
+class MarketplaceDownload(BaseModel):
+    """One entitled download link. Deliberately not a listing: the website's
+    download proxy needs exactly a URL and a filename, and resolving that through
+    the "My Uploads" / "My Purchases" list views cost two full collection queries
+    and one signature per row, on the bot's event loop, per click."""
+    url: str
+    filename: str
+
 
 class MarketplaceListing(BaseModel):
     listing_id: str

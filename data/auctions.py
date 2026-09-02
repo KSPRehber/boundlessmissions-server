@@ -13,6 +13,7 @@ from typing import Any
 
 from firebase_admin import firestore
 
+import settings
 from data.store import _db
 
 log = logging.getLogger(__name__)
@@ -95,6 +96,7 @@ def try_place_bid(guild_id: int, auction_id: str, bidder_id, bidder_name: str,
       {"ok": False, "reason": "own"}
       {"ok": False, "reason": "no_discord"}
       {"ok": False, "reason": "too_high", "ceiling": <int>}
+      {"ok": False, "reason": "fine_cap", "floor": <int>, "fine": <int>, "mult": <int>}
 
     Auctions are a Discord game: the winner is handed a work view in their corp
     channel or DM, and `close_auction` needs a member to do that. A website-only
@@ -121,10 +123,34 @@ def try_place_bid(guild_id: int, auction_id: str, bidder_id, bidder_name: str,
         if str(bidder_id) == str(a.get("issuer_id")):
             return {"ok": False, "reason": "own"}
 
+        # A bid is money the issuer will owe: zero or negative is not a lower bid,
+        # it is a broken one. Both current callers already refuse it, so this is a
+        # backstop — but it belongs in the transaction with the other invariants,
+        # because `close_auction` computes the issuer's refund as
+        # `start_value - final` and a negative `final` refunds more than was ever
+        # escrowed, which mints coins.
+        if amount <= 0:
+            return {"ok": False, "reason": "too_high", "ceiling": 0, "step": 0}
+
         step = a.get("min_decrement", 1)
         ceiling = a["current_bid"] - step
         if amount > ceiling:
             return {"ok": False, "reason": "too_high", "ceiling": ceiling, "step": step}
+
+        # MAX_FINE_MULTIPLE_OF_PAYMENT was checked when the auction opened, against
+        # the START value — but the contract's payment is the WINNING bid. Start
+        # 10 000 / fine 50 000 / bid 1 passed at open and bound the bidder to a
+        # 1-coin job carrying a 50 000 fine, which a give-up or dispute timeout
+        # turns into a debt that follows them; an issuer can bait that on purpose,
+        # since the low bidder always "wins". So a bid may not go below the price
+        # at which the fine would breach the cap. The floor is named in the
+        # refusal: it is a number the bidder can act on.
+        mult = settings.MAX_FINE_MULTIPLE_OF_PAYMENT
+        fine = int(a.get("fine", 0) or 0)
+        if mult > 0 and fine > 0 and fine > amount * mult:
+            floor = -(-fine // mult)   # ceil(fine / mult)
+            return {"ok": False, "reason": "fine_cap", "floor": floor, "fine": fine,
+                    "mult": mult}
 
         fields = {
             "current_bid": amount,
@@ -144,6 +170,60 @@ def try_place_bid(guild_id: int, auction_id: str, bidder_id, bidder_name: str,
         return {"ok": True, "auction": a}
 
     return _bid(transaction)
+
+
+def claim_close(auction_id: str) -> AuctionData | None:
+    """Take the auction out of OPEN atomically, and hand back the state to close on.
+
+    Two separate defects made this necessary, and one transaction closes both.
+
+    **The bid/close race.** `_close_auction_locked` read the auction plainly and then
+    spent several awaits — `contractor_gate`, `create_contract`, `add_balance` — before
+    writing CLOSED. `try_place_bid` refuses a bid only once `ends_at` has passed, so on
+    an EARLY close (the issuer's "End now" button, or the web end endpoint) a bid landing
+    inside that window committed, told the bidder "you're the lowest bidder", and was
+    then ignored: the close bound the PREVIOUS bidder at the PREVIOUS price, leaving the
+    stored auction naming one player and its `result_contract_id` naming another.
+    `try_place_bid` was made transactional for exactly this class of problem; the close
+    it feeds was not. `_close_locks` only serialises closes against each other.
+
+    **The retry.** The close moved money before writing the status, and the sweeper runs
+    every 30 seconds. A failure at the status write left the auction OPEN with `ends_at`
+    in the past, so the next tick created a SECOND contract binding the same winner and
+    paid a SECOND refund.
+
+    So the status leaves OPEN inside the transaction, before any of that work: a
+    concurrent bid then fails its own `status != OPEN` check, and a retry finds nothing
+    to claim. The frozen `current_bid` / `current_bidder_id` in the returned dict are
+    what the caller must use — re-reading the document afterwards would reintroduce the
+    race this removes.
+
+    CLOSED is written provisionally because the branch (bound / refused / no bids) is
+    decided from the very values this transaction freezes; the caller downgrades it to
+    CANCELLED when there is no winner or the winner cannot be bound. A crash between the
+    claim and that downgrade leaves a CLOSED auction with no `result_contract_id`, which
+    is visible and repairable — and, unlike the state it replaces, does not duplicate a
+    contract or a refund. That is the same direction the contract transitions chose.
+
+    Returns the frozen auction, or None when it was not OPEN (already closed, already
+    claimed, or gone) — in which case the caller must do nothing at all.
+    """
+    ref = _col().document(auction_id)
+    transaction = _db.transaction()
+
+    @firestore.transactional
+    def _claim(txn) -> AuctionData | None:
+        snap = ref.get(transaction=txn)
+        if not snap.exists:
+            return None
+        a = snap.to_dict() or {}
+        if a.get("status") != OPEN:
+            return None
+        txn.update(ref, {"status": CLOSED, "close_claimed_at": datetime.utcnow().isoformat()})
+        a["status"] = CLOSED
+        return a
+
+    return _claim(transaction)
 
 
 def list_open(guild_id: int) -> list[AuctionData]:

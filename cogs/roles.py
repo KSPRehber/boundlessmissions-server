@@ -5,9 +5,11 @@ from discord.ext import commands
 from discord.ui import View, Select
 
 import settings
+from data.store import store
 from data import achievements
 from data import guild_config
 from i18n import tp, t, S
+from cogs import perms
 from cogs.moderation import mod_only
 
 log = logging.getLogger(__name__)
@@ -29,11 +31,26 @@ async def sync_user_levels(bot: commands.Bot, uid: int) -> set[int]:
     """Fold any level roles the user already wears (in any guild, resolved via that
     guild's mapped role IDs) into the global achievement store, then return the
     user's full global unlocked set."""
+    # A worn role is only evidence of a level the player actually EARNED here.
+    #
+    # Any guild can map `level_15` to a role of its choosing and hand it out, and
+    # folding that into the global achievement store made a local grant a permanent
+    # global unlock — the cross-guild invariant `perms.is_admin_user` states,
+    # failing on a cosmetic surface. Nothing economic reads `achievements`, which is
+    # why this is small; the mechanism is the part worth closing.
+    #
+    # The XP record is the authority, and it is global already, so a role is folded
+    # in only when the player's own level actually reaches it. That keeps the case
+    # this function exists for — someone who earned the role before the achievement
+    # store existed — and drops the case where a guild simply gave it to them.
+    earned_level = store.get_user(0, uid).get("level", 0)
     for guild in bot.guilds:
         member = guild.get_member(uid)
         if not member:
             continue
         for level in settings.LEVEL_ROLES:
+            if level > earned_level:
+                continue
             role_id = guild_config.get_role_id(guild.id, f"level_{level}")
             if role_id and any(r.id == role_id for r in member.roles):
                 achievements.add_unlocked(uid, level)
@@ -64,6 +81,16 @@ async def _set_notifications(bot: commands.Bot, uid: int, enable: bool) -> tuple
             continue
         role = guild_config.resolve_role(guild, "notifications")
         if role is None:
+            continue
+        # A mapping is not a licence. This role is handed out by a public button
+        # with no eligibility check, so it must confer nothing — and a mapping made
+        # before /admin setrole started refusing privileged roles (or a role given
+        # permissions after it was mapped) is only ever caught here. Skipped, not
+        # counted as available: the feature is misconfigured in this guild, and
+        # saying "enabled" for a role we refused to add would be a lie.
+        if refusal := perms.role_grants_authority(role):
+            log.warning("Refusing to self-assign the notification role in guild %s: %s",
+                        guild.id, refusal)
             continue
         available += 1
         has = role in member.roles
@@ -164,8 +191,16 @@ class LevelSelector(Select):
 
                 has_role = any(r.id == role_obj.id for r in member.roles)
 
+                # See _set_notifications: a level title is applied on the presser's
+                # say-so, so it may not carry authority. Adding is refused; REMOVING
+                # is not — taking a privileged role off someone never escalates, and
+                # it is how a guild recovers from a mapping made before this check.
                 if lvl in selected_levels:
                     if not has_role:
+                        if refusal := perms.role_grants_authority(role_obj):
+                            log.warning("Refusing to self-assign level role %s in "
+                                        "guild %s: %s", role_obj.id, guild.id, refusal)
+                            continue
                         roles_to_add.append(role_obj)
                 else:
                     if has_role:

@@ -4,6 +4,11 @@ aiohttp>=3.9.0
 firebase-admin>=6.4.0
 google-genai>=2.0.0
 fastapi>=0.115.0
+# Required by FastAPI for every multipart route — which is every craft, screenshot,
+# flag and log upload in the API. It was installed only as a transitive dependency
+# while DEPLOYMENT.md claimed it was pinned here; a resolver that stopped pulling it
+# in would have taken out the whole upload surface at the next deploy.
+python-multipart>=0.0.9
 uvicorn[standard]>=0.30.0
 pydantic>=2.0.0
 Pillow>=10.0.0

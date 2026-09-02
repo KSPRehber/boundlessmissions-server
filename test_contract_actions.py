@@ -95,6 +95,12 @@ class _Store:
     def debt_total(self, gid, uid):
         return sum(DEBT.get(str(uid), {}).values())
 
+    def has_user(self, uid):
+        # `_pay_issuer` skips an issuer whose record was deleted. Nothing in this
+        # suite deletes an account, so every id here is live — and keying on BAL
+        # would silently drop refunds to issuers a test never seeded.
+        return True
+
     async def add_debt(self, gid, uid, creditor_id, amount):
         d = DEBT.setdefault(str(uid), {})
         d[str(creditor_id or "")] = d.get(str(creditor_id or ""), 0) + amount
@@ -189,15 +195,20 @@ async def main():
     DEBT.clear()
     r = await ca.cancel(GID, "c1", actor_id=ISSUER, actor_name="Issuer")
     check("issuer can withdraw an active contract", r.ok and DB["c1"]["status"] == cdb.CANCELLED)
-    check("escrow refunded once", BAL.get(ISSUER) == 100, BAL)
     # Withdrawing after the contractor accepted is not free: the agreed fine goes
-    # to the contractor (here the issuer had nothing on hand, so it is a debt).
-    check("issuer owes the contractor the withdrawal fine",
-          DEBT.get(str(ISSUER), {}).get(str(CONTRACTOR)) == 40
-          and r.data.get("fine_owed") == 40, (DEBT, r.data))
+    # to the contractor. The issuer had nothing on hand, but the escrow comes back
+    # BEFORE the fine is collected, so it is paid out of the refund rather than
+    # becoming a debt the issuer holds the money for.
+    check("escrow refunded once, fine paid out of it",
+          BAL.get(ISSUER) == 60 and BAL.get(CONTRACTOR) == 40, BAL)
+    check("the withdrawal fine was collected, not owed",
+          not DEBT.get(str(ISSUER)) and r.data.get("fine_collected") == 40
+          and r.data.get("fine_owed") == 0, (DEBT, r.data))
+    check("the contractor's fine receipt is earnings", (str(CONTRACTOR), 40) in GARNISHABLE,
+          GARNISHABLE)
     r = await ca.cancel(GID, "c1", actor_id=ISSUER, actor_name="Issuer")
     check("cancelling twice is refused", not r.ok and r.code == ca.BAD_STATE)
-    check("no second refund", BAL.get(ISSUER) == 100, BAL)
+    check("no second refund", BAL.get(ISSUER) == 60, BAL)
 
     _mk(status=cdb.PENDING)
     BAL = {}
@@ -215,7 +226,7 @@ async def main():
     # fine, which left the contract ACTIVE with no exit — while submitting junk and
     # waiting out the dispute clock took the same partial amount three days later.
     _mk(status=cdb.ACTIVE)
-    BAL, DEBT = {CONTRACTOR: 10}, {}
+    BAL, DEBT, GARNISHABLE = {CONTRACTOR: 10}, {}, []
     r = await ca.give_up(GID, "c1", actor_id=CONTRACTOR, actor_name="Contractor")
     check("give up succeeds without the full fine", r.ok, r.code)
     check("contract closed anyway", DB["c1"]["status"] == cdb.CANCELLED)

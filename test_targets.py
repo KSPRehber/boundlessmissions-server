@@ -353,10 +353,15 @@ def main() -> int:
     reset()
     acc.ensure_firebase_account(FBUID)
     web = acc.firebase_account_id(FBUID)
-    acc.claim_username(web, "123456")
+    # Audit 3008b H5: an id-shaped name (all digits, or `a_`-prefixed) can no
+    # longer be claimed at all, and an id-shaped value typed into `username` is
+    # read as an id first — otherwise claiming a victim's snowflake as a name
+    # redirected every mod money/XP command aimed at them to the claimant.
+    ok, _why = acc.claim_username(web, "123456")
+    check("an all-digit username is refused at claim time", not ok)
     tgt, err = run(resolve_err(it, None, "123456"))
-    check("a numeric username beats the id reading of the same string",
-          tgt is not None and tgt.account_id == web)
+    check("an id-shaped string with no account behind it is refused, not read as a name",
+          tgt is None)
 
     print("\nboard_name — leaderboards survive a web-only player")
     reset()

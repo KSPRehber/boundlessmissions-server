@@ -32,7 +32,7 @@ def _account_for_firebase(uid):
     return acc.firebase_account_id(uid)
 
 
-def _ensure_firebase_account(uid, *, email="", display_name=""):
+def _ensure_firebase_account(uid, *, email="", display_name="", provider=""):
     aid = _account_for_firebase(uid)
     if aid is None:
         return None
@@ -77,6 +77,9 @@ def _set_display_name(aid, name):
 api_server.accounts.get_account = lambda aid: ACCOUNTS.get(str(aid))
 api_server.accounts.account_for_firebase = _account_for_firebase
 api_server.accounts.ensure_firebase_account = _ensure_firebase_account
+# Sign-in records which Firebase provider the account uses, so the account page
+# knows which credential to ask them to re-prove before enrolling 2FA.
+api_server.accounts.remember_provider = lambda account_id, provider: None
 api_server.accounts.claim_username = _claim_username
 api_server.accounts.set_display_name = _set_display_name
 api_server.accounts.ensure_discord_account = lambda *a, **k: None

@@ -137,10 +137,22 @@ def check_snapshot(snap: dict) -> list[Violation]:
     return out
 
 
+# How many extra vessels one submission may be judged on. `sent_vessels` is a
+# client-supplied list with no bound of its own, and every entry here becomes a
+# full telemetry pass — the same list that, unbounded, made api_server render and
+# upload an arbitrary number of PNGs on the shared event loop. The bound is
+# repeated rather than imported because api_server imports this module, so the
+# dependency only goes one way; the two numbers must stay equal, and 8 is what
+# api_server's MAX_SUBMISSION_IMAGES uses. Truncating rather than refusing keeps
+# it what it is — a check, not a gate — and the vessel a contract is actually
+# about is the first entry.
+MAX_SNAPSHOTS = 8
+
+
 def _snapshots(vessel_data: dict) -> list[dict]:
     """Every per-vessel snapshot in a submission payload: the active/contract vessel
-    plus any extras sent in a multi-vessel submission. Mirrors the shape api_server
-    already unpacks for orbit rendering."""
+    plus any extras sent in a multi-vessel submission (capped at MAX_SNAPSHOTS).
+    Mirrors the shape api_server already unpacks for orbit rendering."""
     snaps: list[dict] = []
     active = vessel_data.get("active_vessel") or vessel_data
     if isinstance(active, dict):
@@ -148,6 +160,8 @@ def _snapshots(vessel_data: dict) -> list[dict]:
     for sv in (vessel_data.get("sent_vessels") or []):
         if isinstance(sv, dict):
             snaps.append(sv)
+        if len(snaps) >= MAX_SNAPSHOTS:
+            break
     return snaps
 
 

@@ -35,11 +35,11 @@ async def main():
     check("contractor paid 40, issuer refunded 100, no debt",
           bal("200") == 40 and bal("100") == 100 and store.debt_total(GID, "100") == 0)
 
-    section("C. the debt is then only repaid from earnings the issuer can avoid")
-    wallet("100", balance=0); wallet("200", balance=0)
-    mk(status=cdb.ACTIVE, payment=100, fine=40)
-    await ca.cancel(GID, "c1", actor_id="100", actor_name="Issuer")
-    # Issuer spends the refund (a spend is never garnished) …
+    section("C. control: a debt is only repaid from earnings, never from refunds or spends")
+    # Seeded directly: with the refund-first fix, A's withdrawal leaves no debt to
+    # test against, but the property still matters for a fine larger than the escrow.
+    wallet("100", balance=100, debts=[{"creditor_id": "200", "amount": 40}]); wallet("200", balance=0)
+    # Issuer spends their balance (a spend is never garnished) …
     assert await store.try_debit(GID, "100", 100)
     # … and a refund of their own later escrow is not garnished either.
     await store.add_balance(GID, "100", 500, category=store.TX_CONTRACT_REFUND)

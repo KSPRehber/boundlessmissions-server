@@ -7,8 +7,11 @@ class FakeBlob:
     def __init__(self, bucket, name):
         self.bucket, self.name = bucket, name
 
-    def upload_from_string(self, data, content_type=None):
+    def upload_from_string(self, data, content_type=None, if_generation_match=None):
         with self.bucket.lock:
+            # GCS: if_generation_match=0 means "only if no object exists" (412 otherwise).
+            if if_generation_match == 0 and self.name in self.bucket.objects:
+                raise RuntimeError(f"412 Precondition Failed: {self.name} exists")
             self.bucket.objects[self.name] = {"data": bytes(data), "ct": content_type, "public": False}
 
     def make_public(self):

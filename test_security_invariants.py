@@ -105,12 +105,18 @@ check("server debug endpoint is gated (404 when DEBUG_ENDPOINTS_ENABLED off)",
 
 # ── (B) ALGORITHM SPEC (ported; attack-vector behaviour) ──────────────────────
 
-FLAG_EXTS = {"png", "dds", "jpg", "jpeg", "truecolor", "mbm", "tga"}
+# What a flag ARRIVING FROM A PEER may be written to disk as — FlagTransfer's
+# RECEIVED_FLAG_EXTS, deliberately narrower than its FLAG_EXTS (which still lists
+# dds/mbm/tga/truecolor and is used for probing local disk on export). Anything
+# written under GameData is decoded by KSP's loader on every later launch with no
+# dimension check anywhere, so a received flag may only be written in a format
+# ToolActions.ImageIsSafeToDecode can actually judge first.
+RECEIVED_FLAG_EXTS = {"png", "jpg", "jpeg"}
 
 
 def safe_flag_ext(ext):
     ext = (ext or "").strip().lstrip(".").lower()
-    return ext if ext in FLAG_EXTS else "png"
+    return ext if ext in RECEIVED_FLAG_EXTS else "png"
 
 
 def sanitize_craft_filename(name):
@@ -125,13 +131,19 @@ def sanitize_craft_filename(name):
     return name or "received_craft.craft"
 
 
-print("\n[B1] SafeFlagExt spec: dangerous extensions are refused")
+print("\n[B1] SafeFlagExt spec: only judgeable image formats are written")
 check("dll -> png", safe_flag_ext("dll") == "png")
 check("cfg -> png", safe_flag_ext("cfg") == "png")
 check(".DLL (dot/case) -> png", safe_flag_ext(".DLL") == "png")
 check("empty -> png", safe_flag_ext("") == "png")
 check("png stays png", safe_flag_ext("png") == "png")
-check("dds (real texture) stays dds", safe_flag_ext("dds") == "dds")
+check("jpg stays jpg", safe_flag_ext("jpg") == "jpg")
+# dds/mbm/tga are real texture formats and are still valid for a flag on local
+# disk — but ImageIsSafeToDecode cannot parse their headers, so a *received* one
+# is unjudgeable and is clamped to png rather than written. The craft's reference
+# to it is reset to Squad/Flags/default by the pass that runs after every install.
+check("dds (unjudgeable when received) -> png", safe_flag_ext("dds") == "png")
+check("mbm (unjudgeable when received) -> png", safe_flag_ext("mbm") == "png")
 
 print("\n[B2] SanitizeCraftFileName spec: traversal/rooting collapse to a basename")
 check("../../ traversal -> basename", sanitize_craft_filename("../../../../evil.craft") == "evil.craft")

@@ -34,6 +34,7 @@ H = {"Authorization": f"Bearer {TOKEN}"}
 
 
 def enroll():
+    twofa.purge(ACC)   # begin_enroll no longer clobbers an enabled record; reset first
     started = twofa.begin_enroll(ACC, "Victim")
     ok, msg, codes = twofa.confirm_enroll(ACC, twofa.totp_now(started["secret"]))
     assert ok, msg

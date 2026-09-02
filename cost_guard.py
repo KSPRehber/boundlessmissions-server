@@ -94,6 +94,24 @@ _PERSIST_INTERVAL = 15.0
 
 _GB = 1_073_741_824
 
+# Storage operation pricing. Class A is the write-shaped half — every upload, and
+# every ACL/metadata patch such as the `make_public()` that follows a public one —
+# billed per operation rather than per byte, which is why the upload surface was
+# invisible to a meter that priced only bytes (ingress is $0/GB on every tier we
+# price). Read through `settings` with a default rather than added to it: this
+# module must stay importable with nothing but `settings`, and a deployment that
+# wants to tune the figure can add the name there without touching code.
+def _setting(name: str, default: float) -> float:
+    return float(getattr(settings, name, default))
+
+
+def _class_a_price() -> float:
+    return _setting("STORAGE_CLASS_A_USD_PER_10K", 0.05)
+
+
+def _class_a_free_per_day() -> int:
+    return int(_setting("FREE_STORAGE_CLASS_A_PER_DAY", 20_000))
+
 # Google's free-tier daily quotas reset at midnight US/Pacific, not UTC. The
 # month rolls over in UTC (that is the billing period) but the daily allowance
 # does not, so the two calendars are deliberately kept apart. Defined here rather
@@ -136,6 +154,15 @@ def _pacific_day(ts: float | None = None) -> str:
     return when.astimezone(FREE_TIER_TZ).strftime("%Y-%m-%d")
 
 
+# Every per-day counter tier 0 keeps and tier 1 may correct. `class_a_ops` and
+# `ingress_bytes` are in the list even though Cloud Monitoring reports neither:
+# both are carried across the adoption in `ingest_usage` so the tail arithmetic
+# in `_effective_daily_locked` has a baseline to subtract from. `signed_urls` is
+# deliberately absent — it is a diagnostic count, never priced.
+_COUNTED_KEYS = ("reads", "writes", "deletes", "egress_bytes", "ingress_bytes",
+                 "class_a_ops")
+
+
 def _month_progress() -> float:
     """Fraction of the current UTC month elapsed, in (0, 1]. Used to prorate the
     at-rest storage charge, which is billed per GB-month."""
@@ -162,6 +189,14 @@ class _CostGuard:
         # moment we adopted them. Everything since is added from tier 0.
         self._auth_daily: dict[str, dict[str, int]] = {}
         self._auth_stored_bytes = 0
+        # Tier 0's own estimate of the bytes standing in the bucket: added on
+        # every upload, subtracted on a delete whose size we already know. It is
+        # a floor, never a total — this process cannot see what was in the bucket
+        # before it started, nor what anything else put there — which is exactly
+        # why the at-rest line takes max(tier 0, tier 1) rather than replacing
+        # one with the other. Without it, a deployment with no Monitoring grant
+        # (the documented degraded mode) prices the whole upload surface at zero.
+        self._stored_bytes = 0
         self._auth_at = 0.0
         self._auth_error: str | None = None
         self._baseline: dict[str, int] = {}
@@ -191,6 +226,11 @@ class _CostGuard:
                 data = json.load(fh)
         except (OSError, ValueError):
             return
+        # Bytes at rest are a standing level, not a monthly tally: the objects are
+        # still in the bucket on the 1st. So this one figure is adopted even from
+        # a state file written in a previous month, and `_rollover_locked` keeps
+        # it — everything else here is spend, and spend does reset.
+        self._stored_bytes = int(data.get("stored_bytes", 0) or 0)
         if data.get("month") != self._month:
             return  # stale month → start fresh
         self._gemini_usd = float(data.get("gemini_usd", 0.0))
@@ -238,6 +278,7 @@ class _CostGuard:
             "daily": self._daily,
             "auth_daily": self._auth_daily,
             "auth_stored_bytes": self._auth_stored_bytes,
+            "stored_bytes": self._stored_bytes,
             "auth_at": self._auth_at,
             "baseline": self._baseline,
             "billed": self._billed,
@@ -275,7 +316,7 @@ class _CostGuard:
             return self._daily
 
         merged = {day: dict(vals) for day, vals in self._auth_daily.items()}
-        for key in ("reads", "writes", "deletes", "egress_bytes", "ingress_bytes"):
+        for key in _COUNTED_KEYS:
             tail = self._sum(self._daily, key) - int(self._baseline.get(key, 0))
             if tail <= 0:
                 continue
@@ -300,6 +341,12 @@ class _CostGuard:
              settings.STORAGE_DOWNLOAD_USD_PER_GB, _GB),
             ("ingress_bytes", "Storage upload",   0,
              settings.STORAGE_UPLOAD_USD_PER_GB, _GB),
+            # Class A: the operation half of an upload. Ingress is $0/GB, so
+            # before this line the entire upload surface priced to exactly zero
+            # no matter how much was written — and a public upload is two of
+            # these (the upload, then the make_public that follows it).
+            ("class_a_ops",  "Storage ops (class A)", _class_a_free_per_day(),
+             _class_a_price(), 10_000),
         )
 
         lines: list[dict] = []
@@ -329,11 +376,19 @@ class _CostGuard:
         # a brake that under-counts is worse than one that reads slightly high.
         # It also includes soft-deleted objects, which GCS bills for the length
         # of the bucket's soft-delete retention (7 days here) after deletion.
+        # Whichever tier reports more, exactly as `ingest_usage` adopts the
+        # larger truth for the daily counters: tier 1 sees every bucket and
+        # everything that was there before this process started, tier 0 sees only
+        # what it uploaded — but it sees that instantly, and on a deployment
+        # without the `roles/monitoring.viewer` grant it is the only tier there
+        # is. Taking the max means the grant improves the figure and its absence
+        # no longer zeroes it.
+        stored = max(self._auth_stored_bytes, self._stored_bytes)
         stored_free = settings.FREE_STORAGE_STORED_GB * _GB
-        billable_stored = max(0, self._auth_stored_bytes - stored_free)
+        billable_stored = max(0, stored - stored_free)
         lines.append({
             "label": "Storage at rest (all buckets)",
-            "used": self._auth_stored_bytes,
+            "used": stored,
             "billable": billable_stored,
             "usd": billable_stored / _GB * settings.STORAGE_STORED_USD_PER_GB_MONTH * _month_progress(),
             "bytes": True,
@@ -365,7 +420,7 @@ class _CostGuard:
         self._gemini_usd = 0.0
         self._daily = {}
         self._auth_daily = {}
-        self._auth_stored_bytes = 0
+        self._auth_stored_bytes = 0     # tier 1 re-reports it on the next poll
         self._auth_at = 0.0
         self._baseline = {}
         self._billed = None
@@ -551,8 +606,23 @@ class _CostGuard:
                 self._bump_locked("deletes", deletes)
             self._persist_locked()
 
-    def note_storage(self, download: int = 0, upload: int = 0) -> None:
-        if not (download or upload):
+    def note_storage(self, download: int = 0, upload: int = 0, *,
+                     ops: int = 0, stored_delta: int = 0) -> None:
+        """Record one Storage operation.
+
+        `ops` is Class-A operations (uploads, ACL/metadata patches, listings) —
+        the half of an upload that is billed per operation rather than per byte,
+        and therefore the only half with a price at all, since ingress is free.
+
+        `stored_delta` moves tier 0's running estimate of the bytes standing in
+        the bucket: +len(data) on an upload, -size on a delete whose size we
+        already hold. It deliberately over-counts in two known ways — an upload
+        that overwrites an existing object adds twice, and a delete of an object
+        whose size we never read subtracts nothing — because for a brake the safe
+        rounding direction is up, and the correct figure arrives from Cloud
+        Monitoring on the next poll (see the at-rest line, which takes the max).
+        """
+        if not (download or upload or ops or stored_delta):
             return
         with self._lock:
             self._rollover_locked()
@@ -560,6 +630,10 @@ class _CostGuard:
                 self._bump_locked("egress_bytes", download)
             if upload:
                 self._bump_locked("ingress_bytes", upload)
+            if ops:
+                self._bump_locked("class_a_ops", ops)
+            if stored_delta:
+                self._stored_bytes = max(0, self._stored_bytes + int(stored_delta))
             self._persist_locked()
 
     def note_signed_url(self, size_bytes: int = 0) -> None:
@@ -592,7 +666,47 @@ class _CostGuard:
 
             self._auth_error = None
             self._auth_at = getattr(snap, "fetched_at", time.time())
-            self._auth_stored_bytes = int(getattr(snap, "stored_bytes", 0) or 0)
+            # Same rule for the authoritative figure itself: adopt it only from a
+            # poll that actually carried one, or a monthly rollover's 0 would be
+            # re-adopted as truth and reported as the real at-rest total.
+            if "stored_bytes" in getattr(snap, "present", ()):
+                self._auth_stored_bytes = int(getattr(snap, "stored_bytes", 0) or 0)
+            # Clamp tier 0's at-rest estimate down to the truth we just read.
+            #
+            # `_stored_bytes` is an *estimate* that in practice only rises: it gains on
+            # every upload (including one that overwrites an existing object) and loses
+            # only on a delete whose size was already known — and the frequent
+            # single-object delete goes through `delete_stored_file`, which builds the
+            # blob from a bare path, so `blob.size` is None and nothing is subtracted.
+            # Left alone it converges on "total bytes ever uploaded". Because the at-rest
+            # line takes `max(auth, estimate)`, once it passed the real figure it would
+            # govern the price permanently and a genuine bucket cleanup could never bring
+            # it back down — a brake fed by a number that only goes up.
+            #
+            # So the poll that establishes the truth also corrects the guess. The `max()`
+            # keeps doing its job between polls and on a deployment with no
+            # `roles/monitoring.viewer` grant, where tier 0 is the only tier there is;
+            # what it no longer does is outrun tier 1 forever.
+            #
+            # The clamp fires ONLY when Monitoring actually returned a storage
+            # reading. `ok` is not that evidence: `gcp_metrics` deliberately keeps a
+            # snapshot ok when one series is missing ("One missing metric must not
+            # sink the whole snapshot"), and `storage/total_bytes` is a daily-cadence
+            # gauge whose query window starts on the 1st — so a perfectly successful
+            # poll carries no storage point at all through the first hours of every
+            # UTC month, which is exactly when `_rollover_locked` has just reset
+            # `_auth_stored_bytes` to 0. Clamping on that wrote a zeroed at-rest
+            # estimate through `_persist_locked(force=True)`, on disk, permanently —
+            # re-introducing the very thing the `max()` above exists to prevent, in
+            # the one direction (under-reporting) that a brake must never fail in.
+            if "stored_bytes" not in getattr(snap, "present", ()):
+                log.debug("cost_guard: no storage reading in this poll — keeping the "
+                          "at-rest estimate at %d", self._stored_bytes)
+            elif self._stored_bytes > self._auth_stored_bytes:
+                log.debug("cost_guard: clamping the at-rest estimate %d -> %d "
+                          "(Cloud Monitoring is authoritative)",
+                          self._stored_bytes, self._auth_stored_bytes)
+                self._stored_bytes = self._auth_stored_bytes
             self._auth_daily = {
                 day: {
                     "reads": int(vals.get("reads", 0)),
@@ -605,16 +719,17 @@ class _CostGuard:
             # Uploads: Monitoring's received_bytes_count is not collected here
             # (ingress is free on every tier we price), so the local figure is
             # carried through rather than being zeroed by the adoption.
+            # Class-A operations are carried for the same reason: Monitoring's
+            # api/request_count is not collected here, so adopting the snapshot
+            # wholesale would erase every operation counted before the poll.
             for day, vals in self._daily.items():
-                if vals.get("ingress_bytes"):
-                    self._auth_daily.setdefault(day, {})["ingress_bytes"] = vals["ingress_bytes"]
+                for key in ("ingress_bytes", "class_a_ops"):
+                    if vals.get(key):
+                        self._auth_daily.setdefault(day, {})[key] = vals[key]
 
             # Freeze tier 0's totals: everything counted after this point is the
             # un-audited tail added on top of Google's figures.
-            self._baseline = {
-                key: self._sum(self._daily, key)
-                for key in ("reads", "writes", "deletes", "egress_bytes", "ingress_bytes")
-            }
+            self._baseline = {key: self._sum(self._daily, key) for key in _COUNTED_KEYS}
             self._refresh_level_locked()
             self._persist_locked(force=True)
 
@@ -681,10 +796,14 @@ class _CostGuard:
             # rather than alarming — it is the blind spot being measured.
             local_total = {k: self._sum(self._daily, k)
                            for k in ("reads", "writes", "deletes", "egress_bytes")}
+            # Class-A operations are tier 0's alone (Monitoring is not queried for
+            # them), so they are reported rather than drifted against.
+            class_a = self._sum(self._effective_daily_locked(), "class_a_ops")
             auth_total = {k: self._sum(self._auth_daily, k)
                           for k in ("reads", "writes", "deletes", "egress_bytes")}
 
-            stored_gb = self._auth_stored_bytes / _GB
+            stored = max(self._auth_stored_bytes, self._stored_bytes)
+            stored_gb = stored / _GB
             return {
                 "enabled": settings.COST_GUARD_ENABLED,
                 "month": self._month,
@@ -708,7 +827,13 @@ class _CostGuard:
                     "lines": lines,
                 },
                 "storage": {
-                    "stored_bytes": self._auth_stored_bytes,
+                    # The figure the ladder actually prices: whichever tier
+                    # reports more. The two are broken out beside it because
+                    # which one is larger is the diagnostic — a local estimate
+                    # above the reported one means Monitoring is stale or absent.
+                    "stored_bytes": stored,
+                    "stored_bytes_reported": self._auth_stored_bytes,
+                    "stored_bytes_estimated": self._stored_bytes,
                     "stored_gb": stored_gb,
                     "free_gb": settings.FREE_STORAGE_STORED_GB,
                     # The full-month charge this standing total implies, as
@@ -731,6 +856,7 @@ class _CostGuard:
                     # in the authoritative egress figure and in none of the local
                     # one, so this is the count that explains the egress drift.
                     "signed_urls": self._sum(self._daily, "signed_urls"),
+                    "class_a_ops": class_a,
                 },
                 # Tier 2: what Google billed. Reported beside our estimate, never
                 # folded into it — see ingest_billing.

@@ -38,8 +38,12 @@ async def main():
     section("A. /analyze: difficulty_rating is unbounded and untyped")
     ssrc = src("cogs/screenshots.py")
     direct = between(ssrc, "if direct:", "# ── Mode 2")
+    # The fix is one shared helper (clamp_rating) rather than an inline int()/min()
+    # at each site, so the static check accepts either shape.
+    clamp = between(ssrc, "def clamp_rating", "\ndef ") if "def clamp_rating" in ssrc else ""
     check("rating is coerced and clamped before _grant_rewards",
-          "int(" in direct and ("min(" in direct or "max(" in direct),
+          ("clamp_rating(" in direct and "int(" in clamp and "min(" in clamp)
+          or ("int(" in direct and ("min(" in direct or "max(" in direct)),
           "cogs/screenshots.py: `rating = data.get(\"difficulty_rating\", 0)` → _grant_rewards(gid, uid, rating)")
     shots.active_client = lambda: FakeClient({"approved": True, "difficulty_rating": 1_000_000,
                                               "description": "ok"})
@@ -47,8 +51,10 @@ async def main():
     before = wallet(uid)
     xp, coins = await shots._grant_rewards(0, uid, data.get("difficulty_rating", 0))
     after = wallet(uid)
+    # A clamped 10 still grants 10x the XP, which from a fresh wallet is a real
+    # level-up and its LEVEL_UP_REWARD — the honest ceiling includes that bonus.
     check("a rating of 1,000,000 does not pay 1,000,000x the per-point reward",
-          after[0] - before[0] <= 10 * settings.SCREENSHOT_COINS_PER_DIFFICULTY,
+          after[0] - before[0] <= 10 * settings.SCREENSHOT_COINS_PER_DIFFICULTY + settings.LEVEL_UP_REWARD,
           f"+{after[0]-before[0]:,} coins, +{after[1]-before[1]:,} XP from one /analyze whose JSON said 1e6 "
           f"(max legitimate: {10*settings.SCREENSHOT_COINS_PER_DIFFICULTY} coins)")
     u.update({"balance": 0, "xp": 0, "level": 0})
@@ -63,9 +69,9 @@ async def main():
           f"balance became {bal!r} ({type(bal).__name__})")
 
     section("B. achievement-photo: int() but no clamp")
-    ach = between(src("api_server.py"), "rating = int(result.get(\"difficulty_rating\", 0) or 0)", "reward_suffix")
+    ach = between(src("api_server.py"), "# Grant XP + KCoins from the difficulty rating", "reward_suffix")
     check("achievement-photo rating is clamped to the 1..10 scale",
-          "min(" in ach or "> 10" in ach or "<= 10" in ach,
+          ("clamp_rating(" in ach and "min(" in clamp) or "min(" in ach or "> 10" in ach or "<= 10" in ach,
           "api_server.py ~8745: `if rating > 0: _grant_rewards(gid, uid, rating)` — same unbounded multiply")
 
     section("C. controls")

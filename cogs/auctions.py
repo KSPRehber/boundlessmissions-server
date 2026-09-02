@@ -19,11 +19,13 @@ from discord.ui import View, Button, DynamicItem
 
 import settings
 from data.store import store
+from data import accounts
 from data import auctions as adb
 from data import contracts as cdb
 from data import guild_config
 from i18n import t, tp, S
-from cogs.contract_views import ContractWorkView, _embed
+from cogs.contract_views import ContractWorkView, _embed, _fit_field
+import contract_actions as ca
 
 log = logging.getLogger(__name__)
 
@@ -66,6 +68,11 @@ S.update({
     "auc.bid_toohigh":     {"en": "❌ Bid must be at most **{max}** {sym}; undercut the current lowest by ≥ {step}."},
     "auc.bid_low":         {"en": "❌ Bid must be a positive amount."},
     "auc.bid_ok":          {"en": "✅ Bid placed: **{amount}** {sym}. You're the lowest bidder!"},
+    "auc.bid_fine_cap":    {"en": "❌ Bids below **{floor}** {sym} would carry a fine over {mult}× "
+                                  "the payment (this auction's fine is {fine} {sym})."},
+    "auc.bid_gate":        {"en": "❌ {reason}"},
+    "auc.winner_refused":  {"en": "The winning bidder could not take the contract ({reason}); "
+                                  "escrow refunded to the issuer."},
     # Ending
     "auc.end_issuer_only": {"en": "❌ Only the issuer can end this auction."},
     "auc.ended":           {"en": "✅ Auction ended."},
@@ -110,18 +117,34 @@ def _auction_embed(a: dict, gid: int) -> discord.Embed:
         title, color = t(gid, "auc.title_cancelled"), discord.Color.red()
 
     e = discord.Embed(title=title, color=color)
-    e.add_field(name=t(gid, "auc.mission"), value=a["mission"], inline=False)
+    # The mission text and both display names are written by players, and an embed
+    # field renders full markdown — including masked links. This card is worse than
+    # the contract one it mirrors: `open_auction` posts it into EVERY guild the bot
+    # serves that has an auction channel, and `_edit_auction_message` re-renders all
+    # of those mirrors on every bid — and a bid escrows nothing, so the vector is
+    # free to re-trigger. A nickname of `[Verify account](https://evil.tld)` fits in
+    # 25 of the 32 characters a display name allows.
+    #
+    # Escaped at DISPLAY only: the same three strings are handed to
+    # `cdb.create_contract` when the auction closes, and the stored record must stay
+    # the text the player actually wrote. Fit-then-escape, for the reason
+    # `contract_views._embed` documents — escaping first spends the field budget on
+    # backslashes and lets truncation cut a `\*` pair in half.
+    _esc = discord.utils.escape_markdown
+    e.add_field(name=t(gid, "auc.mission"),
+                value=_esc(_fit_field(str(a["mission"] or ""))), inline=False)
     # Bidders price the job, so the kind of job has to be on the card — a flag design
     # is not bid the way a craft build is, and it is submitted somewhere else.
     work = _work_line(a, gid)
     if work:
         e.add_field(name=t(gid, "auc.work"), value=work, inline=False)
-    e.add_field(name=t(gid, "auc.issuer"), value=a["issuer_name"], inline=True)
+    e.add_field(name=t(gid, "auc.issuer"), value=_esc(str(a["issuer_name"] or "")), inline=True)
     e.add_field(name=t(gid, "auc.start"), value=f"**{a['start_value']}** {sym}", inline=True)
 
     if status == adb.OPEN:
         if a["bid_count"] > 0:
-            cur = f"**{a['current_bid']}** {sym} · {t(gid, 'auc.bidder', name=a['current_bidder_name'])}"
+            cur = (f"**{a['current_bid']}** {sym} · "
+                   + t(gid, 'auc.bidder', name=_esc(str(a['current_bidder_name'] or ''))))
         else:
             cur = t(gid, "auc.nobids")
         e.add_field(name=t(gid, "auc.current"), value=cur, inline=True)
@@ -129,8 +152,15 @@ def _auction_embed(a: dict, gid: int) -> discord.Embed:
         e.add_field(name=t(gid, "auc.ends"), value=f"<t:{_epoch(a['ends_at'])}:R>", inline=True)
     elif status == adb.CLOSED:
         e.add_field(name=t(gid, "auc.winner"),
-                    value=t(gid, "auc.won_for", name=a["current_bidder_name"],
+                    value=t(gid, "auc.won_for",
+                            name=_esc(str(a["current_bidder_name"] or "")),
                             price=a["current_bid"], sym=sym), inline=False)
+    elif a.get("closed_reason"):
+        # Ended with a lowest bidder who could not be bound (see close): saying
+        # "no bids were placed" over a card that showed bids reads as a bug.
+        e.add_field(name=t(gid, "auc.winner"),
+                    value=t(gid, "auc.winner_refused", reason=a["closed_reason"]),
+                    inline=False)
     else:
         e.add_field(name=t(gid, "auc.winner"), value=t(gid, "auc.no_winner"), inline=False)
 
@@ -234,12 +264,27 @@ async def open_auction(bot, gid: int, issuer_id: int, issuer_name: str, mission:
         adb.update_auction(gid, aid, mirrors=mirrors)
         a["mirrors"] = mirrors
     except Exception:
-        await store.add_balance(gid, issuer_id, start_value,  # refund escrow
-                                category=store.TX_AUCTION_REFUND,
-                                detail="Auction could not be posted")
+        # Through the same helper as every other escrow return, so there is exactly one
+        # place that decides what happens when an issuer no longer has a record. Here
+        # they certainly do (their escrow was debited moments ago in this same request)
+        # — the point is that a fifth refund path added later inherits the guard.
+        await _refund_issuer(gid, issuer_id, start_value,
+                             detail="Auction could not be posted")
         adb.update_auction(gid, a["auction_id"], status=adb.CANCELLED)
         raise
     return a
+
+
+def bid_refusal(gid: int, bidder_id) -> str | None:
+    """Why `bidder_id` may not bid at all, or None.
+
+    Winning binds the bidder to an ACTIVE contract exactly as `ca.accept` does, so
+    the gates `accept` applies — the debt cap and the active-contract cap — apply
+    to a bid. Checked here, on the event loop, rather than inside `try_place_bid`:
+    that runs in a thread, and `store` is only ever read on the loop. `close_auction`
+    re-checks, since both numbers can move between the bid and the close.
+    """
+    return ca.contractor_gate(gid, bidder_id)
 
 
 _close_locks: dict[str, asyncio.Lock] = {}
@@ -264,9 +309,41 @@ async def close_auction(bot, gid: int, auction_id: str, *, ended_by: str = "time
                 _close_locks.pop(auction_id, None)
 
 
+async def _refund_issuer(gid: int, issuer_id: str, amount: int, *, detail: str,
+                         counterparty: str = "") -> None:
+    """Return escrow to an auction's issuer, unless that account no longer exists.
+
+    `store.add_balance` calls `get_user`, which MINTS a default record for an unknown
+    id and marks it dirty — so refunding an issuer who ran delete-my-data recreates a
+    `users/{id}` document holding their balance, which the next auto-save writes back
+    to Firestore. The account asked to be erased and the erasure quietly undoes itself.
+    It also has a second-order cost: `_garnish_locked` forgives debts owed to accounts
+    with no record, so once the ghost exists a debtor is garnished forever into a wallet
+    nobody can spend.
+
+    `contract_actions._pay_issuer` already guards its refund this way; the three auction
+    refunds did not, and an auction outlives its issuer's deletion because
+    `/deletemydata` deliberately does not cancel auctions (they involve other players).
+    """
+    if amount <= 0:
+        return
+    if not store.has_user(str(issuer_id)):
+        log.info("Auction refund: issuer %s has no account record; %d not credited",
+                 issuer_id, amount)
+        return
+    await store.add_balance(gid, str(issuer_id), amount,
+                            category=store.TX_AUCTION_REFUND,
+                            detail=detail, counterparty=counterparty)
+
+
 async def _close_auction_locked(bot, gid: int, auction_id: str, *, ended_by: str) -> None:
-    a = adb.get_auction(gid, auction_id)
-    if not a or a["status"] != adb.OPEN:
+    # Claim the auction transactionally instead of reading it. This both freezes the
+    # winner and the winning bid against a bid landing during an early close, and takes
+    # the auction out of OPEN before any money moves so the 30-second sweeper cannot
+    # close it twice. See `adb.claim_close`. Everything below MUST use the frozen `a`
+    # and never re-read the document.
+    a = adb.claim_close(auction_id)
+    if not a:
         return
     # The winner's contract inherits the auction's ORIGIN guild (for channel routing
     # like the "sue" escalation), regardless of which server's mirror triggered close.
@@ -276,6 +353,55 @@ async def _close_auction_locked(bot, gid: int, auction_id: str, *, ended_by: str
 
     if winner_id:
         final = a["current_bid"]
+        # The bid was gated (`bid_refusal`), but the debt total and the active
+        # count both move between a bid and the close, and an auction opened
+        # before the gate existed was never checked at all. A winner who cannot
+        # be bound is not bound: the auction ends with the whole escrow back to
+        # the issuer, both parties told why, and no contract — a debtor over the
+        # cap must not become the contractor of an ACTIVE contract through the one
+        # path where nobody had to accept anything.
+        refusal = ca.contractor_gate(origin_gid, str(winner_id))
+        if refusal:
+            # Status first, money second: the claim left this CLOSED, so settle the
+            # real terminal status before the refund. A failure after this point is a
+            # cancelled auction whose escrow needs returning by hand — visible — rather
+            # than a refund the next sweeper tick pays again.
+            a["status"] = adb.CANCELLED
+            a["closed_reason"] = refusal
+            adb.update_auction(origin_gid, auction_id, status=adb.CANCELLED,
+                               closed_reason=refusal)
+            await _refund_issuer(origin_gid, a["issuer_id"], a["start_value"],
+                                 detail="Auction winner could not take the contract",
+                                 counterparty=str(winner_id))
+            log.info("Auction %s closed (%s) but winner %s was refused: %s; escrow refunded",
+                     auction_id, ended_by, winner_id, refusal)
+            for who, text in (
+                (str(winner_id),
+                 f"🔨 You had the lowest bid on \"{a['mission'][:80]}\" but could not take "
+                 f"the contract: {refusal}"),
+                (str(a["issuer_id"]),
+                 f"🔨 The lowest bidder on \"{a['mission'][:80]}\" could not take the "
+                 f"contract ({refusal}). Your {a['start_value']} {sym} escrow was refunded."),
+            ):
+                try:
+                    await ca.deliver_to_player(origin_gid, who, content=text)
+                except Exception as exc:
+                    log.warning("Could not notify %s about auction %s: %s", who, auction_id, exc)
+            await _edit_auction_message(bot, a, origin_gid, live=False)
+            return
+
+        # The fine was capped against the START value when the auction opened, but
+        # the payment is the winning bid. `try_place_bid` now refuses a bid that
+        # would breach MAX_FINE_MULTIPLE_OF_PAYMENT; this clamps the contract for a
+        # bid placed before that check existed, so the cap holds on every contract
+        # regardless of when its auction was opened.
+        fine = int(a.get("fine", 0) or 0)
+        mult = settings.MAX_FINE_MULTIPLE_OF_PAYMENT
+        if mult > 0 and fine > final * mult:
+            log.info("Auction %s: fine %d capped to %d (%d× the %d winning bid)",
+                     auction_id, fine, final * mult, mult, final)
+            fine = final * mult
+
         # Ids are account ids and travel as the strings they are stored as —
         # create_contract/add_balance str() them anyway, and an int() here on a
         # web-origin id raised before the status write, leaving the auction OPEN
@@ -283,27 +409,28 @@ async def _close_auction_locked(bot, gid: int, auction_id: str, *, ended_by: str
         c = cdb.create_contract(
             origin_gid, str(a["issuer_id"]), a["issuer_name"],
             str(winner_id), a["current_bidder_name"],
-            a["mission"], final, a["fine"], a["due_date"],
+            a["mission"], final, fine, a["due_date"],
             modlist=a.get("modlist"),
             mission_type=a.get("mission_type"),
         )
         cdb.update_contract(origin_gid, c["contract_id"], status=cdb.ACTIVE)
         c["status"] = cdb.ACTIVE
-        # Refund the part of the escrow above the winning bid.
+        # Record the result BEFORE refunding, for the reason above: the claim already
+        # wrote CLOSED, and this is what makes that status mean "settled" rather than
+        # "claimed". Then refund the part of the escrow above the winning bid.
+        a["status"] = adb.CLOSED
+        adb.update_auction(origin_gid, auction_id, status=adb.CLOSED,
+                           result_contract_id=c["contract_id"])
         refund = a["start_value"] - final
         if refund > 0:
-            await store.add_balance(origin_gid, str(a["issuer_id"]), refund,
-                                    category=store.TX_AUCTION_REFUND,
-                                    detail="Escrow above the winning bid",
-                                    counterparty=str(winner_id or ""))
-        a["status"] = adb.CLOSED
-        adb.update_auction(origin_gid, auction_id, status=adb.CLOSED, result_contract_id=c["contract_id"])
+            await _refund_issuer(origin_gid, a["issuer_id"], refund,
+                                 detail="Escrow above the winning bid",
+                                 counterparty=str(winner_id or ""))
         log.info("Auction %s closed (%s) → contract %s, winner %s for %d",
                  auction_id, ended_by, c["contract_id"], a["current_bidder_name"], final)
         # Hand the winner their active contract with the work view — corp channel
         # first, DM fallback (an auction winner may have no corp).
         try:
-            import contract_actions as ca
             e = _embed(c, origin_gid)
             e.description = t(origin_gid, "auc.won_dm", price=final, sym=sym)
             dm = await ca.deliver_to_player(
@@ -314,12 +441,11 @@ async def _close_auction_locked(bot, gid: int, auction_id: str, *, ended_by: str
         except Exception as exc:
             log.warning("Could not notify auction winner %s: %s", winner_id, exc)
     else:
-        # No bids — refund the full escrow and cancel.
-        await store.add_balance(origin_gid, str(a["issuer_id"]), a["start_value"],
-                                category=store.TX_AUCTION_REFUND,
-                                detail="Auction closed with no bids")
+        # No bids — cancel, then refund the full escrow (status first, money second).
         a["status"] = adb.CANCELLED
         adb.update_auction(origin_gid, auction_id, status=adb.CANCELLED)
+        await _refund_issuer(origin_gid, a["issuer_id"], a["start_value"],
+                             detail="Auction closed with no bids")
         log.info("Auction %s closed (%s) with no bids, escrow refunded", auction_id, ended_by)
 
     await _edit_auction_message(bot, a, origin_gid, live=False)
@@ -348,7 +474,15 @@ class BidModal(discord.ui.Modal):
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        gid, uid = self.gid, interaction.user.id
+        gid = self.gid
+        # The ACCOUNT id, not the raw snowflake. The auction document stores
+        # `issuer_id` as an account id, so the "you cannot bid on your own auction"
+        # and "you cannot be your own contractor" guards — here and inside
+        # `try_place_bid` — compared a snowflake to an `a_…` id and failed OPEN for
+        # any player who linked Discord onto an existing account. They could bid on
+        # their own auction and be bound to their own contract.
+        _acct = accounts.account_for_discord(interaction.user.id)
+        uid = _acct if _acct is not None else interaction.user.id
         sym = settings.CURRENCY_SYMBOL
 
         try:
@@ -358,6 +492,11 @@ class BidModal(discord.ui.Modal):
             return
         if amount <= 0:
             await interaction.followup.send(tp(gid, uid, "auc.bid_low"), ephemeral=True)
+            return
+
+        if refusal := bid_refusal(gid, uid):
+            await interaction.followup.send(tp(gid, uid, "auc.bid_gate", reason=refusal),
+                                            ephemeral=True)
             return
 
         # Validated and written inside one Firestore transaction (the same
@@ -375,6 +514,10 @@ class BidModal(discord.ui.Modal):
                 await interaction.followup.send(
                     tp(gid, uid, "auc.bid_toohigh", max=res["ceiling"], sym=sym,
                        step=res["step"]), ephemeral=True)
+            elif reason == "fine_cap":
+                await interaction.followup.send(
+                    tp(gid, uid, "auc.bid_fine_cap", floor=res["floor"], fine=res["fine"],
+                       mult=res["mult"], sym=sym), ephemeral=True)
             else:  # missing / closed / no_discord
                 await interaction.followup.send(tp(gid, uid, "auc.bid_closed"), ephemeral=True)
             return
@@ -397,7 +540,15 @@ class BidButton(DynamicItem[Button], template=r"auc_bid:" + _AID):
         return cls(match["aid"], int(match["gid"]))
 
     async def callback(self, interaction: discord.Interaction):
-        gid, uid = self.gid, interaction.user.id
+        gid = self.gid
+        # The ACCOUNT id, not the raw snowflake. The auction document stores
+        # `issuer_id` as an account id, so the "you cannot bid on your own auction"
+        # and "you cannot be your own contractor" guards — here and inside
+        # `try_place_bid` — compared a snowflake to an `a_…` id and failed OPEN for
+        # any player who linked Discord onto an existing account. They could bid on
+        # their own auction and be bound to their own contract.
+        _acct = accounts.account_for_discord(interaction.user.id)
+        uid = _acct if _acct is not None else interaction.user.id
         a = adb.get_auction(gid, self.aid)
         if not a or a["status"] != adb.OPEN or a["ends_at"] <= datetime.utcnow().isoformat():
             await interaction.response.send_message(tp(gid, uid, "auc.bid_closed"), ephemeral=True)
@@ -420,7 +571,15 @@ class EndAuctionButton(DynamicItem[Button], template=r"auc_end:" + _AID):
         return cls(match["aid"], int(match["gid"]))
 
     async def callback(self, interaction: discord.Interaction):
-        gid, uid = self.gid, interaction.user.id
+        gid = self.gid
+        # The ACCOUNT id, not the raw snowflake. The auction document stores
+        # `issuer_id` as an account id, so the "you cannot bid on your own auction"
+        # and "you cannot be your own contractor" guards — here and inside
+        # `try_place_bid` — compared a snowflake to an `a_…` id and failed OPEN for
+        # any player who linked Discord onto an existing account. They could bid on
+        # their own auction and be bound to their own contract.
+        _acct = accounts.account_for_discord(interaction.user.id)
+        uid = _acct if _acct is not None else interaction.user.id
         a = adb.get_auction(gid, self.aid)
         if not a or a["status"] != adb.OPEN:
             await interaction.response.send_message(tp(gid, uid, "auc.bid_closed"), ephemeral=True)

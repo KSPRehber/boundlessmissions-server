@@ -13,6 +13,7 @@ Firestore: guilds/{guild_id} → gk_channels: [channel_id_str, ...]
 """
 
 import logging
+import time as _time
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -134,6 +135,25 @@ def _persist(guild_id: int) -> None:
 #  Cog
 # ═══════════════════════════════════════════════════════════════════════════
 
+# Per-user allowance for the "wrong channel" DM. In-process and best-effort: it is
+# rationing an explanation, not enforcing a rule, so losing it on restart is fine.
+_WRONG_CHANNEL_DM: dict[int, list[float]] = {}
+_WRONG_CHANNEL_DM_PER_HOUR = 3
+
+
+def _allow_wrong_channel_dm(user_id: int) -> bool:
+    now = _time.time()
+    hits = [t for t in _WRONG_CHANNEL_DM.get(user_id, []) if now - t < 3600.0]
+    if len(_WRONG_CHANNEL_DM) > 5000:            # cheap unbounded-growth guard
+        _WRONG_CHANNEL_DM.clear()
+    if len(hits) >= _WRONG_CHANNEL_DM_PER_HOUR:
+        _WRONG_CHANNEL_DM[user_id] = hits
+        return False
+    hits.append(now)
+    _WRONG_CHANNEL_DM[user_id] = hits
+    return True
+
+
 class GKChannels(commands.Cog, name="GKChannels"):
     """Gene Kerman channel gating system."""
 
@@ -197,7 +217,17 @@ class GKChannels(commands.Cog, name="GKChannels"):
         except (discord.Forbidden, discord.NotFound):
             pass
 
-        # DM the user
+        # DM the user — but at most a few times an hour each.
+        #
+        # The delete and the DM are two HTTP calls on the bot's shared global bucket,
+        # the same one carrying contract delivery, ticket creation and auction
+        # mirroring. Unthrottled, a handful of members typing "@bot" in a loop in an
+        # ordinary channel is a cheap way to back that up, and nothing logged or
+        # alerted on it. The DELETE still always happens — that is the rule being
+        # enforced; only the explanation is rationed, since after the first one the
+        # person has been told.
+        if not _allow_wrong_channel_dm(message.author.id):
+            return
         channels_str = get_gk_channel_mentions(message.guild)
         try:
             await message.author.send(

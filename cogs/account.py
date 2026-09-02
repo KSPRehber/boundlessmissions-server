@@ -51,22 +51,22 @@ def _account_embed(acct: dict, account_id: str) -> discord.Embed:
         value=f"`{username}`" if username else "⚠️ *not chosen yet*",
         inline=True)
     embed.add_field(name="Display name",
-                    value=acct.get("display_name") or "—", inline=True)
+                    value=acct.get("display_name") or "*not set*", inline=True)
 
     signins = []
     if acct.get("discord_id") or accounts.is_discord_account(account_id):
         signins.append("Discord")
     if acct.get("firebase_uid"):
         signins.append("Google / email")
-    embed.add_field(name="Sign-in", value=", ".join(signins) or "—", inline=False)
+    embed.add_field(name="Sign-in", value=", ".join(signins) or "*none*", inline=False)
 
     if not username:
         embed.add_field(
             name="⚠️ Choose a username",
             value=("Your Discord name wasn't available as a Boundless username, so "
                    "you need to pick one before you can sell crafts, offer "
-                   "contracts or send ships. Open your account page on the website "
-                   "— it only takes a moment and you only do it once."),
+                   "contracts or send ships. Open your account page on the website; "
+                   "it only takes a moment and you only do it once."),
             inline=False)
 
     embed.set_footer(text=f"Account {account_id}")
@@ -82,7 +82,7 @@ def _account_embed(acct: dict, account_id: str) -> discord.Embed:
 # account that holds authority is joined by the owner from the console, on purpose.
 _AUTHORITY_REFUSAL = (
     "⛔ This Discord account holds the owner, admin or moderator role, so it can't "
-    "be joined to a website account from a code — that would move the role's "
+    "be joined to a website account from a code, which would move the role's "
     "authority onto whichever account minted the code. Ask the bot owner to link "
     "it deliberately."
 )
@@ -143,8 +143,9 @@ class LinkCodeModal(Modal, title="Link a website account"):
 
         if d_active and w_active:
             outcome = ("\n\n⚠️ **Both accounts have their own balance and history.** "
-                       "Joining them means deciding which coins and crafts survive, "
-                       "so a moderator has to do it — open a ticket instead.")
+                       "Joining them would mean deciding which coins and crafts "
+                       "survive, so they stay separate. Both keep working, so carry "
+                       "on with whichever one you want to keep.")
         elif d_active or not w_active:
             outcome = (f"\n\nYour Discord account is the one that stays"
                        + (f", so you keep the name **{my_name}**" if my_name else "")
@@ -160,7 +161,7 @@ class LinkCodeModal(Modal, title="Link a website account"):
                 f"**{who}**.{masked}{outcome}\n\n"
                 "**If you don't recognise it, press Cancel.** Someone who talks you "
                 "into entering their code would gain a Discord identity on their "
-                "own account — and your name next to it."),
+                "own account, and your name next to it."),
             color=discord.Color.orange(),
         )
         await interaction.followup.send(
@@ -202,7 +203,7 @@ class ConfirmLinkView(View):
 
         if code in (accounts.JOIN_OK, accounts.JOIN_SAME):
             await interaction.followup.send(
-                f"✅ {message} Sign in with Discord or with Google — same account "
+                f"✅ {message} Sign in with Discord or with Google, same account "
                 "either way.", ephemeral=True)
         else:
             await interaction.followup.send(f"⚠️ {message}", ephemeral=True)
@@ -265,7 +266,7 @@ class AccountView(View):
                 title="Log out of everything?",
                 description=(
                     "Every KSP install and browser signed in as you is logged out. "
-                    "**Nothing is deleted** — your balance, crafts and contracts "
+                    "**Nothing is deleted.** Your balance, crafts and contracts "
                     "are untouched, and you can link again straight away."),
                 color=discord.Color.orange()),
             view=LogoutConfirmView(self.account_id, self.owner_id),
@@ -300,7 +301,7 @@ class Account(commands.Cog, name="Account"):
             # terms in the mod — running a slash command is not that moment.
             await interaction.followup.send(
                 "You don't have a Boundless Missions account yet. Link your game "
-                "with `/b linkcode`, or sign up on the website — either one makes "
+                "with `/b linkcode`, or sign up on the website; either one makes "
                 "you an account.", ephemeral=True)
             return
 

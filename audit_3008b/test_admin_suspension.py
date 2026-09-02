@@ -46,10 +46,13 @@ class Boom:
     def get(self): raise RuntimeError("firestore unavailable")
     def set(self, *a, **k): return self._d.set(*a, **k)
 col.document = lambda k: Boom(real_document(k))
-lifted = S.lift(U, "owner")
+try:
+    lifted = S.lift(U, "owner")
+except Exception as exc:      # the fix: an unreadable record is reported, not read as "nothing running"
+    lifted = exc
 col.document = real_document
-check("lift with an unreadable record reports 'nothing running'", lifted is False,
-      "(informational — it says False rather than raising)")
+check("lift with an unreadable record never claims to have lifted", lifted is not True,
+      "(informational — False or a raised error are both honest answers)")
 still = S._active(col.docs[U], time.time()) is not None
 check("a lift that could not read the record does not cache 'not suspended'",
       not (still and S.get_active(U) is None),

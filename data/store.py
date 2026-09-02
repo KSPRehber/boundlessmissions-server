@@ -33,6 +33,16 @@ from config import cfg
 
 log = logging.getLogger(__name__)
 
+
+class WalletUnavailable(RuntimeError):
+    """Raised by a mutator when the wallet is not loaded, so nothing can be saved.
+
+    A distinct type from `FirebaseBudgetExceeded` because the cause differs: that
+    one means "Firestore is refused right now", this means "this process never got
+    the real records, so a write would be invented". Both answer 503.
+    """
+
+
 # Type alias
 UserData = dict[str, Any]
 
@@ -42,13 +52,29 @@ _bucket_name = os.getenv("FIREBASE_STORAGE_BUCKET", "")
 _app = firebase_admin.initialize_app(_cred, {
     "storageBucket": _bucket_name,
 } if _bucket_name else None)
-from cost_guard import guard
+from cost_guard import guard, FirebaseBudgetExceeded
 from data.firebase_guard import wrap_firestore, wrap_bucket
 
 # All Firestore / Storage access flows through these two handles (every cog
 # imports them from here), so wrapping them is enough to meter spend and enforce
 # the Firebase budget cap project-wide. See cost_guard.py / firebase_guard.py.
-_db = wrap_firestore(firestore.client())
+_db_unguarded = firestore.client()
+_db = wrap_firestore(_db_unguarded)
+
+# The one deliberate hole in the meter, and it is one document read.
+#
+# Every gated call on `_db` raises `FirebaseBudgetExceeded` at Level.FROZEN. The
+# session token-version lookup in `api_auth._get_token_version` is on the auth
+# dependency of EVERY authenticated route, and it fails closed on a read error
+# with a cold cache — so under a freeze it raised, became a 503, and took down
+# every authenticated route with it. Including `/api/v1/web/admin/*`, which is
+# the documented and only in-product way to lift the freeze: the recovery path
+# went through the process that the freeze had just disabled.
+#
+# Refusing this particular read buys nothing anyway — it is one keyed read whose
+# alternative is refusing the entire request — so it is exempted from the BRAKE
+# rather than from the METER: the caller reports it with
+# `cost_guard.guard.note_firestore(reads=1)`, so it still shows up on the bill.
 _storage_bucket = wrap_bucket(fb_storage.bucket() if _bucket_name else None)
 if _storage_bucket:
     log.info("Firebase Storage configured: %s", _bucket_name)
@@ -88,6 +114,67 @@ def safe_filename(name: str, default: str = "file") -> str:
     name = name.lstrip(".")                 # ".." -> "", ".craft" -> "craft"
     name = name[:128]
     return name or default
+
+
+# What a stored file is *called* — on a contract document, in a Discord embed, in
+# the in-game preview — is a separate question from where it is stored, and it
+# used to be answered with the raw UploadFile.filename. That string is the
+# client's, so it could be 1,100 characters (which breaks the embed that carries
+# the moderators' dispute buttons) or `click here](https://evil/) [x` (which
+# Discord renders as a masked link to somewhere else in a moderator ticket).
+DISPLAY_FILENAME_MAX = 80
+_MD_LINK_CHARS_RE = _re.compile(r"([\[\]()\\`])")
+
+
+def display_filename(name: str, default: str = "file",
+                     limit: int = DISPLAY_FILENAME_MAX) -> str:
+    """The name a client-supplied file is shown under: `safe_filename`'s
+    character set, capped at `limit` with the extension kept — several readers
+    pick craft files out of a submission by `.endswith(".craft")`, so a cut that
+    ate the suffix would hide the craft from the very code that delivers it."""
+    name = safe_filename(name, default)
+    if len(name) <= limit:
+        return name
+    stem, dot, ext = name.rpartition(".")
+    if dot and stem and len(ext) < 16:
+        return stem[:max(1, limit - len(ext) - 1)] + "." + ext
+    return name[:limit]
+
+
+def md_filename(name: str, default: str = "file") -> str:
+    """`display_filename` plus a backslash before every character that could
+    close a markdown link's text or open its target. New submissions never carry
+    those (the display name is sanitised when it is stored); this is for entries
+    written before it was, and for any renderer that pastes a name into
+    `[text](url)`, which is the one place a filename can become a link."""
+    return _MD_LINK_CHARS_RE.sub(r"\\\1", display_filename(name, default))
+
+
+# Magic bytes of the raster formats a rendered preview can legitimately be. This
+# is the *storage layer's* half of the "is this an image" question: the API layer
+# decodes the file with Pillow under a pixel ceiling (`_looks_like_image` /
+# `_open_image_bounded` in api_server), which is the stronger check and the one
+# that must stay the primary gate. This one exists because it is cheap, needs no
+# Pillow, and sits at the last point before bytes are made world-readable — so a
+# public-upload helper cannot be handed 25 MB of arbitrary data by a caller that
+# forgot the decode check, which is exactly how the quicksend blueprint path came
+# to publish attacker-chosen bytes on the project's own bucket.
+_IMAGE_MAGIC = (
+    b"\x89PNG\r\n\x1a\n",   # PNG
+    b"\xff\xd8\xff",          # JPEG
+    b"GIF87a", b"GIF89a",       # GIF
+    b"BM",                      # BMP
+)
+
+
+def looks_like_image(data: bytes | None) -> bool:
+    """Whether these bytes begin like a raster image. Header sniff only — never a
+    substitute for decoding one that will be shown to somebody."""
+    if not data or len(data) < 12:
+        return False
+    if data.startswith(_IMAGE_MAGIC):
+        return True
+    return data[:4] == b"RIFF" and data[8:12] == b"WEBP"
 
 
 def safe_content_type(claimed: str) -> str:
@@ -312,8 +399,22 @@ def xp_for_level(level: int) -> int:
 
 
 def level_from_xp(xp: int) -> int:
-    """Derive the current level from total XP."""
-    level = 0
+    """Derive the current level from total XP.
+
+    Closed-form: the level is the inverse of `xp_for_level`, `(xp / BASE) **
+    (1 / EXPONENT)`, then nudged by at most a step or two to agree with the
+    integer truncation `xp_for_level` applies. It used to count levels one at a
+    time, which is fine at level 40 and is ~2e9 iterations at the 2**53 a
+    Discord integer option can carry — run under `store._lock` on the event
+    loop by `set_xp`, so one `/setxp` could stop every command and API request
+    until it finished. The nudge loops are bounded by float error, not by the
+    input, and a negative or zero XP is level 0 either way.
+    """
+    if xp <= 0:
+        return 0
+    level = int((xp / settings.LEVEL_XP_BASE) ** (1.0 / settings.LEVEL_XP_EXPONENT))
+    while level > 0 and xp < xp_for_level(level):
+        level -= 1
     while xp >= xp_for_level(level + 1):
         level += 1
     return level
@@ -353,12 +454,127 @@ class UserStore:
         self._users: dict[str, UserData] = {}
         self._lock = asyncio.Lock()
         self._dirty_users: set[str] = set()  # user_id strings
+        # Set by `load()` when the boot read of the whole collection failed. It
+        # starts False because nothing has failed yet — it records a *failed*
+        # load, not the absence of one, which is why the standalone test suites
+        # (which never load, having no Firestore) are unaffected by it. While it
+        # is True this store will neither persist nor mint: see load().
+        self._load_failed = False
+        # Set once `load()` has completed a full, successful read. Distinct from
+        # `not _load_failed`, which is also true before any load has been *tried* —
+        # and an untried load is the same dangerous state as a failed one for a
+        # live bot: an empty `_users` whose writes are not blocked, so the first
+        # member scan mints zeroed records and the next flush replaces every real
+        # document with them. `bot.py` refuses to start unless this is True.
+        self._loaded = False
+        # Set when the boot read was refused by our own cost brake rather than by
+        # Firestore. A different fact from a failed read, needing a different answer.
+        self._budget_blocked = False
+        # Set the moment `load()` is entered, and never cleared.
+        #
+        # This separates "a load ran and did not finish" from "no load has been
+        # attempted", which `_loaded` alone cannot. Only the first is dangerous to
+        # a *writer*: the process is live, the caller believes their payout landed,
+        # and `save()` will refuse to flush it. The second is the offline case —
+        # the standalone `test_*.py` suites drive the real singleton entirely in
+        # memory and never flush — plus the window before `cogs.xp.cog_load`, and
+        # in production it cannot outlive startup because `bot.py` refuses to run
+        # an unloaded store.
+        #
+        # `save()` deliberately does NOT use this: it gates on `_loaded`, because a
+        # full-document write from memory is unsafe in BOTH states.
+        self._load_attempted = False
+
+    def _require_writable(self) -> None:
+        """Refuse a mutation while the wallet is not loaded.
+
+        The budget-freeze path (`load()` catching `FirebaseBudgetExceeded`) leaves
+        the process running with `_loaded` False so that a frozen guard is not a
+        crash loop. That is right, but it created a worse failure than the one it
+        replaced: `save()` refuses forever on `not _loaded`, while every mutator
+        happily edited the in-memory record and marked it dirty — so the wallet
+        ACCEPTED writes and dropped them.
+
+        While the freeze holds that is at least loud, because most Firestore-backed
+        commands raise anyway. The dangerous window is after it clears: the month
+        rolls over (or the owner raises the budget), Firestore starts working, the
+        bot looks entirely healthy — and every payout, fine, transfer and XP gain
+        still lands in memory and is discarded at the next flush, while contracts
+        settle COMPLETED in Firestore with the money never arriving.
+
+        So a write in this state raises instead. `ensure_loaded()` closes the window
+        by re-reading once the guard drops, and this is the backstop for the moment
+        before it does: refusing a payout is recoverable, silently losing it is not.
+        """
+        if self._load_attempted and not self._loaded:
+            raise WalletUnavailable(
+                "The wallet is not loaded, so this change cannot be saved. "
+                + ("The Firebase cost guard is FROZEN — raise the budget or clear "
+                   "the freeze, and the wallet reloads by itself."
+                   if self._budget_blocked else
+                   "The boot read did not complete.")
+            )
+
+    async def ensure_loaded(self) -> bool:
+        """Re-attempt the boot read if a budget freeze is the only thing blocking it.
+
+        Called from the auto-save loop, which is the heartbeat that already exists.
+        Without this the read-only state is permanent until someone restarts the
+        process — including long after the freeze that caused it has gone, since
+        `load()` is awaited from exactly one place (`cogs.xp.cog_load`) and the level
+        resets itself on the UTC month rollover with nobody in the loop.
+
+        Deliberately narrow: it retries ONLY the budget-blocked state, never a failed
+        Firestore read. A failed read stops the bot at startup by design, and quietly
+        retrying it in the background would work around that gate rather than through
+        it. Returns True when a reload happened and succeeded.
+        """
+        if self._loaded or not self._budget_blocked:
+            return False
+        try:
+            from cost_guard import Level, guard as _guard
+            if _guard.level is Level.FROZEN:
+                return False          # still frozen; nothing to retry yet
+        except Exception:             # pragma: no cover - guard import/attr issues
+            return False
+        log.info("Cost guard is no longer FROZEN — re-reading the wallet.")
+        await self.load()
+        if self._loaded:
+            log.info("Wallet reloaded after the budget freeze cleared; writes are live again.")
+        return self._loaded
+
+    @property
+    def budget_blocked(self) -> bool:
+        """True when the wallet is unloaded because `cost_guard` is FROZEN.
+
+        Kept apart from a read *failure* because the recovery differs. A frozen
+        guard is cleared through the admin console — an API route in this same
+        process — so exiting on it removes the only way back, and since the level
+        is persisted to `data/cost_state.json` and the month has not rolled, it
+        would do so on every restart: a crash loop under `Restart=always`, armed by
+        anyone able to drive the Firebase bill up. Running read-only is safe here in
+        a way it is not after a failed read, because under FROZEN every Firestore
+        and Storage call is already refused — there is nothing to overwrite.
+        """
+        return self._budget_blocked
+
+    @property
+    def loaded(self) -> bool:
+        """True once the boot read of the wallet collection has succeeded.
+
+        The bot's startup gate reads this. It is deliberately a positive assertion
+        ("we hold the real records") rather than the absence of a failure, because
+        the two states that must both stop the bot — the read failed, and the read
+        never ran — differ only in whether anything raised.
+        """
+        return self._loaded
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def load(self) -> None:
         """Load the GLOBAL user wallet from Firestore into memory, running a
         one-time migration from the legacy per-guild layout on first start."""
+        self._load_attempted = True
         total = 0
         try:
             for user_doc in _db.collection("users").stream():
@@ -366,10 +582,49 @@ class UserStore:
                 merged.update(user_doc.to_dict() or {})
                 self._users[user_doc.id] = merged
                 total += 1
+            self._load_failed = False
+            self._budget_blocked = False
+            self._loaded = True
             log.info("Loaded %d global user records from Firestore", total)
+        except FirebaseBudgetExceeded as exc:
+            # Our own brake, not Firestore. Writes stay blocked (`_loaded` is False),
+            # but this must not kill the process — see the `budget_blocked` docstring.
+            self._budget_blocked = True
+            self._loaded = False
+            log.critical(
+                "The wallet could not be loaded because the Firebase cost guard is "
+                "FROZEN (%s). Running read-only: balances read as zero and nothing "
+                "is written. Raise the budget or clear the freeze from the admin "
+                "console, then restart.", exc)
+            return
         except Exception as exc:
-            log.error("Failed to load from Firestore: %s, starting fresh", exc)
-            self._users = {}
+            # A failed load must never become an empty store. `save` writes every
+            # record with `batch.set` — a whole-document REPLACE — and the member
+            # scan in cogs/xp mints a zeroed `_default_user()` for anyone it
+            # cannot find, so "starting fresh" plus one auto-save cycle was every
+            # balance, XP total, unlocked level, rescue count, debt ledger and
+            # transaction history in the game overwritten with zeros, from one
+            # transient 503 that nobody caused.
+            #
+            # Two locks, because the two failure modes differ. The flag is the one
+            # that cannot be bypassed: whatever a caller does with this exception,
+            # the store now refuses to persist and refuses to mint, so the worst
+            # case is a read-only bot rather than a wipe. Re-raising is what makes
+            # it *loud* — `cogs/xp.cog_load` awaits this, so the bot declines to
+            # start. A bot that will not start is recoverable in the time it takes
+            # to restart it; a zeroed `users` collection is not.
+            #
+            # Whatever did stream is deliberately kept rather than discarded: with
+            # writes blocked it can do no harm, and it is the only evidence of how
+            # far the read got.
+            self._load_failed = True
+            self._loaded = False
+            log.critical(
+                "Failed to load the global wallet from Firestore after %d record(s): "
+                "%s. Refusing to continue: writes and record creation are blocked so "
+                "this process cannot overwrite the real records with an empty one.",
+                total, exc)
+            raise
 
         # One-time merge of legacy guilds/{gid}/users/{uid} wallets into the global
         # store. Guarded by a flag doc so it runs exactly once.
@@ -442,6 +697,25 @@ class UserStore:
 
     async def save(self) -> None:
         """Flush all dirty user records to Firestore."""
+        if not self._loaded:
+            # Every write below is a whole-document `batch.set`. Unless the boot read
+            # completed we do not know what those documents hold, so the only safe
+            # number of writes is zero — see load(). The dirty set is left intact:
+            # the records stay inspectable and nothing silently claims to have saved.
+            #
+            # The test is `not _loaded`, NOT `_load_failed`. They differ in exactly
+            # the state that matters: a load that never *ran* (an import error in
+            # `cogs.xp`, say, before `store.load()` is awaited) leaves `_load_failed`
+            # False and `_users` empty — and `bot.close()` calls `save_if_dirty()` on
+            # the way out, so the startup gate's own shutdown would have flushed
+            # zeroed records over real ones. A failed load and an absent one are the
+            # same fact here: memory is not a safe source of truth.
+            log.critical("Refusing to flush %d user record(s): the wallet was never "
+                         "loaded%s, so memory is not a safe source of truth for a "
+                         "full-document write.",
+                         len(self._dirty_users),
+                         " (the boot read failed)" if self._load_failed else "")
+            return
         async with self._lock:
             if not self._dirty_users:
                 return
@@ -479,10 +753,39 @@ class UserStore:
                     batch.commit()
             log.info("Saved %d global user records to Firestore", len(dirty))
         except Exception as exc:
-            log.error("Failed to save to Firestore: %s", exc, exc_info=True)
-            # Re-add to dirty so we retry next cycle
-            async with self._lock:
-                self._dirty_users.update(dirty)
+            log.error("Failed to save to Firestore in one batch: %s", exc, exc_info=True)
+            # One record can sink the whole batch — a value Firestore's encoder
+            # refuses (an int past int64) raises before anything is sent, and a
+            # batch is all-or-nothing anyway. Re-queueing all of `dirty` and
+            # retrying the same batch next cycle meant that from the moment one
+            # bad record existed, no user's XP or balance was persisted again
+            # until a restart dropped everything unsaved. So retry one document
+            # at a time: the good ones land now, and only the bad one stays
+            # dirty — named in the log, since a record that never saves is a
+            # bug report rather than a symptom to be inferred from silence.
+            failed = await asyncio.to_thread(self._save_each, dirty)
+            if failed:
+                async with self._lock:
+                    self._dirty_users.update(failed)
+
+    def _save_each(self, user_ids: list[str]) -> list[str]:
+        """Write each record on its own; return the ids that still failed."""
+        if not self._loaded:
+            return list(user_ids)   # same refusal as save(); nothing may be written
+        failed: list[str] = []
+        for user_id in user_ids:
+            user_data = self._users.get(user_id)
+            if user_data is None:
+                continue
+            try:
+                with guard.final_flush():
+                    _db.collection("users").document(user_id).set(user_data)
+            except Exception as exc:
+                log.error("User record %s cannot be saved (kept dirty): %s", user_id, exc)
+                failed.append(user_id)
+        if len(failed) < len(user_ids):
+            log.info("Saved %d of %d user records individually", len(user_ids) - len(failed), len(user_ids))
+        return failed
 
     async def save_if_dirty(self) -> None:
         """Save only if data has changed since last save."""
@@ -501,8 +804,21 @@ class UserStore:
         (guild_id is accepted for call-site compatibility but not used as a key.)"""
         key = str(user_id)
         if key not in self._users:
+            if self._load_failed:
+                # Do not mint. A zeroed default is indistinguishable from a real
+                # new player, and marking it dirty is exactly how it would reach
+                # Firestore over the top of somebody's real record. Hand back a
+                # detached default instead: reads degrade to zeros, mutations go
+                # nowhere, and nothing is remembered or written.
+                return _default_user()
             self._users[key] = _default_user()
-            self._mark_dirty(guild_id, user_id)
+            # Only queue it if the wallet is actually loaded. `load()` merges into
+            # `_users` rather than replacing it, so a record minted before a load
+            # would survive one (`/reload cogs.xp` re-runs it on a live bot) and be
+            # flushed over the real document afterwards. Minting into memory is
+            # harmless — reads degrade to zeros — but remembering it is not.
+            if self._loaded:
+                self._mark_dirty(guild_id, user_id)
         return self._users[key]
 
     def has_user(self, user_id) -> bool:
@@ -525,6 +841,16 @@ class UserStore:
         async with self._lock:
             existed = self._users.pop(ukey, None) is not None
             self._dirty_users.discard(ukey)  # don't let a pending write resurrect it
+            # What others owed this account goes with it. Left in place, the next
+            # garnish aimed at the deleted id would either re-mint its record (the
+            # bug) or skim a debtor for a creditor who can no longer be paid.
+            for other_id, other in self._users.items():
+                debts = other.get("debts") or []
+                kept = [d for d in debts if str(d.get("creditor_id") or "") != ukey]
+                if len(kept) != len(debts):
+                    other["debts"] = kept
+                    self._mark_dirty(guild_id, other_id)
+                    log.info("Forgave %s's debt to deleted account %s", other_id, ukey)
         try:
             _db.collection("users").document(ukey).delete()
         except Exception as exc:
@@ -680,10 +1006,11 @@ class UserStore:
             user = self.get_user(guild_id, user_id)
             return user["xp"], user["level"], False
 
+        self._require_writable()
         async with self._lock:
             user = self.get_user(guild_id, user_id)
             old_level = user["level"]
-            user["xp"] += amount
+            user["xp"] = min(user["xp"] + amount, settings.MAX_XP)
             new_level = level_from_xp(user["xp"])
             user["level"] = new_level
             self._mark_dirty(guild_id, user_id)
@@ -691,10 +1018,12 @@ class UserStore:
             return user["xp"], new_level, new_level > old_level
 
     async def set_xp(self, guild_id: int, user_id: int, amount: int) -> None:
-        """Directly set a user's XP (admin use)."""
+        """Directly set a user's XP (admin use). Clamped into
+        `[0, settings.MAX_XP]` — see the note on MAX_XP for why the ceiling
+        exists; the caller reports the stored value, so a clamp is visible."""
         async with self._lock:
             user = self.get_user(guild_id, user_id)
-            user["xp"] = max(0, amount)
+            user["xp"] = max(0, min(int(amount), settings.MAX_XP))
             user["level"] = level_from_xp(user["xp"])
             self._mark_dirty(guild_id, user_id)
 
@@ -915,6 +1244,20 @@ class UserStore:
         the caller can tell the player what happened.
         """
         debts = user.get("debts") or []
+        # A creditor with no record ran the delete-my-data flow. Paying them through
+        # `get_user` MINTED a `users/{id}` document for the leaver — holding a balance,
+        # marked dirty, flushed by the next auto-save — every time a debtor earned.
+        # Their claim leaves with them (`delete_user` forgives it at the moment of
+        # deletion; this catches a record that vanished by any other route), for
+        # the same reason a bot's fine pays nobody: there is no wallet on the other
+        # side. Bot debts (empty creditor) are kept — collected and paid to no one.
+        gone = [d for d in debts if d.get("creditor_id")
+                and not self.has_user(str(d["creditor_id"]))]
+        if gone:
+            debts = user["debts"] = [d for d in debts if d not in gone]
+            self._mark_dirty(guild_id, user_id)
+            log.info("Forgave %s's debts to deleted accounts: %s", user_id,
+                     [(str(d.get("creditor_id")), int(d.get("amount", 0))) for d in gone])
         total = self._debt_total(user)
         if gross <= 0 or total <= 0:
             return []
@@ -1066,6 +1409,7 @@ class UserStore:
         that their reward silently halved. An invisible skim reads as the economy being
         broken and arrives as a bug report instead of an appeal.
         """
+        self._require_writable()
         async with self._lock:
             user = self.get_user(guild_id, user_id)
             # The ledger records what actually moved, and `max(0, …)` means a
@@ -1094,7 +1438,34 @@ class UserStore:
         the remaining wait is returned so the caller can say when it reopens. The
         cooldown check and the credit happen under one lock, so two uploads landing
         together can't both collect — the mirror of `try_debit`'s double-spend guard.
+
+        Use `try_claim_timed_reward_gross` when the caller prints the amount: a
+        garnishable reward can be skimmed on the way in, and a caller that reports
+        `amount` is telling a debtor "+300" while they receive 75.
         """
+        granted, wait, _paid = await self.try_claim_timed_reward_gross(
+            guild_id, user_id, key, amount, cooldown_seconds,
+            garnishable=garnishable, category=category, detail=detail)
+        return granted, wait
+
+    async def try_claim_timed_reward_gross(
+        self, guild_id: int, user_id: int, key: str,
+        amount: int, cooldown_seconds: float, *, garnishable: bool = False,
+        category: str = TX_REWARD, detail: str = "",
+    ) -> tuple[bool, float, list[tuple[str, int]]]:
+        """`try_claim_timed_reward`, additionally returning what garnishment took.
+
+        The third element is the (creditor_id, amount) pairs paid out of this
+        credit — the same shape `add_balance_gross` returns and the same one `/pay`
+        and `/finance/send` already use to say how much was skimmed. The player
+        actually received `amount - sum(a for _c, a in paid)`.
+
+        The split exists for the reason the whole debt design does: a reward that
+        silently halves arrives as a bug report rather than as an appeal. This is
+        the implementation; the two-value form above is a wrapper for the callers
+        that never print a figure.
+        """
+        self._require_writable()
         async with self._lock:
             user = self.get_user(guild_id, user_id)
             # Records written before this field existed are merged over the defaults
@@ -1103,7 +1474,7 @@ class UserStore:
             now = time.time()
             elapsed = now - float(stamps.get(key, 0.0) or 0.0)
             if elapsed < cooldown_seconds:
-                return False, cooldown_seconds - elapsed
+                return False, cooldown_seconds - elapsed, []
 
             stamps[key] = now
             before = user["balance"]
@@ -1111,9 +1482,13 @@ class UserStore:
             self._mark_dirty(guild_id, user_id)
             self._record_locked(user, user["balance"] - before, category,
                                 detail or key)
+            paid: list[tuple[str, int]] = []
             if garnishable and amount > 0:
-                self._garnish_locked(guild_id, user, user_id, amount)
-            return True, cooldown_seconds
+                # Records its own debtor-side and creditor-side ledger entries,
+                # exactly as in add_balance_gross — the skim is a second movement
+                # of this wallet, not a smaller version of the credit above.
+                paid = self._garnish_locked(guild_id, user, user_id, amount)
+            return True, cooldown_seconds, paid
 
     async def try_debit(self, guild_id: int, user_id: int, amount: int, *,
                         category: str = TX_OTHER, detail: str = "",
@@ -1127,6 +1502,7 @@ class UserStore:
         no-op success. Never drives the balance below zero."""
         if amount <= 0:
             return True
+        self._require_writable()
         async with self._lock:
             user = self.get_user(guild_id, user_id)
             if user["balance"] < amount:
@@ -1146,6 +1522,7 @@ class UserStore:
         amount returned is exactly what left the account."""
         if amount <= 0:
             return 0
+        self._require_writable()
         async with self._lock:
             user = self.get_user(guild_id, user_id)
             taken = min(amount, user["balance"])

@@ -230,12 +230,25 @@ class _MetricsClient:
                         log.debug("gcp_metrics: %s unavailable (%s)", key, msg)
                         continue
 
-                    snap.present.add(key)
                     if kind == "gauge":
                         # A level: only the newest reading means anything.
+                        #
+                        # `present` is added to only when a datapoint actually
+                        # arrived, NOT merely because the query succeeded. The whole
+                        # point of this set is that "the caller has to know which
+                        # numbers are real", and for a gauge a successful query with
+                        # zero points is not a reading of zero — it is no reading.
+                        # `storage/total_bytes` is a daily-cadence gauge and the
+                        # query window starts at the 1st, so "no points yet" is the
+                        # EXPECTED state for the first hours of every UTC month.
+                        # Marking it present there let `cost_guard`'s at-rest clamp
+                        # read it as a true zero and wipe the estimate.
                         if points:
                             snap.stored_bytes = int(max(points, key=lambda p: p[0])[1])
+                            snap.present.add(key)
                         continue
+
+                    snap.present.add(key)
 
                     total = 0
                     for when, value in points:

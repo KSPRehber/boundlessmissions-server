@@ -295,7 +295,7 @@ def fingerprint(data: bytes) -> dict:
     if len(data) > _MAX_FINGERPRINT_BYTES:
         # Too large to scan safely — hash the bytes and stop. Do NOT parse:
         # that is exactly the work an oversized payload is trying to make us do.
-        log.warning("craft fingerprint: payload too large to scan (%d bytes) — exact hash only", len(data))
+        log.warning("craft fingerprint: payload too large to scan (%d bytes), exact hash only", len(data))
         return {
             EXACT: hashlib.sha256(data).hexdigest(),
             DESIGN: None,
@@ -321,7 +321,7 @@ def fingerprint(data: bytes) -> dict:
     if not parts and _mentions_part_node(text):
         fp["suspect"] = True
         log.warning("craft fingerprint: payload has PART nodes but none could be read "
-                    "(%d bytes) — unusual formatting", len(data))
+                    "(%d bytes), unusual formatting", len(data))
     if parts:
         fp[DESIGN] = _sha("\n".join(sorted(
             f"{n}|{p[0]:.2f},{p[1]:.2f},{p[2]:.2f}" for n, p in parts)))

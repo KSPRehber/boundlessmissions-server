@@ -277,6 +277,16 @@ def _as_str_list(val) -> list[str]:
     return out
 
 
+# How many entries any one free-text constraint list may carry. Two of these
+# lists keep unknown tokens (`keep_unknown=True`), and all four are filled from
+# whatever the model emitted for a mission text the issuer wrote — bounded until
+# now only by `max_output_tokens`. They are shipped to the contractor's client as
+# `EditorPartEnforcer` restrictions and re-checked on every submit, so an
+# unbounded list is a cost the *other* player pays. Fifty is far past any real
+# mission: the largest authored template uses a handful.
+MAX_LIST_ITEMS = 50
+
+
 def normalize(raw: dict | None) -> dict:
     """
     Coerce a possibly-AI-produced dict into the canonical schema: every list key
@@ -287,18 +297,19 @@ def normalize(raw: dict | None) -> dict:
     out = empty()
 
     for key in ("forbidden_parts", "required_parts"):
-        out[key] = _dedupe(_as_str_list(raw.get(key)))
+        out[key] = _dedupe(_as_str_list(raw.get(key)))[:MAX_LIST_ITEMS]
 
     for key in ("forbidden_propellants", "required_propellants"):
-        out[key] = _dedupe(_map_tokens(raw.get(key), _PROPELLANT_ALIASES, keep_unknown=True))
+        out[key] = _dedupe(_map_tokens(raw.get(key), _PROPELLANT_ALIASES,
+                                       keep_unknown=True))[:MAX_LIST_ITEMS]
 
     for key in ("forbidden_engine_categories", "required_engine_categories"):
         out[key] = _dedupe(_map_tokens(raw.get(key), _ENGINE_CATEGORY_ALIASES,
-                                       allowed=ENGINE_CATEGORIES))
+                                       allowed=ENGINE_CATEGORIES))[:MAX_LIST_ITEMS]
 
     for key in ("forbidden_part_categories", "required_part_categories"):
         out[key] = _dedupe(_map_tokens(raw.get(key), _PART_CATEGORY_ALIASES, keep_unknown=True,
-                                       lower=True))
+                                       lower=True))[:MAX_LIST_ITEMS]
 
     for key in ("max_parts", "min_parts", "min_crew"):
         val = raw.get(key)
@@ -527,23 +538,34 @@ def extract_heuristic(text: str) -> dict:
                 or f"{phrase}-free" in low or f"no {phrase}" in low:
             out["forbidden_part_categories"].append(canon)
 
-    # Named parts, e.g. "can't use the Thud engine" / "use only the Mainsail".
-    _extract_named_parts(text, out)
-
-    # Part-count limits, e.g. "max 10 parts" / "at least 5 parts".
-    _extract_part_count(text, out)
-
-    # Delta-v limits, e.g. "at least 3000 m/s of delta-v" / "no more than 5 km/s dv".
-    _extract_delta_v(text, out)
-
-    # Crew-aboard limits, e.g. "crew of 3" / "carry at least 2 kerbals" / "2-4 crew".
-    _extract_crew(text, out)
-
-    # Per-profession crew, e.g. "two pilots and a scientist" / "no tourists".
-    _extract_crew_traits(text, out)
+    # Named parts ("can't use the Thud engine"), part-count limits ("max 10 parts"),
+    # delta-v limits ("at least 3000 m/s of delta-v"), crew aboard ("crew of 3",
+    # "2-4 kerbals") and per-profession crew ("two pilots and a scientist").
+    #
+    # Each is a bundle of guesses about prose somebody typed, and this runs on the
+    # event loop wherever a contract is rendered — so a guess that throws must read
+    # as "found nothing", never as an exception in the caller. The regexes are
+    # bounded (see _COUNT) so this should not fire; it is the backstop for the
+    # input nobody thought of, and it logs rather than hides.
+    for step in (_extract_named_parts, _extract_part_count, _extract_delta_v,
+                 _extract_crew, _extract_crew_traits):
+        try:
+            step(text, out)
+        except Exception as exc:  # noqa: BLE001 - a heuristic must not raise
+            log.warning("%s failed on mission text (%d chars): %s",
+                        step.__name__, len(text), exc)
 
     return normalize(out)
 
+
+# A count in a mission ("crew of 3", "at most 40 parts") is at most a few digits,
+# and every regex below that captures one is bounded to six. Unbounded `\d+` is
+# super-linear on a run of digits — each start position matches the whole run and
+# backtracks it looking for the noun that never comes, so 5 000 digits cost seconds
+# and 10 000 cost a quarter of a minute, on the bot's event loop — and past 4 300
+# digits `int()` refuses the capture outright. Six digits is more than any count
+# that could mean anything and keeps every scan linear.
+_COUNT = r"(\d{1,6})"
 
 # Written-out counts accepted in crew phrases ("a crew of three", "üç kerbal").
 # They're rewritten to digits before matching, so every pattern below only has to
@@ -649,16 +671,16 @@ def _extract_crew(text: str, out: dict) -> None:
         break
 
     # exactly N ("crew of 3", "exactly 2 kerbals", "crew: 3")
-    for m in re.finditer(rf"(?:crew\s*of|exactly|precisely|tam)\s*(\d+)\s*{K}?", low):
+    for m in re.finditer(rf"(?:crew\s*of|exactly|precisely|tam)\s*{_COUNT}\s*{K}?", low):
         add(maxes, m, n(m)); add(mins, m, n(m))
-    for m in re.finditer(rf"{K}\s*(?:size|count)?\s*[:=]\s*(\d+)", low):
+    for m in re.finditer(rf"{K}\s*(?:size|count)?\s*[:=]\s*{_COUNT}", low):
         add(maxes, m, n(m)); add(mins, m, n(m))
     # adjectival exact counts: "a 3-kerbal lander", "3 kişilik mürettebat"
-    for m in re.finditer(rf"(\d+)\s*-\s*{K}\b", low):
+    for m in re.finditer(rf"{_COUNT}\s*-\s*{K}\b", low):
         add(maxes, m, n(m)); add(mins, m, n(m))
-    for m in re.finditer(r"(\d+)\s*kişilik", low):
+    for m in re.finditer(rf"{_COUNT}\s*kişilik", low):
         add(maxes, m, n(m)); add(mins, m, n(m))
-    for m in re.finditer(rf"{K}\s*(\d+)\s*kişi", low):
+    for m in re.finditer(rf"{K}\s*{_COUNT}\s*kişi", low):
         add(maxes, m, n(m)); add(mins, m, n(m))
     # bare "one/single/solo kerbal" (already digitised) — an exact count, since
     # "send one kerbal to the Mun" is not satisfied by sending three.
@@ -667,16 +689,16 @@ def _extract_crew(text: str, out: dict) -> None:
             continue
         add(maxes, m, n(m)); add(mins, m, n(m))
     # range: "between N and M crew" / "N to M kerbals" / "N-M crew"
-    for m in re.finditer(rf"(?:between\s*)?(\d+)\s*(?:and|to|-|–|ile)\s*(\d+)\s*{K}", low):
+    for m in re.finditer(rf"(?:between\s*)?{_COUNT}\s*(?:and|to|-|–|ile)\s*{_COUNT}\s*{K}", low):
         add(mins, m, int(m.group(1))); add(maxes, m, int(m.group(2)))
     # inclusive max
     for m in re.finditer(rf"(?:max(?:imum)?|no more than|at most|up to|no greater than|"
-                         rf"en fazla|en çok)\s*(?:of\s*)?(\d+)\s*{K}", low):
+                         rf"en fazla|en çok)\s*(?:of\s*)?{_COUNT}\s*{K}", low):
         add(maxes, m, n(m))
-    for m in re.finditer(rf"(\d+)\s*{K}\s*or\s*(?:fewer|less)", low):
+    for m in re.finditer(rf"{_COUNT}\s*{K}\s*or\s*(?:fewer|less)", low):
         add(maxes, m, n(m))
     # strict max ("fewer/less than N crew" => N-1)
-    for m in re.finditer(rf"(?:fewer than|less than|under|below|altında)\s*(\d+)\s*{K}", low):
+    for m in re.finditer(rf"(?:fewer than|less than|under|below|altında)\s*{_COUNT}\s*{K}", low):
         add(maxes, m, max(0, n(m, -1)))
     # inclusive min ("at least N crew", "carry N kerbals", "fly 3 kerbals to the Mun").
     # A transport verb reads as a floor, not an exact count, matching how "carry" has
@@ -684,28 +706,28 @@ def _extract_crew(text: str, out: dict) -> None:
     for m in re.finditer(rf"(?:min(?:imum)?|at least|no fewer than|no less than|"
                          rf"carry|carrying|with|fly|flying|send|sending|take|taking|"
                          rf"launch|launching|transport|deliver|"
-                         rf"en az|taşı\w*|götür\w*|gönder\w*)\s*(?:of\s*)?(\d+)\s*{K}{NOT_CEIL}", low):
+                         rf"en az|taşı\w*|götür\w*|gönder\w*)\s*(?:of\s*)?{_COUNT}\s*{K}{NOT_CEIL}", low):
         add(mins, m, n(m))
-    for m in re.finditer(rf"(\d+)\s*{K}\s*or\s*more", low):
+    for m in re.finditer(rf"{_COUNT}\s*{K}\s*or\s*more", low):
         add(mins, m, n(m))
-    for m in re.finditer(rf"(\d+)\+\s*{K}", low):
+    for m in re.finditer(rf"{_COUNT}\+\s*{K}", low):
         add(mins, m, n(m))
     # strict min ("more than N crew" => N+1); "no " lookbehind avoids "no more than".
-    for m in re.finditer(rf"(?<!no )(?:more than|over|greater than|above)\s*(\d+)\s*{K}", low):
+    for m in re.finditer(rf"(?<!no )(?:more than|over|greater than|above)\s*{_COUNT}\s*{K}", low):
         add(mins, m, n(m, 1))
 
     # Reverse word order, where the bound follows the noun: "crew size of at least 2",
     # "crew count under 4", "mürettebat en az 2".
     CONN = r"(?:\s*(?:of|is|:|=)\s*|\s+)"
     CS = rf"{K}\s*(?:size|count|say\w*)?"
-    for m in re.finditer(rf"{CS}{CONN}(?:at least|min(?:imum)?|no fewer than|no less than|en az)\s*(\d+)", low):
+    for m in re.finditer(rf"{CS}{CONN}(?:at least|min(?:imum)?|no fewer than|no less than|en az)\s*{_COUNT}", low):
         add(mins, m, n(m))
-    for m in re.finditer(rf"{CS}{CONN}(?<!no )(?:more than|over|greater than|above)\s*(\d+)", low):
+    for m in re.finditer(rf"{CS}{CONN}(?<!no )(?:more than|over|greater than|above)\s*{_COUNT}", low):
         add(mins, m, n(m, 1))
     for m in re.finditer(rf"{CS}{CONN}(?:at most|max(?:imum)?|no more than|up to|no greater than|"
-                         rf"en fazla|en çok)\s*(\d+)", low):
+                         rf"en fazla|en çok)\s*{_COUNT}", low):
         add(maxes, m, n(m))
-    for m in re.finditer(rf"{CS}{CONN}(?:fewer than|less than|under|below|altında)\s*(\d+)", low):
+    for m in re.finditer(rf"{CS}{CONN}(?:fewer than|less than|under|below|altında)\s*{_COUNT}", low):
         add(maxes, m, max(0, n(m, -1)))
 
     # "crewed / manned mission" with no number: at least somebody aboard. The \b in
@@ -764,27 +786,27 @@ def _extract_crew_traits(text: str, out: dict) -> None:
         add(maxes, m, 0, 1)
 
     # "exactly 2 pilots"
-    for m in re.finditer(rf"\b(?:exactly|precisely|tam)\s*(\d+)\s*({T})\b", low):
+    for m in re.finditer(rf"\b(?:exactly|precisely|tam)\s*{_COUNT}\s*({T})\b", low):
         add(mins, m, int(m.group(1)), 2)
         add(maxes, m, int(m.group(1)), 2)
 
     # Inclusive and strict bounds, either side of the number.
-    for m in re.finditer(rf"\b(?:at least|min(?:imum)?|no fewer than|no less than|en az)\s*(\d+)\s*({T})\b", low):
+    for m in re.finditer(rf"\b(?:at least|min(?:imum)?|no fewer than|no less than|en az)\s*{_COUNT}\s*({T})\b", low):
         add(mins, m, int(m.group(1)), 2)
-    for m in re.finditer(rf"\b(?<!no )(?:more than|over|greater than|above)\s*(\d+)\s*({T})\b", low):
+    for m in re.finditer(rf"\b(?<!no )(?:more than|over|greater than|above)\s*{_COUNT}\s*({T})\b", low):
         add(mins, m, int(m.group(1)) + 1, 2)
-    for m in re.finditer(rf"\b(?:at most|max(?:imum)?|no more than|up to|en fazla|en çok)\s*(\d+)\s*({T})\b", low):
+    for m in re.finditer(rf"\b(?:at most|max(?:imum)?|no more than|up to|en fazla|en çok)\s*{_COUNT}\s*({T})\b", low):
         add(maxes, m, int(m.group(1)), 2)
-    for m in re.finditer(rf"\b(?:fewer than|less than|under|below|altında)\s*(\d+)\s*({T})\b", low):
+    for m in re.finditer(rf"\b(?:fewer than|less than|under|below|altında)\s*{_COUNT}\s*({T})\b", low):
         add(maxes, m, max(0, int(m.group(1)) - 1), 2)
 
     # Trailing bound: "2 pilots or fewer" is a ceiling wearing a bare count's clothes.
-    for m in re.finditer(rf"\b(\d+)\s*({T})\b\s*(?:or\s*(?:fewer|less)|veya\s*az)", low):
+    for m in re.finditer(rf"\b{_COUNT}\s*({T})\b\s*(?:or\s*(?:fewer|less)|veya\s*az)", low):
         add(maxes, m, int(m.group(1)), 2)
 
     # Bare count — a floor. Skipped when a bound word owns the number, or the
     # phrase is "2 pilots or fewer", both of which the patterns above already read.
-    for m in re.finditer(rf"\b(\d+)\s*({T})\b(?!\s*(?:or\s*(?:fewer|less)|veya\s*az))", low):
+    for m in re.finditer(rf"\b{_COUNT}\s*({T})\b(?!\s*(?:or\s*(?:fewer|less)|veya\s*az))", low):
         if not _crew_qualified(low, m.start()):
             add(mins, m, int(m.group(1)), 2)
 
@@ -818,31 +840,31 @@ def _extract_part_count(text: str, out: dict) -> None:
         return int(m.group(1)) + delta
 
     # exactly N
-    for m in re.finditer(rf"(?:exactly|precisely|tam)\s*(\d+)\s*{P}", low):
+    for m in re.finditer(rf"(?:exactly|precisely|tam)\s*{_COUNT}\s*{P}", low):
         maxes.append(n(m)); mins.append(n(m))
     # range: "between N and M parts" / "N to M parts"
-    for m in re.finditer(rf"(?:between\s*)?(\d+)\s*(?:and|to|-|ile)\s*(\d+)\s*{P}", low):
+    for m in re.finditer(rf"(?:between\s*)?{_COUNT}\s*(?:and|to|-|ile)\s*{_COUNT}\s*{P}", low):
         mins.append(int(m.group(1))); maxes.append(int(m.group(2)))
     # inclusive max
     for m in re.finditer(rf"(?:max(?:imum)?|no more than|at most|up to|no greater than|"
-                         rf"en fazla|en çok)\s*(?:of\s*)?(\d+)\s*{P}", low):
+                         rf"en fazla|en çok)\s*(?:of\s*)?{_COUNT}\s*{P}", low):
         maxes.append(n(m))
-    for m in re.finditer(rf"(\d+)\s*{P}\s*or\s*(?:fewer|less)", low):
+    for m in re.finditer(rf"{_COUNT}\s*{P}\s*or\s*(?:fewer|less)", low):
         maxes.append(n(m))
     # strict max ("fewer/less/under N" => N-1)
-    for m in re.finditer(rf"(?:fewer than|less than|under|below|altında)\s*(\d+)\s*{P}", low):
+    for m in re.finditer(rf"(?:fewer than|less than|under|below|altında)\s*{_COUNT}\s*{P}", low):
         maxes.append(max(1, n(m, -1)))
     # inclusive min
     for m in re.finditer(rf"(?:min(?:imum)?|at least|no fewer than|no less than|"
-                         rf"en az)\s*(?:of\s*)?(\d+)\s*{P}", low):
+                         rf"en az)\s*(?:of\s*)?{_COUNT}\s*{P}", low):
         mins.append(n(m))
-    for m in re.finditer(rf"(\d+)\s*{P}\s*or\s*more", low):
+    for m in re.finditer(rf"{_COUNT}\s*{P}\s*or\s*more", low):
         mins.append(n(m))
-    for m in re.finditer(rf"(\d+)\+\s*{P}", low):
+    for m in re.finditer(rf"{_COUNT}\+\s*{P}", low):
         mins.append(n(m))
     # strict min ("more than/over N" => N+1). The "no " lookbehind keeps
     # "no more than N" (an inclusive max) from being read as a minimum.
-    for m in re.finditer(rf"(?<!no )(?:more than|over|greater than|above|üzerinde)\s*(\d+)\s*{P}", low):
+    for m in re.finditer(rf"(?<!no )(?:more than|over|greater than|above|üzerinde)\s*{_COUNT}\s*{P}", low):
         mins.append(n(m, 1))
 
     # Reverse phrasing where the part-count noun precedes the bound and no
@@ -850,13 +872,13 @@ def _extract_part_count(text: str, out: dict) -> None:
     # "part count of at least 10", "parça sayısı 10 üzerinde".
     PC = r"(?:parts?\s*count|parça\s*say\w*)"
     CONN = r"(?:\s*(?:of|is|:|=)\s*|\s+)"  # optional "of"/"is"/":"/"=" connector
-    for m in re.finditer(rf"{PC}{CONN}(?:more than|over|greater than|above|üzerinde)\s*(\d+)", low):
+    for m in re.finditer(rf"{PC}{CONN}(?:more than|over|greater than|above|üzerinde)\s*{_COUNT}", low):
         mins.append(n(m, 1))
-    for m in re.finditer(rf"{PC}{CONN}(?:at least|min(?:imum)?|no fewer than|no less than|en az)\s*(\d+)", low):
+    for m in re.finditer(rf"{PC}{CONN}(?:at least|min(?:imum)?|no fewer than|no less than|en az)\s*{_COUNT}", low):
         mins.append(n(m))
-    for m in re.finditer(rf"{PC}{CONN}(?:fewer than|less than|under|below|altında)\s*(\d+)", low):
+    for m in re.finditer(rf"{PC}{CONN}(?:fewer than|less than|under|below|altında)\s*{_COUNT}", low):
         maxes.append(max(1, n(m, -1)))
-    for m in re.finditer(rf"{PC}{CONN}(?:at most|max(?:imum)?|no more than|up to|no greater than|en fazla|en çok)\s*(\d+)", low):
+    for m in re.finditer(rf"{PC}{CONN}(?:at most|max(?:imum)?|no more than|up to|no greater than|en fazla|en çok)\s*{_COUNT}", low):
         maxes.append(n(m))
 
     if maxes:
@@ -877,7 +899,9 @@ def _extract_delta_v(text: str, out: dict) -> None:
     maxes: list[float] = []
     mins: list[float] = []
 
-    NUM = r"(\d[\d,]*(?:\.\d+)?)"
+    # Bounded like _COUNT: "12,345.678" is the longest Δv worth reading, and an
+    # unbounded run backtracks quadratically (see _COUNT).
+    NUM = r"(\d[\d,]{0,9}(?:\.\d{1,3})?)"
     UNIT = r"\s*(km/s|km/sec|kps|m/s|m/sec|mps)?"
     # Δ lower-cases to δ; also accept "delta-v", "deltav", standalone "dv".
     DV = r"(?:[δ]\s*-?\s*v|delta[\s\-]*v|deltav|\bdv\b)"
@@ -945,8 +969,10 @@ def _extract_named_parts(text: str, out: dict) -> None:
     # is caught), optionally preceded by a Capitalised brand token ("LV-N Nerv").
     # Generic/fuel/category head words are filtered out below.
     pattern = re.compile(
-        r'(?:([A-Z][A-Za-z0-9\-]+)\s+)?'                    # optional brand prefix
-        r'([A-Za-z][A-Za-z0-9\-]+)\s+'                      # head word before the noun
+        # {0,40}: a part name is a word or two, and an unbounded word class backtracks
+        # the length of the text at every position (see _COUNT).
+        r'(?:([A-Z][A-Za-z0-9\-]{0,40})\s+)?'                # optional brand prefix
+        r'([A-Za-z][A-Za-z0-9\-]{0,40})\s+'                  # head word before the noun
         r'(?:[Ee]ngine|[Mm]otor|[Bb]ooster|[Tt]hruster|[Rr]ocket)s?\b'
     )
     candidates = []
@@ -1319,7 +1345,7 @@ def crew_trait_phrases(constraints: dict | None) -> list[str]:
         elif mn and mx and mn == mx:
             out.append(f"exactly {mn}× {trait}")
         elif mn and mx:
-            out.append(f"{mn}–{mx}× {trait}")
+            out.append(f"{mn}-{mx}× {trait}")
         elif mx:
             out.append(f"up to {mx}× {trait}")
         elif mn:

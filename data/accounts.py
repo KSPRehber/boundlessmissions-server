@@ -98,6 +98,15 @@ def account_for_discord(discord_id) -> str | None:
     linked onto an account that already existed without it.
     """
     did = str(discord_id)
+    # Deliberately NOT memoised, though it is now on the hot path (every contract
+    # button resolves the actor through it, and `/pay` resolves both ends).
+    #
+    # A cache would have to serve its last good answer during a read failure, and
+    # that silently defeats the invariant this function exists to uphold: a failed
+    # read must REFUSE, never be read as an answer. `cogs/targets.py` states it —
+    # "wait" and "retype" are different answers — and `test_targets.py` asserts it.
+    # One keyed document read per button press is the price of that, and it is the
+    # right trade: the alternative is paying the wrong wallet.
     try:
         snap = _discord_index().document(did).get()
     except Exception as exc:
@@ -227,8 +236,14 @@ def ensure_discord_account(discord_id, username: str = "") -> dict | None:
 
 
 def ensure_firebase_account(firebase_uid: str, *, email: str = "",
-                            display_name: str = "") -> dict | None:
-    """The account document for a Google / email sign-in, created on first use."""
+                            display_name: str = "", provider: str = "") -> dict | None:
+    """The account document for a Google / email sign-in, created on first use.
+
+    `provider` is Firebase's `sign_in_provider` and is recorded because the account
+    page has to know which credential to ask the holder to re-prove before it will
+    let them enrol a second factor — a password account cannot answer a Google
+    popup, and being asked for one is a dead end with no way forward.
+    """
     uid = str(firebase_uid)
     aid = account_for_firebase(uid)
     if aid is None:
@@ -247,6 +262,7 @@ def ensure_firebase_account(firebase_uid: str, *, email: str = "",
         "avatar_url": "",
         "created_at": _now(),
         "created_via": "firebase",
+        "provider": provider,
     }
     try:
         _accounts().document(aid).set(doc)
@@ -323,8 +339,8 @@ def link_discord(account_id, discord_id) -> tuple[str, str]:
     if has_activity(current):
         return LINK_HAS_DATA, (
             "That Discord account already has a Boundless Missions account with "
-            "its own balance and history. Sign in with it instead, or open a "
-            "ticket if you need the two combined.")
+            "its own balance and history, so it can't be attached to this one. "
+            "Sign in with it instead.")
 
     acct = get_account(aid)
     if acct is None:
@@ -349,6 +365,18 @@ def link_discord(account_id, discord_id) -> tuple[str, str]:
     return LINK_OK, "Discord account linked."
 
 
+def remember_provider(account_id, provider: str) -> None:
+    """Record which Firebase provider this account signs in with, if not already
+    known. Backfills accounts created before the field existed; best-effort, since
+    it only decides which re-auth prompt the account page offers."""
+    if not provider:
+        return
+    try:
+        _accounts().document(str(account_id)).set({"provider": provider}, merge=True)
+    except Exception as exc:
+        log.warning("Could not record the sign-in provider for %s: %s", account_id, exc)
+
+
 def link_firebase(account_id, firebase_uid: str, *, email: str = "") -> tuple[str, str]:
     """Attach a Google / email identity to an existing account. Mirror of
     `link_discord`, and refuses the same merge case for the same reason."""
@@ -363,8 +391,8 @@ def link_firebase(account_id, firebase_uid: str, *, email: str = "") -> tuple[st
     if has_activity(current):
         return LINK_HAS_DATA, (
             "That Google account already has a Boundless Missions account with its "
-            "own balance and history. Sign in with it instead, or open a ticket if "
-            "you need the two combined.")
+            "own balance and history, so it can't be attached to this one. Sign in "
+            "with it instead.")
 
     acct = get_account(aid)
     if acct is None:
@@ -434,9 +462,29 @@ def validate_username(name: str) -> str | None:
     if not _USERNAME_RE.match(raw):
         return ("Usernames can use letters, numbers, hyphens and underscores, "
                 "and must start and end with a letter or number.")
+    if looks_like_account_id(raw):
+        # A name that is *shaped* like an account id is a forgery, not a name.
+        # `cogs/targets.resolve` lets a moderator type an account id into the
+        # same field a username goes in, so a username spelled as somebody
+        # else's Discord snowflake would steer every `/fine`, `/setbalance` and
+        # `/contractreset` aimed at that player onto whoever claimed the name.
+        # The resolver now tries the id first as well, but a claim that can only
+        # ever be an impersonation attempt has no reason to be accepted at all.
+        # Reservations claimed before this rule existed are found by
+        # `tools/sweep_id_shaped_usernames.py`.
+        return "Usernames can't be all digits or start with 'a_', because those look like account ids."
     if normalize_username(raw) in RESERVED_USERNAMES:
         return "That username is reserved."
     return None
+
+
+def looks_like_account_id(value: str) -> bool:
+    """Whether a string has the shape of an account id — a Discord snowflake
+    (all digits) or a website account (`a_…`). A shape test only: it says nothing
+    about whether such an account exists. Case-insensitive on the prefix so that
+    `A_…` cannot slip past a check that `a_…` would fail."""
+    v = str(value or "").strip()
+    return bool(v) and (v.isdigit() or v.lower().startswith(FIREBASE_PREFIX))
 
 
 def claim_username(account_id, name: str) -> tuple[bool, str]:
@@ -652,13 +700,28 @@ def create_link_challenge(account_id) -> tuple[str, float] | None:
     try:
         for doc in _link_codes().where("account_id", "==", aid).stream():
             doc.reference.delete()
-        code = _digits(6)
         expires_at = time.time() + ACCOUNT_LINK_CODE_LIFETIME
-        _link_codes().document(code).set({
-            "account_id": aid,
-            "created_at": _now(),
-            "expires_at": expires_at,
-        })
+        # `create()`, not `set()`: the code IS the document id, and `set()` overwrites
+        # unconditionally — so a collision between two live 6-digit codes silently
+        # re-pointed one player's challenge at another player's account. Same fix and
+        # same reasoning as `api_auth._claim_unused_code`; a taken code is re-drawn.
+        from google.api_core import exceptions as _gexc
+        code = None
+        for _ in range(8):
+            candidate = _digits(6)
+            try:
+                _link_codes().document(candidate).create({
+                    "account_id": aid,
+                    "created_at": _now(),
+                    "expires_at": expires_at,
+                })
+                code = candidate
+                break
+            except _gexc.AlreadyExists:
+                continue
+        if code is None:
+            log.warning("Could not allocate an unused link challenge for %s", aid)
+            return None
         log.info("Created Discord-link challenge for account %s", aid)
         return code, expires_at
     except Exception as exc:
@@ -725,7 +788,8 @@ def delete_account(account_id) -> dict:
     """
     aid = str(account_id)
     removed = {"account": False, "username": "", "discord_index": False,
-               "firebase_index": False, "link_codes": 0}
+               "firebase_index": False, "firebase_auth": False,
+               "link_codes": 0, "friends": False}
 
     acct = get_account(aid) or {}
 
@@ -760,6 +824,30 @@ def delete_account(account_id) -> dict:
         except Exception as exc:
             log.warning("delete_account: firebase index for %s: %s", aid, exc)
 
+        # ...and the Firebase Authentication user itself, which nothing in this
+        # codebase deleted. Dropping the index row above removes only our POINTER to
+        # the identity; the identity stayed, holding the EMAIL ADDRESS, the password
+        # hash or linked Google account, the display name and Firebase's own sign-in
+        # metadata. That is the single sharpest item a deletion request is about, and
+        # the confirmation message this path prints says explicitly that it is gone.
+        #
+        # It also silently undid the whole deletion: with the index row removed but the
+        # auth user alive, that person could still sign in, `web_auth_signin` would find
+        # no `account_firebase` row, and `ensure_firebase_account` would mint a brand new
+        # account re-copying the email straight back out of the token.
+        #
+        # Here rather than in the two callers because this is the only function that
+        # still holds `firebase_uid` — the account document is deleted below. Best
+        # effort: a failure must not abort the rest of the erasure, and it is reported
+        # in `removed` so the caller can say what actually happened.
+        try:
+            from firebase_admin import auth as fb_auth
+            fb_auth.delete_user(fuid)
+            removed["firebase_auth"] = True
+        except Exception as exc:
+            # UserNotFoundError included: already gone is the desired end state.
+            log.warning("delete_account: firebase auth user for %s: %s", aid, exc)
+
     try:
         for doc in _link_codes().where("account_id", "==", aid).stream():
             doc.reference.delete()
@@ -773,6 +861,30 @@ def delete_account(account_id) -> dict:
             removed["account"] = True
     except Exception as exc:
         log.warning("delete_account: account doc %s: %s", aid, exc)
+
+    # The friend graph is the one place a deleted id survives in OTHER people's
+    # documents: dropping `friends/{aid}` alone would leave this account as a
+    # nameless row in every friend's list, un-removable because the account it
+    # names no longer exists. Imported here rather than at module scope — the
+    # friends store imports the wallet store, which imports this.
+    try:
+        from data import friends as _friends
+        _friends.forget_account(aid)
+        removed["friends"] = True
+    except Exception as exc:
+        log.warning("delete_account: friend graph for %s: %s", aid, exc)
+
+    # The crew hand-over ledger records which of this player's kerbals went out to
+    # whom — a record *about them*, so it goes when they do. Unlike the friend graph
+    # it lives only under their own id, so this is a single delete; a stale entry
+    # under someone else's id could only ever attest a return to an account that no
+    # longer exists, which nothing can act on.
+    try:
+        from data import crew_ledger as _crew_ledger
+        _crew_ledger.forget_account(aid)
+        removed["crew_ledger"] = True
+    except Exception as exc:
+        log.warning("delete_account: crew ledger for %s: %s", aid, exc)
 
     log.warning("Deleted account identity records for %s: %s", aid, removed)
     return removed
@@ -800,7 +912,13 @@ def join_accounts(discord_account_id, web_account_id) -> tuple[str, str, str]:
     way of signing in is moved onto it.** Someone who has played for months and now
     wants a Google button keeps everything and gains a button. Only when BOTH sides
     have a real history is this a merge — rewriting references, picking a winner,
-    destroying one of two balances — and that is refused for a human to sort out.
+    destroying one of two balances — and that is simply refused.
+
+    The refusal deliberately promises nothing. There is no merge tool, here or in
+    the owner console, so a message pointing at a moderator would be an offer
+    nobody can honour: a moderator can move a balance and XP, and cannot move a
+    listing or a contract at all. What it says instead is what is actually true —
+    the two accounts stay separate and both keep working.
     """
     d_id = str(discord_account_id)
     w_id = str(web_account_id)
@@ -812,18 +930,61 @@ def join_accounts(discord_account_id, web_account_id) -> tuple[str, str, str]:
     if d_acct is None or w_acct is None:
         return JOIN_ERROR, "Couldn't read one of those accounts. Try again.", ""
 
+    # A suspension is a state of the *person*, not of a document id, but it is
+    # stored per account id and `delete_account` does not carry it — so joining a
+    # suspended account into a clean one used to launder it away: the survivor has
+    # no suspension record, every later token is minted for the survivor, and the
+    # console goes on listing the dropped id as suspended, actively misreporting
+    # it. `has_activity` is False for exactly the zero-XP, starting-balance
+    # accounts a suspension is usually aimed at, so this was the easy direction.
+    try:
+        from data import suspensions as _susp
+        for _side in (d_id, w_id):
+            if _susp.get_active(_side):
+                return (JOIN_ERROR,
+                        "One of those accounts is currently suspended, so they "
+                        "can't be joined. Wait for the suspension to end, or talk "
+                        "to a moderator.", "")
+    except Exception as exc:   # a read failure must not decide this either way
+        log.warning("Could not check suspensions before joining %s/%s: %s", d_id, w_id, exc)
+        return JOIN_ERROR, "Couldn't check those accounts just now. Try again.", ""
+
     d_active = has_activity(d_id)
     w_active = has_activity(w_id)
     if d_active and w_active:
         return (JOIN_BOTH_ACTIVE,
-                "Both of those accounts have their own balance and history. "
-                "Combining them means deciding which crafts, contracts and coins "
-                "survive, so a moderator has to do it — open a ticket.", "")
+                "Both of those accounts already have a balance and history of "
+                "their own. Joining them would mean deciding which crafts, "
+                "contracts and coins survive, so they stay separate. Carry on "
+                "with whichever one you want to keep. Both still work, and you "
+                "sign in to each the way you already do.", "")
 
     # Ties and the everyday case both go to Discord: it is the side that owns a
     # corp channel, guild roles and any KSP link, none of which move.
     keep, drop = (d_id, w_id) if (d_active or not w_active) else (w_id, d_id)
     keep_acct, drop_acct = (d_acct, w_acct) if keep == d_id else (w_acct, d_acct)
+
+    # Decide the second factor's fate BEFORE anything irreversible happens. It used
+    # to be settled at the end, after the sign-in had already been re-pointed at the
+    # survivor — so refusing there left the dropped account unreachable (its Firebase
+    # uid now resolves to `keep`) and therefore impossible to turn 2FA off on, which
+    # is what the refusal asks for. A permanent lockout is a worse outcome than the
+    # orphaned record this was fixing. The `move` itself stays at the end.
+    #
+    # `is_enabled` is not sufficient on its own: `begin_enroll` writes a document
+    # with enabled=False, so a survivor who merely started an enrolment has no
+    # enabled factor but does have a document, and `move` refuses to overwrite one.
+    try:
+        _tf = _twofa_mod()
+        move_2fa = _tf.is_enabled(drop)
+        if move_2fa and _tf.has_record(keep):
+            return (JOIN_ERROR,
+                    "Both of those accounts have two-factor authentication set up. "
+                    "Turn it off on the one you're giving up, then join them again.",
+                    "")
+    except Exception as exc:
+        log.error("Could not read 2FA state for %s/%s: %s", drop, keep, exc)
+        return JOIN_ERROR, "Couldn't check the security settings. Try again.", ""
 
     # Move the dropped side's way of signing in onto the survivor.
     if keep == d_id:
@@ -894,11 +1055,46 @@ def join_accounts(discord_account_id, web_account_id) -> tuple[str, str, str]:
     # dropped wallet is deliberately left: it is a default record by definition
     # (that is what `has_activity` just established), so there is nothing in it to
     # clean up and nothing to lose if this is ever re-run.
+    # The second factor is part of the identity, not of the document — the same
+    # view `admin_user_delete` already takes when it calls `twofa.purge`. Left
+    # behind, a player who enrolled on the dropped side silently lost their 2FA
+    # (the survivor's sign-in stopped asking for a code), and one who enrolled on
+    # the surviving side kept it. Carry it when only one side has it; refuse when
+    # both do, because picking one would disable a factor its owner still trusts.
+    if move_2fa:
+        try:
+            _twofa_mod().move(drop, keep)
+        except Exception as exc:
+            # Decided above, before anything irreversible happened; a failure here is
+            # a lost second factor rather than a lost account, and the survivor can
+            # re-enrol. Logged loudly because it should not happen.
+            log.error("Could not carry 2FA from %s to %s: %s", drop, keep, exc)
+
+    # The dropped side's KSP sessions, device bindings and outstanding challenges
+    # go with it; `delete_account` covers the account document, not these.
+    try:
+        from api_auth import purge_ksp_user_data as _purge_ksp
+        _purge_ksp(drop)
+    except Exception as exc:   # best effort: the tokens were already revoked above
+        log.warning("Could not purge KSP data for dropped account %s: %s", drop, exc)
+
     delete_account(drop)
 
     log.warning("Joined accounts: kept %s, dropped %s", keep, drop)
     named = f" You're **{kept_name}**." if kept_name else ""
     return JOIN_OK, f"Accounts joined.{named}", keep
+
+
+def _twofa_mod():
+    """The 2FA module, imported at call time.
+
+    Not for a circular import — there is none: accounts → twofa → store is a chain,
+    and store imports neither. It is deferred only so that importing `accounts` (as
+    several tools and scripts do) does not pull in the 2FA collection handle. Move it
+    to module scope freely if that ever stops being worth it.
+    """
+    from data import twofa as _twofa
+    return _twofa
 
 
 def drop_id_of(acct: dict, fallback: str) -> str:

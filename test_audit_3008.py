@@ -79,7 +79,7 @@ check("avatar upload charges the quota", 'avatar:{ctx' in src and "_charge_uploa
 check("rescue wreck upload charges the quota", "_charge_upload_quota(uid, len(node_bytes))" in src)
 check("rescue creation is rate limited", 'rescue:{uid}' in src)
 i_charge = src.index("_charge_upload_quota(uid, len(craft_data or b\"\")")
-i_craft = src.index("url = await cdb.upload_private_to_storage(\n                contract_id, craft_file.filename")
+i_craft = src.index("url = await cdb.upload_submission_file(\n                contract_id, uid, craft_file.filename")
 check("submit charges the quota before storing the craft", i_charge < i_craft)
 check("catalog writes are rate limited", 'catalog:{uid}' in src)
 
@@ -92,7 +92,8 @@ api_server.mkt.claim_auto_delist = lambda lid, score: calls.append(lid) or False
 check("20 dislikes from 20 accounts do not delist", api_server._enforce_rating_floor(listing, 0, 20) == "" and not calls)
 api_server._enforce_rating_floor(listing, 15, 35)
 check("the floor still engages once the votes are there", calls == ["L"])
-check("vote endpoint gates new accounts", "_vote_eligible" in src and "mkvote_ip:" in src)
+check("vote endpoint gates new accounts",
+      "_vote_eligible" in src and '_rate_limit_ip("mkvote_ip"' in src)
 
 print("\n[A6] the web tier refuses aud-less tokens, the KSP tier still accepts them")
 check("KSP tier accepts legacy", api_server._require_audience({"aud": None}, "ksp", "no", allow_legacy=True)["aud"] is None)

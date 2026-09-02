@@ -43,6 +43,18 @@ class _Doc:
         else:
             DATA[self._path] = dict(payload)
 
+    def create(self, payload):
+        """Real `create()` semantics: refuse if the document already exists.
+
+        This is what makes a link code safe to key on its own 6-digit value — a
+        collision must fail so the caller re-draws, where `set()` would silently
+        overwrite one player's challenge with another's.
+        """
+        if self._path in DATA:
+            from google.api_core import exceptions as _gexc
+            raise _gexc.AlreadyExists(self._path)
+        DATA[self._path] = dict(payload)
+
     def delete(self):
         DATA.pop(self._path, None)
 

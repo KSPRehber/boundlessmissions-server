@@ -27,6 +27,8 @@ import logging
 import discord
 
 import settings
+from firebase_admin import firestore
+
 from data.store import _db
 
 log = logging.getLogger(__name__)
@@ -98,6 +100,25 @@ def _required_role_keys() -> list[str]:
 # ── In-memory cache ──────────────────────────────────────────────────────────
 # guild_id (str) -> {"channels": {key: id}, "roles": {key: id}}
 _config: dict[str, dict[str, dict[str, int]]] = {}
+
+# Set once `load()` has completed a successful read. `_persist` refuses until then,
+# for the reason `store.save()` does: an empty in-memory map is not evidence that
+# the stored one is empty, and writing from it can erase a guild's whole config.
+# `load()` catches and logs its own failures, so without this a failed boot read
+# followed by any single `set_channel` was enough.
+_loaded = False
+
+
+class GuildConfigUnavailable(RuntimeError):
+    """Raised when a mapping change cannot be persisted because the boot read failed.
+
+    Deliberately not a startup refusal, unlike `store`'s equivalent: an unloaded wallet
+    can lose money, while an unloaded role map only means the mappings are unavailable
+    until the next successful load. But it must be LOUD at the point of use, because
+    every read also answers None in this state — so `get_admin` 404s every mapped
+    bot-admin, achievement roles self-disable and ticket categories become unfindable,
+    all while the bot presents as healthy.
+    """
 
 
 def _guild_entry(guild_id: int) -> dict[str, dict[str, int]]:
@@ -208,8 +229,9 @@ def set_channel(guild_id: int, key: str, channel_id: int | None) -> None:
     entry = _guild_entry(guild_id)["channels"]
     if channel_id is None:
         entry.pop(key, None)
-    else:
-        entry[key] = int(channel_id)
+        _persist(guild_id, removed=("config_channels", key))
+        return
+    entry[key] = int(channel_id)
     _persist(guild_id)
 
 
@@ -221,8 +243,9 @@ def set_role(guild_id: int, key: str, role_id: int | None) -> None:
     entry = _guild_entry(guild_id)["roles"]
     if role_id is None:
         entry.pop(key, None)
-    else:
-        entry[key] = int(role_id)
+        _persist(guild_id, removed=("config_roles", key))
+        return
+    entry[key] = int(role_id)
     _persist(guild_id)
 
 
@@ -232,10 +255,54 @@ def clear_role(guild_id: int, key: str) -> None:
 
 # ── Persistence ──────────────────────────────────────────────────────────────
 
-def _persist(guild_id: int) -> None:
+def _persist(guild_id: int, *, removed: tuple[str, str] | None = None) -> None:
+    """Write the mappings back.
+
+    `removed` names a (container_field, key) pair that was just deleted, and it is
+    NOT optional bookkeeping — without it a clear does not persist at all.
+
+    `set(..., merge=True)` builds its update mask from the leaf field paths present
+    in the payload. A key popped from the in-memory map contributes no path, so it
+    is not in the mask and Firestore leaves the stored value exactly where it was;
+    `load()` then re-adopts it on the next boot. Verified against the installed SDK:
+
+        {"config_channels": {"corp": 1}, "config_roles": {"mod": 9}}
+          -> mask ['config_channels.corp', 'config_roles.mod']
+
+    So "Clear this mapping" redrew the embed as unset, made `get_admin` 404, and
+    silently handed the role its console access back at the next restart. The same
+    held for every key, `mod` and the ticket category included.
+
+    A removal is therefore an explicit `DELETE_FIELD` on that one path. The
+    surviving keys still go through the merge, so a concurrent write to the other
+    container is not clobbered.
+
+    Note also why the empty-map case must not simply be merged: when a container is
+    `{}`, `extract_fields` emits the CONTAINER path, which replaces the whole stored
+    map. Combined with a `load()` that only logs its failures, one `set_channel`
+    after a failed load would have erased that guild's entire role map — the EC2
+    lesson ("a failed load must not authorise a write"), which `store` learned and
+    this module had not. `_loaded` below is that guard.
+    """
+    if not _loaded:
+        # RAISE, do not return. Refusing the write is right (see above); doing it
+        # silently is not. `set_role`/`set_channel` returned None either way, so the
+        # admin panel redrew the embed with the mapping shown as SET and logged that it
+        # had mapped it — and it was gone at the next restart. That is precisely the
+        # sentence the wallet's own guard was written around: refusing a change is
+        # recoverable, silently losing it is not. The callers surface this.
+        raise GuildConfigUnavailable(
+            "The guild configuration never finished loading, so this change cannot be "
+            "saved. Check the bot's Firestore connection and try again after a restart."
+        )
     entry = _guild_entry(guild_id)
     try:
-        _db.collection("guilds").document(str(guild_id)).set(
+        doc = _db.collection("guilds").document(str(guild_id))
+        if removed is not None:
+            container, key = removed
+            doc.update({f"{container}.{key}": firestore.DELETE_FIELD})
+            return
+        doc.set(
             {"config_channels": entry["channels"], "config_roles": entry["roles"]},
             merge=True,
         )
@@ -246,6 +313,7 @@ def _persist(guild_id: int) -> None:
 def load() -> None:
     """Load all per-guild channel/role config from Firestore. Call at startup,
     next to gkchannels.load_gk_channels()."""
+    global _loaded
     try:
         n_ch = n_role = 0
         for doc in _db.collection("guilds").stream():
@@ -256,7 +324,18 @@ def load() -> None:
                 _config[doc.id] = {"channels": channels, "roles": roles}
                 n_ch += len(channels)
                 n_role += len(roles)
+        _loaded = True
         log.info("Loaded guild config: %d channel mappings, %d role mappings across %d guilds",
                  n_ch, n_role, len(_config))
     except Exception as exc:  # pragma: no cover - network/IO
         log.error("Failed to load guild config: %s", exc)
+        # Name the consequences rather than only the cause. In this state every
+        # resolve_* answers None, so the bot runs with no mapped admin role, no ticket
+        # categories and no achievement roles — and every attempt to set one now raises
+        # instead of silently reverting at the next restart.
+        log.warning(
+            "Guild config is UNLOADED: role and channel mappings will resolve as unset "
+            "(no bot-admin console access, no ticket categories, no achievement roles), "
+            "and /admin setrole|setchannel will refuse. Restart once Firestore is "
+            "reachable to recover."
+        )

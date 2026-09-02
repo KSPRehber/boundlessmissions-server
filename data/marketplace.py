@@ -15,19 +15,27 @@ Firestore structure (GLOBAL — the marketplace spans every server):
 import hashlib
 import logging
 import threading
+import time
 import uuid
 from datetime import datetime
 from typing import Any
 
 from firebase_admin import firestore
 
-from data.store import _db, _storage_bucket, safe_filename, upload_private
+from data.store import (_db, _storage_bucket, safe_filename, safe_content_type,
+                        upload_private)
 
 log = logging.getLogger(__name__)
 
 # Status constants
 ACTIVE = "active"
 DELISTED = "delisted"
+# The document exists but its craft is not in Storage yet. A listing is created
+# before its craft is uploaded (the upload needs the id), and it used to be
+# created ACTIVE — so a failed upload left an empty craft on the grid that a
+# buyer could pay for. PENDING keeps it off `list_active` until the upload has
+# landed; a failed upload deletes it (see marketplace_list_craft).
+PENDING = "pending"
 
 # Vote values. A vote is a tri-state, not a toggle: the client always sends the
 # state it wants (NONE clears), so a double-click can't flip an unrelated later
@@ -59,6 +67,7 @@ def create_listing(
     ls_crew_capacity: int = 0,
     custom_textures: bool = False,
     craft_hashes: list[str] | None = None,
+    status: str = ACTIVE,
 ) -> ListingData:
     lid = uuid.uuid4().hex[:12]
     now = datetime.utcnow().isoformat()
@@ -116,7 +125,7 @@ def create_listing(
         # those are matched only when a moderator bans from the listing itself,
         # which hashes that one file on demand.
         "craft_hashes": list(craft_hashes or []),
-        "status": ACTIVE,
+        "status": status,
         "created_at": now,
         # Vote tallies. These are *derived* counters kept in step with the per-user
         # vote records in `marketplace_votes` (see set_vote) — cheap to read on a
@@ -139,6 +148,7 @@ def create_listing(
         "sales_count": 0,
     }
     _col().document(lid).set(doc)
+    invalidate_active_cache()
     log.info("Listing %s created: %s selling %s for %d", lid, seller_name, craft_name, price)
     return doc
 
@@ -150,14 +160,74 @@ def get_listing(guild_id: int, listing_id: str) -> ListingData | None:
 
 def update_listing(guild_id: int, listing_id: str, **fields) -> None:
     _col().document(listing_id).update(fields)
+    invalidate_active_cache()
+
+
+# The active market, memoised. This query streams every ACTIVE document — one
+# metered Firestore read per listing — and it backs the site's public catalog,
+# which is unauthenticated and CDN-cached on a URL the caller controls. So a
+# visitor able to vary the query string could turn one browse into a full scan,
+# repeatedly; the CDN was the only thing between that and the bill `cost_guard`
+# exists to defend. A short TTL here is the backstop that does not depend on the
+# cache being hit. Kept deliberately shorter than the CDN's own s-maxage so the
+# grid is never staler than the page already is.
+_ACTIVE_CACHE: dict[str, object] = {"at": 0.0, "rows": [], "gen": 0}
+_ACTIVE_TTL = 30.0
+
+# The console's view of the same collection, memoised the same way and for a
+# sharper version of the same reason. `list_all` streams EVERY listing whatever
+# its status — one metered Firestore read per document — and it was the one
+# marketplace read with no cache at all, behind a 240-per-minute bucket, reachable
+# by a mapped guild-admin whose whole tier is deliberately narrower than the
+# owner's. The guild scoping is applied to the rows *after* the read, so it
+# reduces what is shown and not what is billed: 240 × N reads a minute from a role
+# that is not supposed to be able to spend anything. Same TTL and the same
+# invalidation, so a moderator's own edit still shows up immediately.
+_ALL_CACHE: dict[str, object] = {"at": 0.0, "rows": [], "gen": 0}
 
 
 def list_active(guild_id: int) -> list[ListingData]:
-    """All active listings, globally (guild_id ignored — one shared market)."""
-    return [
+    """All active listings, globally (guild_id ignored — one shared market).
+
+    Answers from a 30-second in-process cache; `invalidate_active_cache()` clears it
+    on every write so a new listing, a purchase or a delist shows up at once rather
+    than after the TTL.
+    """
+    now = time.time()
+    # Snapshot both fields once. Reading `["rows"]` twice let an invalidate landing
+    # between the check and the return hand back an empty list — an empty
+    # marketplace page — since this runs in a threadpool while writers invalidate
+    # from other threads.
+    rows, at = _ACTIVE_CACHE["rows"], float(_ACTIVE_CACHE["at"])
+    if rows and now - at < _ACTIVE_TTL:
+        return list(rows)                           # a copy: callers sort in place
+    # A generation counter, taken before the stream and re-checked after it: a
+    # writer that invalidates while this query is in flight bumps it, and the fill
+    # is then discarded rather than writing rows that predate the write back into
+    # the cache with a fresh timestamp (which would resurrect a delisted listing
+    # for a full TTL, and 404 anyone who tried to buy it).
+    gen = _ACTIVE_CACHE["gen"]
+    rows = [
         doc.to_dict()
         for doc in _col().where("status", "==", ACTIVE).stream()
     ]
+    if _ACTIVE_CACHE["gen"] == gen:
+        _ACTIVE_CACHE["rows"] = rows
+        _ACTIVE_CACHE["at"] = time.time()
+    return list(rows)
+
+
+def invalidate_active_cache() -> None:
+    """Drop the memoised listing sets — the public active grid and the console's
+    all-statuses view. Every writer of a listing's stored fields calls this —
+    including `_set_vote_locked`, whose counters feed the score and both rating
+    sorts. One function for both caches so a new writer cannot remember one and
+    forget the other; a delist has to leave the grid AND appear as delisted in the
+    console, and those are the same event."""
+    for cache in (_ACTIVE_CACHE, _ALL_CACHE):
+        cache["rows"] = []
+        cache["at"] = 0.0
+        cache["gen"] = int(cache["gen"]) + 1
 
 
 def list_by_seller(seller_id: int) -> list[ListingData]:
@@ -192,9 +262,24 @@ def list_by_hash(entry: str) -> list[ListingData]:
 
 
 def list_all() -> list[ListingData]:
-    """Every listing regardless of status or seller — the owner admin console's
-    view (it must see delisted crafts to be able to moderate them)."""
-    return [doc.to_dict() for doc in _col().stream()]
+    """Every listing regardless of status or seller — the admin console's view
+    (it must see delisted crafts to be able to moderate them).
+
+    Answers from the same 30-second cache `list_active` uses, cleared by the same
+    `invalidate_active_cache()` writers, and with the same generation counter so a
+    write landing mid-stream discards the fill instead of caching rows that
+    predate it.
+    """
+    now = time.time()
+    rows, at = _ALL_CACHE["rows"], float(_ALL_CACHE["at"])
+    if rows and now - at < _ACTIVE_TTL:
+        return list(rows)                           # a copy: callers filter/sort it
+    gen = _ALL_CACHE["gen"]
+    rows = [doc.to_dict() for doc in _col().stream()]
+    if _ALL_CACHE["gen"] == gen:
+        _ALL_CACHE["rows"] = rows
+        _ALL_CACHE["at"] = time.time()
+    return list(rows)
 
 
 def delete_listing(listing_id: str) -> None:
@@ -212,6 +297,7 @@ def delete_listing(listing_id: str) -> None:
             log.warning("Could not list Storage blobs for listing %s: %s", listing_id, exc)
     _col().document(listing_id).delete()
     log.info("Listing %s permanently deleted", listing_id)
+    invalidate_active_cache()
 
 
 def try_claim_purchase(guild_id: int, listing_id: str, buyer_id: int) -> bool | None:
@@ -247,7 +333,11 @@ def try_claim_purchase(guild_id: int, listing_id: str, buyer_id: int) -> bool | 
         })
         return True
 
-    return _claim(transaction)
+    result = _claim(transaction)
+    if result:
+        # sales_count and buyers are shown on the card, so the memoised set is stale.
+        invalidate_active_cache()
+    return result
 
 
 # ── Votes ────────────────────────────────────────────────────────────────────
@@ -342,8 +432,15 @@ def _set_vote_locked(listing_id: str, user_id: int | str, vote: int) -> tuple[in
     except Exception:
         ref.update({"likes": firestore.Increment(-d_like),
                     "dislikes": firestore.Increment(-d_dislike)})
+        invalidate_active_cache()   # the compensating write moved the counters too
         raise
 
+    # A vote changes `likes`/`dislikes`, which every card's score and both the
+    # "highest rated" and "recommended" sorts are computed from — so the memoised
+    # set is stale the moment this returns. Missing this made a vote invisible to
+    # everyone but the voter (whose own view is masked by the optimistic local
+    # delta in use-listing-votes.ts) for up to a TTL.
+    invalidate_active_cache()
     return max(0, likes + d_like), max(0, dislikes + d_dislike)
 
 
@@ -388,6 +485,7 @@ def claim_auto_delist(listing_id: str, score: int) -> bool:
 
     claimed = bool(_claim(transaction))
     if claimed:
+        invalidate_active_cache()   # it just left the grid
         log.info("Listing %s auto-delisted at score %d", listing_id, score)
     return claimed
 
@@ -469,12 +567,19 @@ async def upload_craft(listing_id: str, filename: str, data: bytes) -> str:
 
 
 async def upload_blueprint(listing_id: str, data: bytes, content_type: str = "image/png") -> str:
-    """Upload a rendered blueprint image for a listing. Returns public URL."""
+    """Upload a rendered blueprint image for a listing. Returns public URL.
+
+    The content type goes through `safe_content_type` for the reason it exists
+    (see data/store.py): this blob is made public and the website links it, so a
+    client-declared `text/html` or `image/svg+xml` would have the project's own
+    bucket serving attacker-authored active content from a URL the site publishes.
+    These two uploaders were the only public ones that skipped it.
+    """
     if _storage_bucket is None:
         raise RuntimeError("Firebase Storage not configured")
     path = f"marketplace/{listing_id}/blueprint.png"
     blob = _storage_bucket.blob(path)
-    blob.upload_from_string(data, content_type=content_type)
+    blob.upload_from_string(data, content_type=safe_content_type(content_type))
     blob.make_public()
     log.info("Uploaded %s to Storage", path)
     return blob.public_url
@@ -486,7 +591,7 @@ async def upload_thumbnail(listing_id: str, data: bytes, content_type: str = "im
         raise RuntimeError("Firebase Storage not configured")
     path = f"marketplace/{listing_id}/thumbnail.png"
     blob = _storage_bucket.blob(path)
-    blob.upload_from_string(data, content_type=content_type)
+    blob.upload_from_string(data, content_type=safe_content_type(content_type))
     blob.make_public()
     log.info("Uploaded %s to Storage", path)
     return blob.public_url

@@ -115,14 +115,29 @@ def get_active(user_id: str) -> dict | None:
     return _active(rec, now)
 
 
-def get_record(user_id: str) -> dict | None:
-    """The stored document whatever its state (expired, lifted). Admin views only
-    — the gate asks `get_active`."""
+class SuspensionReadError(RuntimeError):
+    """The record could not be read — distinct from "there is none". Raised by
+    the one path (`lift`) where the two have opposite consequences."""
+
+
+def _read_record(user_id: str) -> dict | None:
+    """The stored document, or None if there is none. Raises
+    `SuspensionReadError` rather than guessing when Firestore cannot be read."""
     try:
         snap = _col().document(str(user_id)).get()
-        return snap.to_dict() if snap.exists else None
     except Exception as exc:
         log.warning("Could not read suspension record for %s: %s", user_id, exc)
+        raise SuspensionReadError(str(exc)) from exc
+    return snap.to_dict() if snap.exists else None
+
+
+def get_record(user_id: str) -> dict | None:
+    """The stored document whatever its state (expired, lifted). Admin views only
+    — the gate asks `get_active`. None for both "absent" and "unreadable", which
+    is fine for a view and is why `lift` does not use it."""
+    try:
+        return _read_record(user_id)
+    except SuspensionReadError:
         return None
 
 
@@ -163,9 +178,17 @@ def lift(user_id: str, by: str) -> bool:
     """End a suspension early. Returns False if there was nothing running.
 
     The document is kept (with `until` moved to now) so the record of what
-    happened survives being undone."""
+    happened survives being undone.
+
+    Raises `SuspensionReadError` when the record could not be read, and caches
+    nothing in that case. It used to take `get_record`'s None at face value:
+    "nothing running" went back to the console, and `(None, now)` went into the
+    cache — so for a TTL the gate every request passes through answered "not
+    suspended" for a player whose suspension was still in force, on the word of
+    a read that never happened. The gate's own read path already refuses to cache
+    a failed read; this is the same rule on the write side."""
     user_id = str(user_id)
-    rec = get_record(user_id)
+    rec = _read_record(user_id)
     now = time.time()
     if _active(rec, now) is None:
         # Still drop any cached copy: an expired suspension left in the cache is

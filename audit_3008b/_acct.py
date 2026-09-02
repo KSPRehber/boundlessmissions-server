@@ -120,10 +120,30 @@ class Col:
             yield s
 
 
+class _Txn:
+    """A transaction handle. Writes land immediately, which is equivalent to
+    Firestore's deferred commit because `transactional` below serialises whole
+    transactions on the DB's lock — so the reads inside one always see the
+    committed writes of the one before, the outcome Firestore's optimistic
+    retry converges on."""
+    def __init__(self, db):
+        self.db = db
+
+    def set(self, ref, payload, merge=False):
+        ref.set(payload, merge=merge)
+
+    def update(self, ref, payload):
+        ref.update(payload)
+
+    def delete(self, ref):
+        ref.delete()
+
+
 class DB:
     def __init__(self, latency=0.0):
         self.cols = {}
         self.latency = latency
+        self.txn_lock = threading.RLock()
 
     def collection(self, name):
         if name not in self.cols:
@@ -131,20 +151,26 @@ class DB:
         return self.cols[name]
 
     def transaction(self):
-        class _Txn:
-            def set(self, ref, payload, merge=False):
-                ref.set(payload, merge=merge)
-
-            def update(self, ref, payload):
-                ref.update(payload)
-        return _Txn()
+        return _Txn(self)
 
 
 def patch_accounts_db(db):
     from data import accounts, twofa
     accounts._db = db
     twofa._db = db
-    accounts.firestore = type("_FS", (), {"transactional": staticmethod(lambda fn: fn)})()
+
+    # `firestore.transactional(fn)(txn)`: run `fn` under the DB's transaction
+    # lock so concurrent transactions serialise (3008b: the 2FA counter/attempt
+    # fixes are transactions, and a fake that ran them unserialised would show
+    # the race the real SDK's retry prevents). Real reads still sleep `latency`.
+    def _transactional(fn):
+        def run(txn, *a, **k):
+            with txn.db.txn_lock:
+                return fn(txn, *a, **k)
+        return run
+    fs = type("_FS", (), {"transactional": staticmethod(_transactional)})()
+    accounts.firestore = fs
+    twofa.firestore = fs
 
 
 class MemStore:

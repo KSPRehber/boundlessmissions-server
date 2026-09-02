@@ -19,7 +19,7 @@ import time
 import discord
 from discord import app_commands
 from discord.ext import commands
-from config import cfg
+from config import cfg, insecure_gates
 
 # Parse --sync flag before the bot starts
 _SYNC_COMMANDS = "--sync" in sys.argv
@@ -182,12 +182,52 @@ class GeneKermanBot(commands.Bot):
         else:
             log.info("Moderation commands: DISABLED (ENABLE_MOD_COMMANDS=false)")
 
+        failed_cogs: list[str] = []
         for module in cog_modules:
             try:
                 await self.load_extension(module)
                 log.info("Loaded cog: %s", module)
             except Exception as exc:
-                log.error("Failed to load cog %s: %s", module, exc)
+                log.error("Failed to load cog %s: %s", module, exc, exc_info=True)
+                failed_cogs.append(module)
+
+        # The wallet must be in memory before this process serves anything.
+        #
+        # `cogs.xp.cog_load` is what awaits `store.load()`, and the loop above
+        # deliberately swallows a cog failure so one broken feature cannot stop the
+        # bot. For every other cog that is right; for this one it is not, and the
+        # difference is that the store's failure mode is silent rather than absent.
+        # A bot running on an unloaded store answers every balance as 0, accrues no
+        # XP, never flushes, and says so nowhere a player can see — which is
+        # indistinguishable from the wipe that `store.load()` refuses to allow, and
+        # arrives as "the economy is broken" rather than as an outage. `store` blocks
+        # its own writes in that state, so nothing is destroyed; what is missing is
+        # someone noticing. This is that.
+        #
+        # `store.loaded` is a positive assertion, so it also catches the case where
+        # `cogs.xp` failed before `store.load()` ever ran — an empty store whose
+        # writes are NOT blocked, which is the more dangerous of the two.
+        from data.store import store
+        if not store.loaded and store.budget_blocked:
+            # The one unloaded state we do NOT die on. `cost_guard` FROZEN is cleared
+            # from the admin console, which is a route in this same process, and the
+            # level is persisted — so exiting here would remove the only way back and
+            # would do it on every restart, which under `Restart=always` is a crash
+            # loop that anyone able to drive the Firebase bill can trigger. Under a
+            # freeze every Firestore and Storage call is refused anyway, so there is
+            # nothing here to overwrite while the owner raises the budget.
+            log.critical(
+                "Starting with an UNLOADED wallet because the Firebase cost guard is "
+                "FROZEN. Balances read as zero and nothing is written. Clear the "
+                "freeze or raise the budget from the admin console, then restart.")
+        elif not store.loaded:
+            raise RuntimeError(
+                "The user wallet did not load, so this bot will not start.\n"
+                + (f"Cogs that failed to load: {', '.join(failed_cogs)}\n" if failed_cogs else "")
+                + "Nothing has been written and no record was changed — the store "
+                  "blocks its own writes in this state. Check the CRITICAL line above "
+                  "for the Firestore error, then start the bot again."
+            )
 
         # If a command group is configured, wrap all commands under it
         # This must happen every boot so the tree matches what Discord expects
@@ -197,6 +237,7 @@ class GeneKermanBot(commands.Bot):
 
             # Subclass to add GK channel gating
             from cogs.gkchannels import is_gk_channel, is_mod, get_gk_channel_mentions
+            from cogs.perms import real_user
             from i18n import tp
 
             class GKGroup(app_commands.Group):
@@ -204,8 +245,11 @@ class GeneKermanBot(commands.Bot):
                     # DMs — allow
                     if interaction.guild is None:
                         return True
-                    # Mods bypass
-                    if isinstance(interaction.user, discord.Member) and is_mod(interaction.user):
+                    # Mods bypass — on the REAL invoker. This is an authority check
+                    # like any other, so it goes through perms.real_user rather than
+                    # the mimic-swapped interaction.user (see the invariant above).
+                    ru = real_user(interaction)
+                    if isinstance(ru, discord.Member) and is_mod(ru):
                         return True
                     # GK channels — allow
                     if is_gk_channel(interaction.guild_id, interaction.channel_id):
@@ -378,6 +422,12 @@ class GeneKermanBot(commands.Bot):
             await ctx.send("💥 An unexpected error occurred. The maintainer (<@815228135049527297>) has been pinged via DM.")
 
     async def on_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
+        # Imported here, not at module level: setup_hook does the same, and i18n
+        # loads its string tables on import. The CheckFailure branch below used to
+        # reach for `tp` bound only inside setup_hook, so every refused permission
+        # check raised NameError instead of saying "no permission".
+        from i18n import tp
+
         budget = self._budget_stop(error)
         if budget is not None:
             # A spending stop is a known state, not a crash. Saying "unexpected
@@ -389,6 +439,18 @@ class GeneKermanBot(commands.Bot):
                 await interaction.response.send_message(msg, ephemeral=True)
             else:
                 await interaction.followup.send(msg, ephemeral=True)
+            return
+
+        if isinstance(error, app_commands.CheckFailure):
+            # A permission check said no. discord.py runs this handler after the
+            # cog's own one regardless of what it did, so a refusal used to arrive
+            # as "no permission" followed by "an unexpected error occurred" and a
+            # DM to the maintainer for every non-mod who tried a mod command.
+            # Only answer if the cog has not.
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    tp(interaction.guild_id, interaction.user.id, "common.no_perm"),
+                    ephemeral=True)
             return
 
         log.error("Unhandled app command error: %s", error, exc_info=True)
@@ -445,13 +507,9 @@ async def main() -> None:
             # the DLL hash, so the version gate blocks the build you are testing — and
             # the failure mode is forgetting to flip them back, which ships a server
             # that accepts outdated and modified clients without challenge.
-            disabled_gates = [
-                name for name, on in (
-                    ("KSP_VERSION_CHECK_ENABLED", cfg.KSP_VERSION_CHECK_ENABLED),
-                    ("KSP_DEVICE_BINDING_ENABLED", cfg.KSP_DEVICE_BINDING_ENABLED),
-                    ("KSP_2FA_ENABLED", cfg.KSP_2FA_ENABLED),
-                ) if not on
-            ]
+            # Derived from the register in config.py, never re-listed here: this
+            # list used to be maintained by hand and had fallen two gates behind.
+            disabled_gates = insecure_gates()
             if disabled_gates:
                 banner = "  ".join(disabled_gates)
                 print("\n" + "!" * 72)
@@ -479,6 +537,20 @@ async def main() -> None:
                 port=cfg.API_PORT,
                 log_level="info",
                 access_log=False,
+                # This server is a task inside the Discord bot's own process and
+                # event loop, so anything that exhausts it here also takes the bot
+                # down — moderation, tickets and auctions with it. A concurrency
+                # ceiling turns that into 503s for the excess rather than a dead
+                # process.
+                #
+                # It must stay well above what the per-user WebSocket cap permits:
+                # uvicorn counts a live WS against this, every linked player holds at
+                # least one for their whole session, and NotificationHub.MAX_PER_USER
+                # allows eight — so a ceiling near the player count would answer 503
+                # to every HTTP request at ordinary load, which is the outcome this
+                # is meant to prevent. The per-user cap is the control that bounds
+                # sockets; this only stops runaway.
+                limit_concurrency=2048,
                 **ssl_kwargs,
             )
             api_server = uvicorn.Server(api_config)

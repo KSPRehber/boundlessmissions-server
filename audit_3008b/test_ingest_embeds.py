@@ -50,7 +50,7 @@ check("contract_views._embed of a long rescue mission is postable", ok,
       f"and swallow the resulting 400 — the offer never reaches the contractor's corp channel")
 
 section("B. submitted file names: raw into a masked-link field")
-sub = between(api, "stored_files.append({\"filename\": craft_file.filename", "\n")
+sub = between(api, "stored_files.append({\"filename\": craft_safe_name", "\n")
 check("craft/screenshot filenames are truncated or sanitised before storage",
       "[:" in sub or "_safe" in sub or "basename" in sub,
       "api_server.py:4242/4253 store UploadFile.filename verbatim")
@@ -59,13 +59,13 @@ files = [{"filename": "a" * 1100 + ".craft", "url": "https://storage.invalid/x"}
 # Re-create exactly the field contract_actions.dispute(sue) adds (contract_actions.py ~1367)
 e = cv._embed(contract("Land on the Mun", files), 0)
 e.add_field(name="📁 Submitted Files",
-            value="\n".join(f"📎 [{f['filename']}]({f['url']})" for f in files), inline=False)
+            value="\n".join(cdb.file_link(f) for f in files)[:1024], inline=False)
 ok, why = embed_ok(e)
 check("sue-ticket embed survives a long submitted filename", ok,
       f"{why}: the ticket channel is created and recorded, but the post carrying ModReviewView "
       f"(the mods' enforce/cancel buttons) fails, so the dispute has no controls")
 evil = "click here](https://evil.example/phish) [x"
-val = f"📎 [{evil}](https://storage.invalid/x)"
+val = cdb.file_link({"filename": evil, "url": "https://storage.invalid/x"})
 check("a filename cannot rewrite the masked link's target",
       "https://evil.example" not in val or "](" not in evil,
       f"rendered as {val!r}: Discord shows 'click here' pointing at evil.example in a moderator ticket")

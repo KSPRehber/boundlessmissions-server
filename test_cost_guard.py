@@ -356,9 +356,17 @@ with tuned(**PRICING):
 # ── [I] tier 1 ───────────────────────────────────────────────────────────────
 print("\n[I] Cloud Monitoring is adopted as the baseline; local counting continues")
 class _Snap:
-    def __init__(self, ok=True, daily=None, stored=0, error=None):
+    def __init__(self, ok=True, daily=None, stored=0, error=None, present=None):
         self.ok, self.daily, self.stored_bytes = ok, daily or {}, stored
         self.error, self.fetched_at = error, 1234.0
+        # Mirrors the real `UsageSnapshot.present`: which series actually returned
+        # a value. For a gauge like `stored_bytes` a successful query with no
+        # datapoint is NOT a reading of zero, and `cost_guard` must not adopt or
+        # clamp to it — see the at-rest checks below. Default: a stored figure was
+        # supplied means the series reported.
+        if present is None:
+            present = {"stored_bytes"} if stored else set()
+        self.present = set(present)
 
 with tuned(**PRICING):
     g = fresh()
@@ -377,6 +385,25 @@ with tuned(**PRICING):
     check("bytes at rest come from tier 1 only",
           g.snapshot()["storage"]["stored_bytes"] == 7 * cost_guard._GB)
 
+
+    # RB2 (0209-R2): a poll that carried NO storage datapoint must leave the at-rest
+    # estimate alone. `ok` is not evidence of a reading — gcp_metrics keeps a
+    # snapshot ok when one series is missing, and `storage/total_bytes` is a daily
+    # gauge whose window starts on the 1st, so an empty result is the expected state
+    # in the first hours of every UTC month, exactly when the rollover has just set
+    # the authoritative figure to 0. Clamping on that zeroed the estimate on disk.
+    g2 = fresh()
+    g2.note_storage(upload=0)
+    g2._stored_bytes = 42 * cost_guard._GB
+    g2._auth_stored_bytes = 42 * cost_guard._GB
+    g2.ingest_usage(_Snap(daily={}, stored=0, present=set()))
+    check("an ok poll with no storage datapoint does not zero the at-rest estimate",
+          g2._stored_bytes == 42 * cost_guard._GB, g2._stored_bytes)
+    check("...nor is the authoritative figure re-adopted as 0",
+          g2._auth_stored_bytes == 42 * cost_guard._GB, g2._auth_stored_bytes)
+    g2.ingest_usage(_Snap(daily={}, stored=3 * cost_guard._GB))
+    check("a poll that DOES carry a reading still clamps down to it",
+          g2._stored_bytes == 3 * cost_guard._GB, g2._stored_bytes)
     g.note_firestore(reads=30_000)
     eff = g._effective_daily_locked()
     check("post-poll work is added on top of the baseline",

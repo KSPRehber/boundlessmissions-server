@@ -155,7 +155,7 @@ async def resolve(interaction: discord.Interaction,
 
     if member is not None and name:
         raise TargetError(
-            "Give **either** a member **or** a username — not both. "
+            "Give **either** a member **or** a username, not both. "
             "I won't guess which one you meant.")
 
     if member is None and not name:
@@ -170,33 +170,42 @@ async def resolve(interaction: discord.Interaction,
         if account_id is None:
             raise TargetError(
                 "Couldn't reach the account service to work out whose account "
-                "that is. Nothing was changed — try again in a moment.")
+                "that is. Nothing was changed. Try again in a moment.")
         acct = await asyncio.to_thread(accounts.get_account, account_id)
         label, uname = _label_for(account_id, acct, member)
         return Target(account_id=account_id, label=label, member=member, username=uname)
 
     # A username, or — for a moderator who copied one out of the admin console —
-    # an account id typed into the same field. The username is tried first and
-    # wins outright: names are the thing players know, ids are the fallback, and a
-    # name can never look like a snowflake anyway (`_USERNAME_RE` requires the
-    # first character to be alphanumeric but the reserved-word list and the
-    # 3-character floor do not exclude digits, so the id branch must come second).
-    owner = await asyncio.to_thread(accounts.owner_of_username, name)
-    if owner is None:
-        raise TargetError(
-            "Couldn't reach the account service to look that name up. "
-            "Nothing was changed — try again in a moment.")
-
-    if not owner:
+    # an account id typed into the same field. Which is tried first is decided
+    # by the *shape* of what was typed, and the order matters: an earlier
+    # version tried the username first on the theory that a name can never look
+    # like a snowflake, and it could — `validate_username` accepted any 3–20
+    # character `[A-Za-z0-9_-]` string, and a snowflake is 17–19 digits. So
+    # anyone could claim the username `190212345678901234` and every `/fine`,
+    # `/setbalance` or `/contractreset` a moderator aimed at that Discord id
+    # landed on the claimant instead. `validate_username` now refuses id-shaped
+    # names, but a reservation claimed before it did is still in `usernames/`
+    # until the sweep runs, so the resolver must not trust the order either:
+    # something shaped like an id IS an id if any account or wallet answers to
+    # it, and only falls through to the username lookup when nothing does.
+    owner = ""
+    if accounts.looks_like_account_id(name):
         owner = await _account_id_if_exists(name)
         if owner is None:
             raise TargetError(
                 "Couldn't reach the account service to look that up. "
-                "Nothing was changed — try again in a moment.")
+                "Nothing was changed. Try again in a moment.")
+
+    if not owner:
+        owner = await asyncio.to_thread(accounts.owner_of_username, name)
+        if owner is None:
+            raise TargetError(
+                "Couldn't reach the account service to look that name up. "
+                "Nothing was changed. Try again in a moment.")
         if not owner:
             raise TargetError(
                 f"No Boundless account is called **{discord.utils.escape_markdown(name)}**. "
-                f"Usernames are what players choose on the website or in the mod — "
+                f"Usernames are what players choose on the website or in the mod; "
                 f"they aren't Discord names.")
 
     acct = await asyncio.to_thread(accounts.get_account, owner)
@@ -223,7 +232,7 @@ async def _account_id_if_exists(candidate: str) -> str | None:
     `admin_user_adjust`, which refuses ids the store has never seen.
     """
     cand = candidate.strip()
-    if not (cand.isdigit() or cand.startswith(accounts.FIREBASE_PREFIX)):
+    if not accounts.looks_like_account_id(cand):
         return ""
     try:
         acct = await asyncio.to_thread(accounts.get_account, cand)

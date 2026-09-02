@@ -17,9 +17,11 @@ VICTIM = "190212345678901234"        # a Discord snowflake (18 digits)
 ATTACKER = "a_attackerFirebaseUid0000000"
 
 section("a username may be spelled exactly like another player's Discord id")
-check("validate_username accepts an 18-digit name", accounts.validate_username(VICTIM) is None,
-      accounts.validate_username(VICTIM))
-check("validate_username accepts a 19-digit name", accounts.validate_username("1" * 19) is None)
+check("validate_username refuses an 18-digit name", accounts.validate_username(VICTIM) is not None,
+      "an id-shaped username is a forgery of somebody's account id")
+check("validate_username refuses a 19-digit name", accounts.validate_username("1" * 19) is not None)
+check("validate_username refuses an a_-prefixed name", accounts.validate_username("a_notanid") is not None)
+check("control: an ordinary name is still fine", accounts.validate_username("jeb_42") is None)
 
 # ── fakes: no Firestore ──────────────────────────────────────────────────────
 USERNAMES = {VICTIM: ATTACKER}                       # attacker claimed the name "190212345678901234"

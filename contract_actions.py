@@ -215,6 +215,14 @@ async def _pay_issuer(gid: int, c: dict, *, refund: int = 0, income: int = 0) ->
     if _is_bot_issued(c):
         return
     uid = str(c["issuer_id"])
+    # An issuer who ran the delete-my-data flow has no record, and `add_balance`
+    # would mint one — a ghost `users/{id}` document holding the refund, flushed
+    # to Firestore by the next auto-save. The account chose to leave, and the
+    # coins were theirs; there is nowhere to put them, so they are not put anywhere.
+    if not store.has_user(uid):
+        log.info("Contract %s: issuer %s has no account record; %d refund / %d income "
+                 "not credited", c.get("contract_id"), uid, refund, income)
+        return
     label = _contract_label(c)
     if refund > 0:
         await store.add_balance(gid, uid, refund, category=store.TX_CONTRACT_REFUND,
@@ -323,6 +331,9 @@ def open_dispute_fields(now: datetime | None = None) -> dict:
     sweep and would sit open forever, which is the loophole the clock closes.
     `more_time_requests` resets because the allowance is per dispute, not per contract:
     an extension that was granted and then blown puts you back here with a fresh one.
+    `more_time_granted` is deliberately NOT here — see `dispute`'s bot branch: it counts
+    the extensions a bot contract has *granted itself* over the contract's whole life,
+    and resetting it on every reopen is what made that branch loop.
     """
     now = now or datetime.utcnow()
     return {
@@ -341,6 +352,24 @@ def auto_fine_at(c: dict) -> datetime | None:
     try:
         return (datetime.fromisoformat(stamped)
                 + timedelta(days=settings.DISPUTE_AUTO_FINE_DAYS))
+    except (ValueError, TypeError):
+        return None
+
+
+def mod_review_deadline(c: dict) -> datetime | None:
+    """When this moderator review resolves itself, or None if it is not on the clock.
+
+    Mirrors `auto_fine_at`, including the None case: a contract that entered MOD_REVIEW
+    before this stamp existed carries no `mod_review_at`, and the sweep stamps it and
+    waits a full window rather than resolving something that has been sitting there
+    unmeasured.
+    """
+    stamped = c.get("mod_review_at")
+    if c.get("status") != cdb.MOD_REVIEW or not stamped:
+        return None
+    try:
+        return (datetime.fromisoformat(stamped)
+                + timedelta(days=settings.MOD_REVIEW_TIMEOUT_DAYS))
     except (ValueError, TypeError):
         return None
 
@@ -396,6 +425,45 @@ def _other_party(c: dict, actor_id) -> str | None:
     return str(other)
 
 
+# ── Gates on taking on work ──────────────────────────────────────────────────
+#
+# Three ways to become the contractor of an ACTIVE contract: accept an offer, win
+# an auction, select a weekly mission. The gates lived only on the first, so a
+# debtor over DEBT_MAX_OUTSTANDING (or a player at MAX_ACTIVE_CONTRACTS_PER_USER)
+# who was refused an offer kept taking obligations through the other two. Stated
+# once here, with one wording, so a refusal reads the same wherever it lands.
+
+def debt_limit_refusal(gid: int, user_id) -> str | None:
+    """The sentence refusing `user_id` new work over the debt cap, or None.
+
+    Not a lockout — garnishment is already collecting, and shutting a debtor out of
+    the contract economy would remove the earnings it collects from. This only stops
+    obligations piling up across MAX_ACTIVE_CONTRACTS_PER_USER contracts at once.
+    """
+    cap = settings.DEBT_MAX_OUTSTANDING
+    if cap <= 0:
+        return None
+    owed = store.debt_total(gid, str(user_id))
+    if owed <= cap:
+        return None
+    return (f"You owe {owed} {settings.CURRENCY_SYMBOL} in unpaid fines "
+            f"(limit {cap}). Earn it down before taking on new contracts.")
+
+
+def active_limit_refusal(gid: int, user_id) -> str | None:
+    """The sentence refusing `user_id` an eleventh active contract, or None.
+    Same wording as the create endpoints in `api_server`, which check the issuer."""
+    cap = settings.MAX_ACTIVE_CONTRACTS_PER_USER
+    if cap <= 0 or cdb.count_active(gid, str(user_id)) < cap:
+        return None
+    return f"Active contract limit reached ({cap})."
+
+
+def contractor_gate(gid: int, user_id) -> str | None:
+    """Both gates, debt first (it is the in-memory one). None means clear to proceed."""
+    return debt_limit_refusal(gid, user_id) or active_limit_refusal(gid, user_id)
+
+
 # ── Offer: accept / cancel ───────────────────────────────────────────────────
 
 @serialized
@@ -410,17 +478,19 @@ async def accept(gid: int, contract_id: str, *, actor_id: int, actor_name: str) 
     if c.get("status") != cdb.PENDING:
         return _fail(BAD_STATE, "Contract is not pending.", c)
 
-    # Not a lockout — garnishment is already collecting, and shutting a debtor out of
-    # the contract economy would remove the earnings it collects from. This only stops
-    # obligations piling up across MAX_ACTIVE_CONTRACTS_PER_USER contracts at once.
-    cap = settings.DEBT_MAX_OUTSTANDING
-    if cap > 0:
-        owed = store.debt_total(gid, str(actor_id))
-        if owed > cap:
-            return _fail(DEBT_LIMIT,
-                         f"You owe {owed} {settings.CURRENCY_SYMBOL} in unpaid fines "
-                         f"(limit {cap}). Earn it down before taking on new contracts.",
-                         c)
+    # See `debt_limit_refusal` for why this is a cap and not a lockout. The same
+    # sentence gates auction bids and weekly-mission selection.
+    if refusal := debt_limit_refusal(gid, actor_id):
+        return _fail(DEBT_LIMIT, refusal, c)
+
+    # And the active-contract cap, which this path never applied. It did not matter
+    # while a PENDING offer already counted against the contractor's allowance — but
+    # counting it there let a stranger fill a victim's cap with unwanted offers, so
+    # it was removed, and this became the only place the contractor side is bounded
+    # at all. Without it a player can collect unlimited offers from alts and accept
+    # every one, ending with far more live obligations than the cap allows.
+    if refusal := active_limit_refusal(gid, actor_id):
+        return _fail(BAD_STATE, refusal, c)
 
     cdb.update_contract(gid, contract_id, status=cdb.ACTIVE)
     c["status"] = cdb.ACTIVE
@@ -480,6 +550,18 @@ async def cancel(gid: int, contract_id: str, *, actor_id: int, actor_name: str) 
     # contractor's hours went unpaid. Declining a PENDING offer stays free: nobody
     # has done anything yet. A bot issuer never pays (no wallet), and a bot
     # contractor is never paid.
+    #
+    # The escrow comes back FIRST, and the fine is then collected out of it. In the
+    # other order an issuer who kept their spare balance at 0 — everything they had
+    # was the escrow — paid nothing now: `debit_up_to` found an empty wallet, the
+    # whole fine became a debt, and the refund then landed in a wallet free to
+    # spend it, since a refund is non-garnishable by design and a spend is never
+    # garnished. The fine that exists to stop "preview the renders, walk away" was
+    # unenforced against exactly the issuer most likely to walk. The escrow is the
+    # issuer's own money, so refunding it before charging them is not a gift; it
+    # only means the fine is paid from what they demonstrably have.
+    await _pay_issuer(gid, c, refund=c.get("payment", 0))
+
     sym = settings.CURRENCY_SYMBOL
     collected = owed = 0
     contractor = str(c.get("contractor_id") or "")
@@ -495,12 +577,16 @@ async def cancel(gid: int, contract_id: str, *, actor_id: int, actor_name: str) 
         owed = fine - collected
         if owed > 0:
             await store.add_debt(gid, issuer, contractor, owed)
-        if collected > 0:
+        if collected > 0 and store.has_user(contractor):
+            # See `_pay_issuer`: crediting an account that deleted itself mints a ghost
+            # `users/{id}` record and un-does the erasure. The coins stay uncredited.
             await store.add_balance(gid, contractor, collected, garnishable=True,
                                     category=store.TX_FINE_RECEIVED, detail=label,
                                     counterparty=issuer)
+        elif collected > 0:
+            log.info("Contract %s: contractor %s has no account record; %d withdrawal "
+                     "fine not credited", contract_id, contractor, collected)
 
-    await _pay_issuer(gid, c, refund=c.get("payment", 0))
     log.info("Contract %s cancelled by %s (escrow %s refunded to issuer %s, fine %d/%d to contractor)",
              contract_id, actor_name, c.get("payment"), c.get("issuer_id"), collected, fine)
 
@@ -547,12 +633,24 @@ async def give_up(gid: int, contract_id: str, *, actor_id: int, actor_name: str)
     # out, while the same player could submit junk, be refused, and have the dispute
     # timeout take exactly this much three days later. So the honest exit was the only
     # blocked one. What is short becomes a debt (see `_charge_fine`).
-    collected, owed = await _charge_fine(gid, c, str(actor_id), fine)
-
-    await _pay_issuer(gid, c, refund=c.get("payment", 0), income=collected)
+    # Status FIRST, money second. Every mutator on `store` edits the in-process dict
+    # and sets a dirty flag; the only thing here that can raise is the Firestore status
+    # write. Charging before writing therefore leaves the one state that must never
+    # exist: money moved, contract still non-terminal. It is still counted by
+    # `_ESCROW_STATUSES`, so the escrow reads as held after being paid out — and
+    # `review(approve=True)` accepts DISPUTED, which would pay the contractor a
+    # `payment` that is no longer there. Worse, both sweepers RETRY (30 min for
+    # disputes, 30 s for auctions), so the next pass charges the fine and refunds the
+    # escrow a second time. This order fails the other way: an unpaid closed contract,
+    # which is visible, recoverable and does not duplicate. It is what `cancel`,
+    # `settle_response`, `mod_resolve(cancel)`, `mod_reset` and `_auto_accept_contract`
+    # already do.
     cdb.update_contract(gid, contract_id, status=cdb.CANCELLED,
-                        completed_at=datetime.utcnow().isoformat())
+                        completed_at=datetime.utcnow().isoformat(),
+                        closed_by="give_up")
     c["status"] = cdb.CANCELLED
+    collected, owed = await _charge_fine(gid, c, str(actor_id), fine)
+    await _pay_issuer(gid, c, refund=c.get("payment", 0), income=collected)
     log.info("Contract %s given up by %s (fine %d to issuer %s)",
              contract_id, actor_name, fine, c.get("issuer_id"))
 
@@ -566,6 +664,124 @@ async def give_up(gid: int, contract_id: str, *, actor_id: int, actor_name: str)
     msg = "Contract given up." + _fine_paid_sentence(collected, owed, sym)
     return Result(ok=True, message=msg, contract=c,
                   data={"fine_collected": collected, "fine_owed": owed})
+
+
+# ── Flag-design submission ───────────────────────────────────────────────────
+
+
+@serialized
+async def submit_flag(gid: int, contract_id: str, *, actor_id, actor_name: str,
+                      image: bytes, filename: str,
+                      content_type: str = "image/png") -> Result:
+    """Contractor hands over the image a `flag_design` contract asked for.
+
+    Submission normally lives in the mod, because what a review is judged against —
+    the craft, its mod list, the telemetry — can only be read from a running game.
+    A flag is the one deliverable that is *only* an image, so it has no in-game
+    upload and never had one: it was a Discord button, and this is that button's
+    body with the Discord parts taken out, so the website can offer the same act.
+
+    Two things are load-bearing and were not true of the Discord copy this replaces.
+    The flip is `claim_submission`, the same transactional ACTIVE→SUBMITTED the craft
+    path uses: real I/O (two Storage uploads) happens between reading the status and
+    writing it, and a plain `update` would put SUBMITTED over a contract that was
+    cancelled or given up in that window — whose escrow is already refunded — so the
+    review that followed would pay it a second time. And the issuer gets a `_notify`
+    as well as the Discord embed, so their in-game contract list refreshes; the
+    Discord path told only Discord, which is why a flag submitted there was invisible
+    to a player reviewing from the sidebar.
+
+    The clean image stays private and is surfaced only once the contract completes
+    (i.e. is paid for); what everyone sees until then is the watermarked preview.
+    """
+    import flag_preview
+
+    c, err = _load(gid, contract_id)
+    if err:
+        return err
+
+    if (c.get("mission_type") or "") != cdb.FLAG_DESIGN:
+        return _fail(BAD_REQUEST,
+                     "This contract is not a flag design. Submit it from inside KSP, "
+                     "which sends the craft and the telemetry the review is judged "
+                     "against.", c)
+    if str(c.get("contractor_id")) != str(actor_id):
+        return _fail(FORBIDDEN, "This contract is not yours to submit.", c)
+    if c.get("status") != cdb.ACTIVE:
+        return _fail(BAD_STATE, f"Cannot submit a {c.get('status')} contract.", c)
+    if not image:
+        return _fail(BAD_REQUEST, "That file was empty.", c)
+
+    # Full-res stays gated: stored PRIVATE (a bare path), surfaced only through a
+    # signed URL once the contract completes. Under a server-minted slot
+    # (contracts/{cid}/submitted/…) because the name is the contractor's — an
+    # upload called `flag_preview.png` would otherwise land exactly where the
+    # watermarked preview is written next, and the issuer would review, and pay
+    # for, a clean copy they already had.
+    try:
+        fullres_url = await cdb.upload_submission_file(
+            contract_id, str(actor_id), filename, image, content_type, public=False)
+        preview_url = await cdb.upload_to_storage(
+            contract_id, "flag_preview.png",
+            flag_preview.make_watermarked(image), "image/png")
+    except Exception as exc:
+        log.error("Flag upload failed for %s: %s", contract_id, exc)
+        return _fail(UNAVAILABLE, "Could not store that flag. Try again.", c)
+
+    fields = {
+        "submitted_files": [],
+        "flag_filename": cdb.display_filename(filename, "flag.png"),
+        "flag_fullres_url": fullres_url,
+        "flag_preview_url": preview_url,
+        "submitted_at": datetime.utcnow().isoformat(),
+    }
+    if not await asyncio.to_thread(cdb.claim_submission, gid, contract_id, fields):
+        # The contract moved out of ACTIVE while the two uploads were in flight.
+        # The preview is public and the full-res is the deliverable of a contract
+        # that no longer wants one, so neither should outlive the failed claim. The
+        # preview is deleted by its *path*: `upload_to_storage` hands back a public
+        # URL, and `delete_stored_file` refuses anything with a scheme in it — so
+        # passing what the upload returned would silently leave the public copy of
+        # an unsubmitted flag in the bucket.
+        await asyncio.to_thread(cdb.delete_stored_file, fullres_url)
+        await asyncio.to_thread(cdb.delete_stored_file,
+                                f"contracts/{contract_id}/flag_preview.png")
+        return _fail(BAD_STATE, "Contract is no longer active.", c)
+
+    c = cdb.get_contract(gid, contract_id) or dict(c, status=cdb.SUBMITTED, **fields)
+    log.info("Contract %s: flag submitted by %s", contract_id, actor_name)
+
+    _notify(gid, str(c["issuer_id"]), "submission_received", "🚩 Flag Submitted",
+            f"{c.get('contractor_name', actor_name)} submitted a flag for "
+            f"\"{c['mission'][:80]}\"", contract_id)
+
+    # A flag contract is always human-issued (a weekly mission has no flag to want),
+    # so there is no AI-review branch here — the issuer decides.
+    try:
+        import discord
+        from cogs.contract_views import _embed, ContractReviewView
+        from i18n import t
+
+        e = _embed(c, gid)
+        e.title = f"📬 {t(gid, 'ct.review_title')}"
+        e.color = discord.Color.orange()
+        e.add_field(
+            name="🚩 Flag",
+            value="Preview is watermarked; the full-res flag is delivered to your "
+                  "in-game flag picker on acceptance.",
+            inline=False)
+        # The id is passed as it is stored, not through `int()`: an issuer who
+        # signed up on the website has an account id that is not a snowflake, and
+        # coercing it would raise in here and log a delivery failure for something
+        # `deliver_to_player` already declines to attempt.
+        msg = await deliver_to_player(gid, c["issuer_id"], embed=e,
+                                      view=ContractReviewView(contract_id, gid))
+        if msg is not None:
+            cdb.update_contract(gid, contract_id, issuer_review_msg_id=str(msg.id))
+    except Exception as exc:
+        log.error("Could not deliver flag review to issuer of %s: %s", contract_id, exc)
+
+    return Result(ok=True, message="Flag submitted for review.", contract=c)
 
 
 # ── Review ───────────────────────────────────────────────────────────────────
@@ -732,12 +948,24 @@ async def dispute(gid: int, contract_id: str, *, actor_id: int, actor_name: str,
         # Partial, for the same reason `give_up` is: refusing a contractor who cannot
         # cover it only parked the contract in dispute until the timeout took this
         # exact amount anyway. Conceding is now always possible; the shortfall is a debt.
-        collected, owed = await _charge_fine(gid, c, contractor_id, fine)
-        await _pay_issuer(gid, c, refund=c.get("payment", 0), income=collected)
+        # Status FIRST, money second. Every mutator on `store` edits the in-process dict
+        # and sets a dirty flag; the only thing here that can raise is the Firestore status
+        # write. Charging before writing therefore leaves the one state that must never
+        # exist: money moved, contract still non-terminal. It is still counted by
+        # `_ESCROW_STATUSES`, so the escrow reads as held after being paid out — and
+        # `review(approve=True)` accepts DISPUTED, which would pay the contractor a
+        # `payment` that is no longer there. Worse, both sweepers RETRY (30 min for
+        # disputes, 30 s for auctions), so the next pass charges the fine and refunds the
+        # escrow a second time. This order fails the other way: an unpaid closed contract,
+        # which is visible, recoverable and does not duplicate. It is what `cancel`,
+        # `settle_response`, `mod_resolve(cancel)`, `mod_reset` and `_auto_accept_contract`
+        # already do.
         cdb.update_contract(gid, contract_id, status=cdb.COMPLETED,
                             completed_at=datetime.utcnow().isoformat(),
-                            pending_request=None)
+                            pending_request=None, closed_by="pay_fine")
         c["status"] = cdb.COMPLETED
+        collected, owed = await _charge_fine(gid, c, contractor_id, fine)
+        await _pay_issuer(gid, c, refund=c.get("payment", 0), income=collected)
         _clear_request(c)
         if not _is_bot_issued(c):
             _notify(gid, str(c["issuer_id"]), "review_result", "💰 Fine Paid",
@@ -759,8 +987,11 @@ async def dispute(gid: int, contract_id: str, *, actor_id: int, actor_name: str,
         posted = await _escalate_to_mods(gid, contract_id, c, opener_id=contractor_id)
         if not posted:
             return _fail(UNAVAILABLE, "Moderator review is not configured.", c)
-        cdb.update_contract(gid, contract_id, status=cdb.MOD_REVIEW, pending_request=None)
+        _now_iso = datetime.utcnow().isoformat()
+        cdb.update_contract(gid, contract_id, status=cdb.MOD_REVIEW,
+                            pending_request=None, mod_review_at=_now_iso)
         c["status"] = cdb.MOD_REVIEW
+        c["mod_review_at"] = _now_iso
         _clear_request(c)
         log.info("Contract %s escalated to moderators by %s", contract_id, actor_name)
         return Result(ok=True, message="Case escalated to moderators.", contract=c)
@@ -769,6 +1000,15 @@ async def dispute(gid: int, contract_id: str, *, actor_id: int, actor_name: str,
     if action == "settle":
         if _is_bot_issued(c):
             return _fail(BAD_REQUEST, "AI contracts cannot be settled.", c)
+        # Asking again while the first ask is still unanswered changes nothing about
+        # the contract, but it does write a notification and @-ping the issuer in
+        # their corp channel — so uncapped it is a harassment channel aimed at a
+        # person the contractor picked, and unmetered Firestore writes besides.
+        # `more_time` has been capped from the start; this is the same rule.
+        if _open_request_of(c, REQUEST_SETTLE) is not None:
+            return _fail(BAD_STATE,
+                         "You have already asked to settle. Wait for the issuer to "
+                         "answer, or pay the fine or sue instead.", c)
         _open_request(gid, contract_id, c, REQUEST_SETTLE)
         _notify(gid, str(c["issuer_id"]), "dispute_request", "🤝 Settlement Requested",
                 f"{c.get('contractor_name', actor_name)} asks to settle "
@@ -792,12 +1032,27 @@ async def dispute(gid: int, contract_id: str, *, actor_id: int, actor_name: str,
                      "pay the fine or sue.", c)
 
     if _is_bot_issued(c):
+        # A human issuer can refuse the request, so the per-dispute cap above is
+        # enough for them. A bot grants it unconditionally, and a granted extension
+        # ends in ACTIVE — from where the overdue sweep reopens the dispute through
+        # `open_dispute_fields`, which resets the per-dispute counter. So for a bot
+        # contract "once per dispute" was "once per week, forever", and
+        # `expire_dispute` — the only path that charges the fine — was never
+        # reached. The grants are therefore also counted per contract, in a field
+        # no reopen touches.
+        granted = int(c.get("more_time_granted") or 0)
+        if granted >= settings.DISPUTE_MAX_MORE_TIME_REQUESTS:
+            return _fail(BAD_STATE,
+                         "This mission has already been extended once. Pay the fine, "
+                         "sue, or submit before the dispute clock runs out.", c)
         end_of_week = _end_of_week()
         cdb.update_contract(gid, contract_id, due_date=end_of_week, status=cdb.ACTIVE,
-                            pending_request=None, more_time_requests=used + 1)
+                            pending_request=None, more_time_requests=used + 1,
+                            more_time_granted=granted + 1)
         c["status"] = cdb.ACTIVE
         c["due_date"] = end_of_week
         c["more_time_requests"] = used + 1
+        c["more_time_granted"] = granted + 1
         _clear_request(c)
         log.info("Contract %s auto-extended to %s for %s", contract_id, end_of_week, actor_name)
         return Result(ok=True, message=f"Deadline extended to {end_of_week}. Submit again!",
@@ -888,8 +1143,17 @@ async def more_time_response(gid: int, contract_id: str, *, actor_id: int, actor
     if c.get("status") != cdb.DISPUTED:
         return _fail(BAD_STATE, "This contract is no longer in dispute.", c)
 
+    # An OPEN request is required, unconditionally. This used to read
+    # `req is None and not new_date`, which let a caller-supplied date stand in for the
+    # request itself — so a stale Discord button (rebuilt by `from_custom_id` with an
+    # empty date and re-scraped from the message text) still moved DISPUTED -> ACTIVE
+    # and rewrote the deadline on a contract whose `pending_request` had since been
+    # cleared by a refusal, by the grace path, or by a later settle. That takes the
+    # contract off the auto-fine clock with nothing currently asked for, which is the
+    # opposite of what the docstring above promises. `new_date` keeps its ONLY intended
+    # job below: supplying the date for a legacy request that has no `new_date` field.
     req = _open_request_of(c, REQUEST_MORE_TIME)
-    if req is None and not new_date:
+    if req is None:
         return _fail(BAD_STATE, "There is no open extension request on this contract.", c)
 
     if not approve:
@@ -936,6 +1200,8 @@ async def expire_dispute(gid: int, contract_id: str) -> Result:
         return err
     if c.get("status") != cdb.DISPUTED:
         return _fail(BAD_STATE, "Contract is not in dispute.", c)
+    if _clock_paused_by_suspension(gid, contract_id, c):
+        return _fail(BAD_STATE, "Contractor is suspended; dispute clock paused.", c)
 
     deadline = auto_fine_at(c)
     if deadline is None:
@@ -965,11 +1231,14 @@ async def expire_dispute(gid: int, contract_id: str) -> Result:
         posted = await _escalate_to_mods(gid, contract_id, c,
                                          opener_id=str(c["contractor_id"]))
         if posted:
+            _now_iso = datetime.utcnow().isoformat()
             cdb.update_contract(gid, contract_id, status=cdb.MOD_REVIEW,
                                 pending_request=None, request_grace_used=True,
-                                escalated_by="unanswered_request")
+                                escalated_by="unanswered_request",
+                                mod_review_at=_now_iso)
             c["status"] = cdb.MOD_REVIEW
             c["request_grace_used"] = True
+            c["mod_review_at"] = _now_iso
             _clear_request(c)
             _notify(gid, str(c["contractor_id"]), "review_result", "⚖️ Sent to Moderators",
                     f"Your {kind.replace('_', ' ')} request on \"{c['mission'][:80]}\" "
@@ -1001,12 +1270,24 @@ async def expire_dispute(gid: int, contract_id: str) -> Result:
 
     sym = settings.CURRENCY_SYMBOL
     fine = c.get("fine", 0)
-    collected, owed = await _charge_fine(gid, c, str(c["contractor_id"]), fine)
-    await _pay_issuer(gid, c, refund=c.get("payment", 0), income=collected)
+    # Status FIRST, money second. Every mutator on `store` edits the in-process dict
+    # and sets a dirty flag; the only thing here that can raise is the Firestore status
+    # write. Charging before writing therefore leaves the one state that must never
+    # exist: money moved, contract still non-terminal. It is still counted by
+    # `_ESCROW_STATUSES`, so the escrow reads as held after being paid out — and
+    # `review(approve=True)` accepts DISPUTED, which would pay the contractor a
+    # `payment` that is no longer there. Worse, both sweepers RETRY (30 min for
+    # disputes, 30 s for auctions), so the next pass charges the fine and refunds the
+    # escrow a second time. This order fails the other way: an unpaid closed contract,
+    # which is visible, recoverable and does not duplicate. It is what `cancel`,
+    # `settle_response`, `mod_resolve(cancel)`, `mod_reset` and `_auto_accept_contract`
+    # already do.
     cdb.update_contract(gid, contract_id, status=cdb.COMPLETED,
                         completed_at=datetime.utcnow().isoformat(),
                         pending_request=None, closed_by="dispute_timeout")
     c["status"] = cdb.COMPLETED
+    collected, owed = await _charge_fine(gid, c, str(c["contractor_id"]), fine)
+    await _pay_issuer(gid, c, refund=c.get("payment", 0), income=collected)
     _clear_request(c)
 
     _notify(gid, str(c["contractor_id"]), "review_result", "⏱️ Dispute Timed Out",
@@ -1029,6 +1310,156 @@ async def expire_dispute(gid: int, contract_id: str) -> Result:
                   contract=c, data={"fine_collected": collected, "fine_owed": owed})
 
 
+def _clock_paused_by_suspension(gid: int, contract_id: str, c: dict) -> bool:
+    """Pause (or resume) a contract's clock around a service suspension.
+
+    Submitting is a KSP-only action, and a suspension refuses exactly the KSP API. The
+    two sweepers below did not know that, so a suspension quietly ran the overdue clock
+    and then the dispute clock and collected the full fine — up to
+    MAX_ACTIVE_CONTRACTS_PER_USER of them — turning what the shortfall could not cover
+    into a garnished debt that follows the player afterwards. A four-day suspension was
+    therefore a fine on every contract they held.
+
+    That directly contradicts what a suspension is documented to be, in `data/suspensions.py`
+    ("not a wipe: balance, XP, contracts and listings are untouched and waiting") and in
+    the notice the mod draws for it ("nothing was deleted"). It was also unavoidable: the
+    exits a contractor has — give up, pay the fine — take the same money, and the only
+    action that would have saved them is the one the suspension blocks.
+
+    So the clock stops instead. `clock_paused_at` is stamped the first time a sweep sees
+    the contractor suspended, and the elapsed time is added back to the deadline when a
+    later sweep sees them free. Driven entirely from the sweeps, so it needs no hook on
+    the unsuspend path and self-corrects if one is ever missed — including for a
+    suspension that expired on its own clock, which nothing announces.
+
+    Reads FAIL OPEN, exactly as `data/suspensions.py` does: a Firestore blip must not
+    freeze every deadline in the system. The cost of failing open is the pre-existing
+    behaviour for one sweep pass.
+
+    Returns True when the caller must do nothing this pass.
+    """
+    from data import suspensions as susp
+    try:
+        active = susp.get_active(str(c.get("contractor_id") or ""))
+    except Exception as exc:  # noqa: BLE001 - fail open, see docstring
+        log.warning("Contract %s: could not read suspension state (%s); clock unchanged",
+                    contract_id, exc)
+        return False
+
+    paused_at = (c.get("clock_paused_at") or "").strip()
+
+    if active:
+        if not paused_at:
+            now = datetime.utcnow().isoformat()
+            cdb.update_contract(gid, contract_id, clock_paused_at=now)
+            c["clock_paused_at"] = now
+            log.info("Contract %s: contractor is suspended; deadline clock paused.",
+                     contract_id)
+        return True
+
+    if not paused_at:
+        return False
+
+    # Suspension over. Give back exactly the time it took, then let the NEXT sweep judge
+    # the extended deadline — resuming and fining in the same pass would hand back the
+    # days and immediately spend them.
+    try:
+        paused_for = datetime.utcnow() - datetime.fromisoformat(paused_at)
+    except (ValueError, TypeError):
+        paused_for = timedelta(0)
+    days = max(0, paused_for.days)
+    fields: dict = {"clock_paused_at": None}
+
+    due = (c.get("due_date") or "").strip()
+    if days and due:
+        try:
+            fields["due_date"] = (datetime.strptime(due, "%Y-%m-%d")
+                                  + timedelta(days=days)).strftime("%Y-%m-%d")
+        except (ValueError, TypeError):
+            pass
+    stamp = (c.get("disputed_at") or "").strip()
+    if stamp:
+        try:
+            fields["disputed_at"] = (datetime.fromisoformat(stamp) + paused_for).isoformat()
+        except (ValueError, TypeError):
+            pass
+
+    cdb.update_contract(gid, contract_id, **fields)
+    c.update({k: v for k, v in fields.items() if v is not None})
+    c["clock_paused_at"] = None
+    log.info("Contract %s: suspension over after %s; deadline clock resumed.",
+             contract_id, paused_for)
+    return True
+
+
+@serialized
+async def expire_mod_review(gid: int, contract_id: str) -> Result:
+    """Resolve a moderator review nobody answered in time.
+
+    MOD_REVIEW is entered by `dispute(action="sue")` and by the dispute grace path, and
+    until now nothing ever left it except a moderator pressing a button. Every other
+    transition is refused there, so the issuer's escrow and one of each party's ten
+    contract slots were locked indefinitely — the "a contractor who owes a fine wants
+    exactly nothing to happen" failure that DISPUTE_AUTO_FINE_DAYS was written to close,
+    reappearing one state later.
+
+    Resolves the same way an unanswered dispute does — the fine collects — because the
+    alternative direction is gameable: if suing and waiting ended with the fine
+    cancelled, suing would strictly dominate paying. See MOD_REVIEW_TIMEOUT_DAYS.
+
+    Called by a sweep, never by a player, so it takes no actor. Money moves only after
+    the terminal status is written, like every other transition here.
+    """
+    c, err = _load(gid, contract_id)
+    if err:
+        return err
+    if c.get("status") != cdb.MOD_REVIEW:
+        return _fail(BAD_STATE, "Contract is not in moderator review.", c)
+    if _clock_paused_by_suspension(gid, contract_id, c):
+        return _fail(BAD_STATE, "Contractor is suspended; review clock paused.", c)
+
+    deadline = mod_review_deadline(c)
+    if deadline is None:
+        # Entered MOD_REVIEW before the stamp existed. Start the clock rather than
+        # resolving instantly against time nobody was counting — the same choice
+        # `expire_dispute` makes for a dispute with no `disputed_at`.
+        now = datetime.utcnow().isoformat()
+        cdb.update_contract(gid, contract_id, mod_review_at=now)
+        c["mod_review_at"] = now
+        log.info("Contract %s had no mod_review_at; review clock started now.", contract_id)
+        return _fail(BAD_STATE, "Review clock started.", c)
+    if datetime.utcnow() < deadline:
+        return _fail(BAD_STATE, "Moderator review has not timed out yet.", c)
+
+    sym = settings.CURRENCY_SYMBOL
+    fine = c.get("fine", 0)
+    cdb.update_contract(gid, contract_id, status=cdb.COMPLETED,
+                        completed_at=datetime.utcnow().isoformat(),
+                        closed_by="mod_review_timeout")
+    c["status"] = cdb.COMPLETED
+    collected, owed = await _charge_fine(gid, c, str(c["contractor_id"]), fine)
+    await _pay_issuer(gid, c, refund=c.get("payment", 0), income=collected)
+
+    _notify(gid, str(c["contractor_id"]), "review_result", "⚖️ Review Timed Out",
+            f"\"{c['mission'][:80]}\" waited "
+            f"{settings.MOD_REVIEW_TIMEOUT_DAYS} days for a moderator decision and none "
+            f"came, so it closed on the agreed terms. -{collected} {sym}."
+            + (f" {owed} {sym} is owed and comes out of your later earnings."
+               if owed else ""), contract_id)
+    if not _is_bot_issued(c):
+        _notify(gid, str(c["issuer_id"]), "review_result", "⚖️ Review Timed Out",
+                f"\"{c['mission'][:80]}\" waited "
+                f"{settings.MOD_REVIEW_TIMEOUT_DAYS} days for a moderator decision and "
+                f"none came, so it closed on the agreed terms. "
+                f"+{collected + c.get('payment', 0)} {sym}.", contract_id)
+
+    await restore_rescue(gid, contract_id, c)
+    log.info("Contract %s: moderator review timed out, collected %d of %d fine (%d owed)",
+             contract_id, collected, fine, owed)
+    return Result(ok=True, message=f"Review timed out. Fine collected ({collected}).",
+                  contract=c, data={"fine_collected": collected, "fine_owed": owed})
+
+
 @serialized
 async def expire_overdue(gid: int, contract_id: str) -> Result:
     """Push an ACTIVE contract past its due date into dispute.
@@ -1047,6 +1478,8 @@ async def expire_overdue(gid: int, contract_id: str) -> Result:
         return err
     if c.get("status") != cdb.ACTIVE:
         return _fail(BAD_STATE, "Contract is not active.", c)
+    if _clock_paused_by_suspension(gid, contract_id, c):
+        return _fail(BAD_STATE, "Contractor is suspended; deadline clock paused.", c)
 
     due = (c.get("due_date") or "").strip()
     try:
@@ -1070,8 +1503,8 @@ async def expire_overdue(gid: int, contract_id: str) -> Result:
 
     _notify(gid, str(c["contractor_id"]), "review_result", "⌛ Deadline Passed",
             f"\"{c['mission'][:80]}\" was due {due} and has not been submitted, so it "
-            f"has gone to dispute. Settle, ask for more time, pay the fine or sue — "
-            f"left alone, the fine collects itself in "
+            f"has gone to dispute. Settle, ask for more time, pay the fine or sue. "
+            f"Left alone, the fine collects itself in "
             f"{settings.DISPUTE_AUTO_FINE_DAYS} days.", contract_id)
     if not _is_bot_issued(c):
         _notify(gid, str(c["issuer_id"]), "review_result", "⌛ Deadline Passed",
@@ -1118,11 +1551,24 @@ async def mod_resolve(gid: int, contract_id: str, *, actor_id: int, actor_name: 
     # issuer is never credited coins that were never debited. The shortfall is billed
     # rather than dropped — a moderator enforcing a fine has decided it is owed, which
     # is precisely the case debt exists for.
+    # Status FIRST, money second. Every mutator on `store` edits the in-process dict
+    # and sets a dirty flag; the only thing here that can raise is the Firestore status
+    # write. Charging before writing therefore leaves the one state that must never
+    # exist: money moved, contract still non-terminal. It is still counted by
+    # `_ESCROW_STATUSES`, so the escrow reads as held after being paid out — and
+    # `review(approve=True)` accepts DISPUTED, which would pay the contractor a
+    # `payment` that is no longer there. Worse, both sweepers RETRY (30 min for
+    # disputes, 30 s for auctions), so the next pass charges the fine and refunds the
+    # escrow a second time. This order fails the other way: an unpaid closed contract,
+    # which is visible, recoverable and does not duplicate. It is what `cancel`,
+    # `settle_response`, `mod_resolve(cancel)`, `mod_reset` and `_auto_accept_contract`
+    # already do.
+    cdb.update_contract(gid, contract_id, status=cdb.COMPLETED,
+                        completed_at=datetime.utcnow().isoformat(),
+                        closed_by="mod_enforce")
+    c["status"] = cdb.COMPLETED
     collected, owed = await _charge_fine(gid, c, str(c["contractor_id"]), c.get("fine", 0))
     await _pay_issuer(gid, c, refund=payment, income=collected)
-    cdb.update_contract(gid, contract_id, status=cdb.COMPLETED,
-                        completed_at=datetime.utcnow().isoformat())
-    c["status"] = cdb.COMPLETED
     _notify(gid, str(c["contractor_id"]), "review_result", "⚖️ Fine Enforced",
             f"Moderators enforced the fine for \"{c['mission'][:80]}\". "
             f"-{collected} {settings.CURRENCY_SYMBOL}."
@@ -1177,6 +1623,59 @@ async def mod_review_submission(gid: int, contract_id: str, *, actor_id: int,
 
 
 # ── Date helpers ─────────────────────────────────────────────────────────────
+
+MOD_RESET_STATUSES = frozenset({cdb.PENDING, cdb.ACTIVE, cdb.SUBMITTED, cdb.DISPUTED,
+                                cdb.MOD_REVIEW})
+
+
+@serialized
+async def mod_reset(gid: int, contract_id: str, *, actor_name: str) -> Result:
+    """One step of a moderator's `/contractreset`: cancel this contract if it is
+    still unfinished, refunding the issuer's escrow.
+
+    The command used to do this itself from a snapshot it took in a thread, and
+    wrote CANCELLED plus the refund without ever taking `contract_lock`. A `review`
+    (or the AI auto-accept, or the player's own `cancel`) landing while that
+    snapshot was out paid the contractor, and the reset then overwrote COMPLETED
+    with CANCELLED and refunded the issuer the same escrow — one escrow, two
+    payouts. So each contract is now re-read here, under the same lock every other
+    transition holds, and the status is re-checked *after* the read: a contract that
+    closed in the meantime is reported as skipped, not reset.
+
+    This deliberately cancels statuses `cancel` refuses (submitted, disputed,
+    mod_review) — it is a moderator's bulk clean-up, not a party backing out — and
+    charges no fine, since a reset is not anyone conceding. `data["refunded"]` is
+    what went back to the issuer, for the command's tally.
+    """
+    c, err = _load(gid, contract_id)
+    if err:
+        return err
+    if c.get("status") not in MOD_RESET_STATUSES:
+        return _fail(BAD_STATE, f"Contract is already {c.get('status')}.", c)
+
+    cdb.update_contract(gid, contract_id, status=cdb.CANCELLED, pending_request=None,
+                        closed_by="mod_reset")
+    c["status"] = cdb.CANCELLED
+    _clear_request(c)
+
+    refunded = int(c.get("payment", 0) or 0) if not _is_bot_issued(c) else 0
+    await _pay_issuer(gid, c, refund=refunded)
+
+    for party in (c.get("issuer_id"), c.get("contractor_id")):
+        if party and str(party) != str(_api()._get_bot_user_id()):
+            _notify(gid, str(party), "contract_cancelled", "🚫 Contract Reset",
+                    f"A moderator cancelled \"{c['mission'][:80]}\"."
+                    + (" The escrow was refunded to the issuer." if refunded else ""),
+                    contract_id)
+
+    # A rescue's wreck was deleted from the issuer's save when the contract was
+    # created. Cancelling without this leaves their ship gone for good.
+    await restore_rescue(gid, contract_id, c)
+    log.info("Contract %s reset by moderator %s (escrow %d refunded)",
+             contract_id, actor_name, refunded)
+    return Result(ok=True, message="Contract cancelled.", contract=c,
+                  data={"refunded": refunded})
+
 
 def _valid_future_date(s: str) -> bool:
     """YYYY-MM-DD and strictly after today. The classic Discord modal already checked
@@ -1256,10 +1755,26 @@ async def deliver_to_player(gid: int, user_id: int, *, content: str | None = Non
             if channel is None:
                 channel = await bot.fetch_channel(ch_id)
             import discord
-            # None, not AllowedMentions(users=True): `send` reads None as "use the
-            # client default", so the ping-on path is byte-for-byte what this call
-            # did before the preference existed.
-            allowed = (None if store.corp_pings_enabled(gid, did)
+            # Ping the recipient and NOBODY else.
+            #
+            # This used to pass None when pings were on, which `send` reads as "use
+            # the client default" — and the client sets none, so Discord parsed
+            # every mention in the content. `content` is player-written text at one
+            # call site (the auction "winner refused" notice interpolates the
+            # auction's `mission`), which made `@everyone` in a mission notify the
+            # corp channel's members and the mod role, from the official bot.
+            #
+            # `users=[recipient]` keeps the intended behaviour — the mention that
+            # is the whole point of the message still pings — while making the
+            # content itself inert. Falls back to the plain mention-only form if
+            # the user object cannot be built.
+            try:
+                _target = discord.Object(id=int(did))
+                _ping = discord.AllowedMentions(everyone=False, roles=False,
+                                                users=[_target])
+            except Exception:
+                _ping = discord.AllowedMentions.none()
+            allowed = (_ping if store.corp_pings_enabled(gid, did)
                        else discord.AllowedMentions.none())
             return await channel.send(content=f"{mention} {content}" if content else mention,
                                       embed=embed, view=view, allowed_mentions=allowed)
@@ -1362,11 +1877,20 @@ async def _escalate_to_mods(gid: int, contract_id: str, c: dict, *, opener_id: i
         # Why the submission was refused, so mods can judge whether the refusal was wrong.
         reason = c.get("review_reason")
         if reason:
-            e.add_field(name="Refusal Reason", value=str(reason)[:1024], inline=False)
+            # Escaped like every other free text in a moderator ticket: this is the
+            # one field the model returns verbatim, and an embed renders markdown —
+            # including masked links aimed at whoever holds the console. (`_embed`
+            # itself carries the mission text and both display names; it is shared
+            # with the player-facing views, so it is escaped at its own source.)
+            e.add_field(name="Refusal Reason",
+                        value=discord.utils.escape_markdown(str(reason))[:1024],
+                        inline=False)
         files = c.get("submitted_files", [])
         if files:
             e.add_field(name="📁 Submitted Files",
-                        value="\n".join(f"📎 [{f['filename']}]({f['url']})" for f in files),
+                        # cdb.file_link escapes and caps the name: it is the client's
+                        # string, and this field is a masked link in a moderator ticket.
+                        value="\n".join(cdb.file_link(f) for f in files)[:1024],
                         inline=False)
 
         if guild_config.get_channel_id(gid, "ticket_category"):

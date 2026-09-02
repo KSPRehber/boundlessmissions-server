@@ -49,11 +49,20 @@ class _Col:
     def document(self, doc_id): return _Doc(f"{self._name}/{doc_id}")
 
 
+class _Txn:
+    def set(self, ref, payload, merge=False): ref.set(payload, merge=merge)
+    def delete(self, ref): ref.delete()
+
+
 class _DB:
     def collection(self, name): return _Col(name)
+    def transaction(self): return _Txn()
 
 
 twofa._db = _DB()
+# The real decorator wraps a function expecting a transaction; ours just calls
+# it — single-threaded here, so there is nothing to serialise.
+twofa.firestore = type("_FS", (), {"transactional": staticmethod(lambda fn: fn)})()
 
 FAILED = []
 

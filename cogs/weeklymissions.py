@@ -6,6 +6,7 @@ Players select via buttons → contract created in their corp channel.
 AI reviews submissions. Resets every Monday 00:00 GMT+3.
 """
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -38,7 +39,7 @@ SUBMIT_IN_KSP = (
 
 S.update({
     "wm.title":        {"en": "📋 Weekly Missions"},
-    "wm.week":         {"en": "Week {n} ({start} – {end})"},
+    "wm.week":         {"en": "Week {n} ({start} to {end})"},
     "wm.locked":       {"en": "🔒 Mission selection is locked."},
     "wm.no_corp":      {"en": "❌ You need a corporation first! Use `/g corpsetup`."},
     "wm.already":      {"en": "❌ You already selected this mission."},
@@ -49,6 +50,9 @@ S.update({
     "wm.extreme":      {"en": "⚫ Extreme"},
     "wm.closes":       {"en": "⏰ Selection closes"},
     "wm.contract_title": {"en": "📋 Weekly Mission #{n}"},
+    "wm.account_unavailable": {"en": "⚠️ Couldn't look your account up just now. Try again in a moment."},
+    "wm.starting_up":  {"en": "⏳ The bot is still starting up. Try again in a moment."},
+    "wm.custom_accepted": {"en": "✅ Custom mission accepted! Contract posted to {channel}."},
 })
 
 
@@ -141,8 +145,60 @@ def _load_missions(guild_id: int, week_key: str) -> tuple[list[dict], int | None
 
 
 def _selection_ref(guild_id: int, week_key: str, user_id: int, mission_id: int):
+    """The claim on one (week, player, mission).
+
+    Top-level and **guild-independent**, the same move the wallet made to
+    `users/{user_id}`, and for the same reason: what this claim protects is the
+    payout, and the payout is global. It used to live under
+    `guilds/{guild_id}/weekly_selections`, while `_generate_missions` seeds mission
+    ids 1..20 from the week alone — so the same mission existed in every guild and
+    a player in two of them held two different claim documents for it. Both
+    succeeded, both minted a bot-issued contract, and the weekly coins and XP paid
+    twice (N guilds, N times) into one wallet. `guild_id` is kept as a field,
+    because where the mission was selected is still worth knowing.
+    """
     doc_id = f"{week_key}_{user_id}_{mission_id}"
-    return _db.collection("guilds").document(str(guild_id)).collection("weekly_selections").document(doc_id)
+    return _db.collection("weekly_selections").document(doc_id)
+
+
+def migrate_guild_selections() -> int:
+    """Copy this week's per-guild selection claims to the top-level collection.
+
+    `_selection_ref` moved from `guilds/{gid}/weekly_selections` to a top-level
+    collection so the claim is guild-independent — the wallet it protects always was
+    (see the docstring there). Without this, every claim already made in the current
+    week is orphaned on deploy: `_has_selected` reads the new path, finds nothing,
+    and every player can select each mission a second time, minting a second
+    bot-issued contract that pays the weekly coins and XP again. That is the exact
+    double-pay the move exists to prevent, delivered once to the whole community
+    instead of only to players in two guilds.
+
+    Only the CURRENT week is copied: older claims can no longer be re-selected (the
+    week key is part of the document id), so moving them would be work for nothing.
+    Idempotent — the ids are identical by construction and `set()` is last-writer-wins
+    with the same content — so a second run, or a run after a partial one, is safe.
+    Returns the number of claims carried over.
+    """
+    wk = _week_key()
+    moved = 0
+    try:
+        for gdoc in _db.collection("guilds").stream():
+            col = gdoc.reference.collection("weekly_selections")
+            for doc in col.stream():
+                if not doc.id.startswith(wk + "_"):
+                    continue
+                data = doc.to_dict() or {}
+                data.setdefault("guild_id", gdoc.id)
+                _db.collection("weekly_selections").document(doc.id).set(data)
+                moved += 1
+    except Exception as exc:
+        # Best effort: a failure here means some players can re-select once this
+        # week, which is bad but not worth refusing to start the bot over.
+        log.error("Weekly-selection migration failed: %s", exc)
+    if moved:
+        log.warning("Weekly selections: carried %d claim(s) for week %s to the "
+                    "top-level collection.", moved, wk)
+    return moved
 
 
 def _has_selected(guild_id: int, week_key: str, user_id: int, mission_id: int) -> bool:
@@ -164,6 +220,7 @@ def _save_selection(guild_id: int, week_key: str, user_id: int, mission_id: int)
     try:
         _selection_ref(guild_id, week_key, user_id, mission_id).create({
             "user_id": str(user_id),
+            "guild_id": str(guild_id),
             "mission_id": mission_id,
             "selected_at": datetime.now(TZ).isoformat(),
             "status": "active",
@@ -171,6 +228,34 @@ def _save_selection(guild_id: int, week_key: str, user_id: int, mission_id: int)
     except AlreadyExists:
         return False
     return True
+
+
+def link_selection_contract(guild_id: int, week_key: str, user_id: int,
+                            mission_id: int, contract_id: str) -> None:
+    """Record which contract a claim minted.
+
+    The claim is the ONLY thing preventing a weekly mission being selected — and so
+    paid — twice; `_has_selected` is the sole gate, and a bot-issued contract has no
+    escrow behind it, so a second payout is a straight mint. That made
+    `/contractreset` dangerous: it deleted every claim the account held, including
+    the one for a mission already completed and PAID this week, and the loop directly
+    above it in the same command is careful to skip terminal contracts for exactly
+    this reason.
+
+    Nothing on the claim said which contract it belonged to, so the reset had no way
+    to be careful. This writes the link at the moment it is known. Claims created
+    before this field existed carry no `contract_id` and are deliberately treated as
+    un-resettable rather than as free to delete — see `contractreset`.
+
+    Best effort and non-fatal: the claim itself is already created, and failing to
+    annotate it must not undo a selection the player successfully made.
+    """
+    try:
+        _selection_ref(guild_id, week_key, user_id, mission_id).set(
+            {"contract_id": str(contract_id)}, merge=True)
+    except Exception as exc:  # noqa: BLE001 - annotation only; the claim still stands
+        log.warning("Could not link weekly selection %s/%s/%s to contract %s: %s",
+                    week_key, user_id, mission_id, contract_id, exc)
 
 
 def _release_selection(guild_id: int, week_key: str, user_id: int, mission_id: int) -> None:
@@ -258,7 +343,30 @@ class MissionSelectView(discord.ui.View):
 
 async def _handle_selection(interaction: discord.Interaction, week_key: str, guild_id: int, mission: dict):
     await interaction.response.defer(ephemeral=True)
-    uid = interaction.user.id
+    # The ACCOUNT id, not the raw snowflake. The claim, the wallet and the contract
+    # are all keyed on the account, and for a player who linked Discord onto a
+    # website account they already had, the two differ — so keying this surface on
+    # the snowflake minted a *second* claim document for a mission the API surface
+    # had already claimed, and paid the weekly coins and XP twice. Same correction
+    # /linkcode, /linkas and /deletemydata already carry.
+    from data import accounts as _accounts
+    uid = await asyncio.to_thread(_accounts.account_for_discord, interaction.user.id)
+    if not uid:
+        await interaction.followup.send(
+            t(guild_id, "wm.account_unavailable"), ephemeral=True)
+        return
+
+    # The issuer of a weekly mission is the bot itself, and every later stage
+    # (auto-review, the payout, the fine) recognises it by that id. Before the
+    # gateway hands us a user object there is no id to write, and a contract
+    # issued by nobody is unreviewable, unpayable and still fineable — so refuse
+    # rather than mint one. Structurally unreachable from a Discord interaction
+    # (which cannot arrive before READY); said here because the API twin,
+    # api_server.select_mission, IS reachable that early.
+    bot_user = interaction.client.user
+    if bot_user is None:
+        await interaction.followup.send(t(guild_id, "wm.starting_up"), ephemeral=True)
+        return
 
     # Locked?
     if _is_locked():
@@ -282,6 +390,17 @@ async def _handle_selection(interaction: discord.Interaction, week_key: str, gui
     # Already selected? The read is the friendly answer; the claim below is the gate.
     if _has_selected(guild_id, week_key, uid, mission["id"]):
         await interaction.followup.send(t(guild_id, "wm.already"), ephemeral=True)
+        return
+
+    # Selecting a weekly mission is one of the three ways to become the contractor
+    # of an ACTIVE contract, and contract_actions.contractor_gate is where that rule
+    # is stated. The mod's Select applies it; this button did not, which made the
+    # debt cap and the active-contract cap advisory for anyone with Discord open.
+    # Called on the loop, not in a thread: the gate reads `store`, which is only
+    # ever read on the loop (see cogs.auctions.bid_refusal, which says the same).
+    from contract_actions import contractor_gate
+    if refusal := contractor_gate(guild_id, uid):
+        await interaction.followup.send(refusal, ephemeral=True)
         return
 
     # Post contract in corp channel
@@ -313,7 +432,7 @@ async def _handle_selection(interaction: discord.Interaction, week_key: str, gui
     try:
         c = cdb.create_contract(
             guild_id=guild_id,
-            issuer_id=interaction.client.user.id,
+            issuer_id=bot_user.id,
             issuer_name="Boundless Missions",
             contractor_id=uid,
             contractor_name=interaction.user.display_name,
@@ -325,6 +444,8 @@ async def _handle_selection(interaction: discord.Interaction, week_key: str, gui
     except Exception:
         _release_selection(guild_id, week_key, uid, mission["id"])
         raise
+
+    link_selection_contract(guild_id, week_key, uid, mission["id"], c["contract_id"])
 
     # Build embed for corp channel
     embed = discord.Embed(
@@ -342,8 +463,32 @@ async def _handle_selection(interaction: discord.Interaction, week_key: str, gui
 
     from cogs.contract_views import ContractWorkView
     view = ContractWorkView(c["contract_id"], guild_id)
-    msg = await channel.send(embed=embed, view=view)
-    cdb.update_contract(guild_id, c["contract_id"], dm_message_id=str(msg.id), status=cdb.ACTIVE)
+    # The post and the activation are inside the rollback too.
+    #
+    # Moving the bot-id check above the claim fixed the claim being taken and handed
+    # back, but everything from here down still sat outside any `try`. A Discord
+    # failure at `channel.send` — a permission change, a 500, the channel deleted
+    # between the lookup and the post — left the week's claim held AND a bot-issued
+    # contract stranded in PENDING that nobody could see or act on, for the rest of
+    # the week, with the deferred interaction never answered.
+    #
+    # The contract is CANCELLED as well as the claim released: releasing alone would
+    # leave the player able to re-select while the first, invisible contract still
+    # counted against `contractor_gate`'s active-contract cap. Cancelled rather than
+    # deleted because that is the terminal state the rest of the system already
+    # understands, and it leaves the record behind to explain itself. No refund is
+    # involved — a weekly mission is bot-issued and escrows nothing.
+    try:
+        msg = await channel.send(embed=embed, view=view)
+        cdb.update_contract(guild_id, c["contract_id"], dm_message_id=str(msg.id), status=cdb.ACTIVE)
+    except Exception:
+        _release_selection(guild_id, week_key, uid, mission["id"])
+        try:
+            cdb.update_contract(guild_id, c["contract_id"], status=cdb.CANCELLED)
+        except Exception:         # pragma: no cover - best effort; the claim is the thing
+            log.exception("Could not stand down the stranded weekly contract %s",
+                          c["contract_id"])
+        raise
 
     await interaction.followup.send(
         t(guild_id, "wm.accepted", n=mission["id"], channel=channel.mention),
@@ -362,7 +507,27 @@ class CustomMissionAcceptView(discord.ui.View):
     async def accept_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
         guild_id = interaction.guild_id
-        uid = interaction.user.id
+
+        # The ACCOUNT id, not the raw snowflake — the same correction
+        # `_handle_selection` above carries, and for the same reason: the claim,
+        # the wallet and the contract are all keyed on the account, and for a
+        # player who linked Discord onto a website account they already had the
+        # two differ. Keyed on the snowflake, the contract is written against an
+        # id the mod is not authenticated as, so it can never be submitted — it
+        # goes overdue into dispute and fines a wallet the game never reads.
+        from data import accounts as _accounts
+        uid = await asyncio.to_thread(_accounts.account_for_discord, interaction.user.id)
+        if not uid:
+            await interaction.followup.send(
+                t(guild_id, "wm.account_unavailable"), ephemeral=True)
+            return
+
+        # See `_handle_selection`: a bot-issued contract with no issuer id is
+        # unreviewable, unpayable and still fineable.
+        bot_user = interaction.client.user
+        if bot_user is None:
+            await interaction.followup.send(t(guild_id, "wm.starting_up"), ephemeral=True)
+            return
 
         corp = _get_corp(guild_id, uid)
         if not corp:
@@ -382,10 +547,18 @@ class CustomMissionAcceptView(discord.ui.View):
             return
             
         msg_id = interaction.message.id
+        # The read is the friendly answer; the claim below is the gate.
         if _has_selected(guild_id, "custom", uid, msg_id):
             await interaction.followup.send(t(guild_id, "wm.already"), ephemeral=True)
             return
-        
+
+        # Same gate the weekly button and the mod's Select apply: see
+        # contract_actions.contractor_gate. On the loop, because it reads `store`.
+        from contract_actions import contractor_gate
+        if refusal := contractor_gate(guild_id, uid):
+            await interaction.followup.send(refusal, ephemeral=True)
+            return
+
         corp_channel_id = int(corp["channel_id"])
         channel = interaction.client.get_channel(corp_channel_id)
         if not channel:
@@ -394,39 +567,55 @@ class CustomMissionAcceptView(discord.ui.View):
             except Exception:
                 await interaction.followup.send("❌ Corp channel not found.", ephemeral=True)
                 return
+
+        # Claim the selection BEFORE creating the contract — the weekly path above
+        # does the same and says why: everything up to here awaited Discord, and two
+        # presses of the button that both passed `_has_selected` would otherwise each
+        # create a paying, bot-issued contract for one mission. Written after the
+        # fact (as this used to be) the claim is a note, not a gate.
+        if _save_selection(guild_id, "custom", uid, msg_id) is False:
+            await interaction.followup.send(t(guild_id, "wm.already"), ephemeral=True)
+            return
         
+        # Everything from here to the created contract is inside the claim, so any
+        # failure hands it back — otherwise a mission nobody holds is one nobody
+        # can ever take.
         import re
-        coins = 0
-        fine = 0
-        xp = 0
-        for field in embed.fields:
-            if "💰" in field.name:
-                m = re.search(r'\+(\d+)', field.value)
-                if m: coins = int(m.group(1))
-            elif "XP" in field.name:
-                m = re.search(r'\+(\d+)', field.value)
-                if m: xp = int(m.group(1))
-            elif "Fine" in field.name:
-                m = re.search(r'(\d+)', field.value)
-                if m: fine = int(m.group(1))
-                
-        desc = embed.description
-        
-        now = datetime.now(TZ)
-        due = (now + timedelta(days=duration_days)).strftime("%Y-%m-%d")
-        
         from data import contracts as cdb
-        c = cdb.create_contract(
-            guild_id=guild_id,
-            issuer_id=interaction.client.user.id,
-            issuer_name="Boundless Missions",
-            contractor_id=uid,
-            contractor_name=interaction.user.display_name,
-            mission=desc,
-            payment=coins,
-            fine=fine,
-            due_date=due,
-        )
+        try:
+            coins = 0
+            fine = 0
+            xp = 0
+            for field in embed.fields:
+                if "💰" in field.name:
+                    m = re.search(r'\+(\d+)', field.value)
+                    if m: coins = int(m.group(1))
+                elif "XP" in field.name:
+                    m = re.search(r'\+(\d+)', field.value)
+                    if m: xp = int(m.group(1))
+                elif "Fine" in field.name:
+                    m = re.search(r'(\d+)', field.value)
+                    if m: fine = int(m.group(1))
+
+            desc = embed.description
+
+            now = datetime.now(TZ)
+            due = (now + timedelta(days=duration_days)).strftime("%Y-%m-%d")
+
+            c = cdb.create_contract(
+                guild_id=guild_id,
+                issuer_id=bot_user.id,
+                issuer_name="Boundless Missions",
+                contractor_id=uid,
+                contractor_name=interaction.user.display_name,
+                mission=desc,
+                payment=coins,
+                fine=fine,
+                due_date=due,
+            )
+        except Exception:
+            _release_selection(guild_id, "custom", uid, msg_id)
+            raise
         
         sym = settings.CURRENCY_SYMBOL
         c_embed = discord.Embed(
@@ -443,12 +632,15 @@ class CustomMissionAcceptView(discord.ui.View):
 
         from cogs.contract_views import ContractWorkView
         view = ContractWorkView(c["contract_id"], guild_id)
+        # The claim is deliberately NOT released if the send below fails: the
+        # contract already exists and the player can accept it from the mod, so
+        # handing the claim back would let them mint a second one for the same
+        # mission — the very thing claiming first prevents.
         msg = await channel.send(embed=c_embed, view=view)
         cdb.update_contract(guild_id, c["contract_id"], dm_message_id=str(msg.id), status=cdb.ACTIVE)
-        
-        _save_selection(guild_id, "custom", uid, msg_id)
-        
-        await interaction.followup.send(f"✅ Custom mission accepted! Contract posted to {channel.mention}.", ephemeral=True)
+
+        await interaction.followup.send(
+            t(guild_id, "wm.custom_accepted", channel=channel.mention), ephemeral=True)
 
 
 # ── Cog ──────────────────────────────────────────────────────────────────────
@@ -463,6 +655,9 @@ class WeeklyMissions(commands.Cog, name="WeeklyMissions"):
         self._ensured: dict[int, str] = {}
 
     async def cog_load(self):
+        # One-shot, idempotent: carry this week's claims over from the per-guild
+        # collection the claim used to live in. See migrate_guild_selections.
+        await asyncio.to_thread(migrate_guild_selections)
         self.refresh_loop.start()
         self.bot.add_view(CustomMissionAcceptView())
 
@@ -554,10 +749,13 @@ class WeeklyMissions(commands.Cog, name="WeeklyMissions"):
         duration_days="Days to complete the contract once accepted"
     )
     async def add_custom_mission(
-        self, interaction: discord.Interaction, 
-        desc_en: str, desc_tr: str, 
-        xp: int, coins: int, fine: int, 
-        accept_hours: int, duration_days: int
+        self, interaction: discord.Interaction,
+        desc_en: str, desc_tr: str,
+        xp: app_commands.Range[int, 0, 100_000],
+        coins: app_commands.Range[int, 0, 10_000_000],
+        fine: app_commands.Range[int, 0, 10_000_000],
+        accept_hours: app_commands.Range[int, 1, 8760],
+        duration_days: app_commands.Range[int, 1, 365],
     ):
         from cogs.perms import real_user
         ru = real_user(interaction)   # mimic-safe: gate on the real invoker
@@ -565,6 +763,22 @@ class WeeklyMissions(commands.Cog, name="WeeklyMissions"):
             if not (ru.guild_permissions.kick_members or ru.guild_permissions.administrator):
                 await interaction.response.send_message("❌ Mod only.", ephemeral=True)
                 return
+
+        # The same fine cap every other contract-creation path enforces.
+        #
+        # This was the one route into an ACTIVE contract that applied none of them:
+        # the fields were bare `int`s with no range, no floor and no cross-check, and
+        # the accept handler calls `cdb.create_contract` directly. So a moderator
+        # could post a card that looked exactly like the weekly board offering
+        # `coins:1, fine:500000` — and since an unpayable fine is no longer forgiven
+        # but recorded as a garnished debt, accepting it followed the player
+        # permanently and, past DEBT_MAX_OUTSTANDING, stopped them taking any
+        # contract at all. `duration_days:0` additionally produced a due date at or
+        # before today, so the daily sweep pushed it straight into dispute.
+        from api_server import _fine_too_large
+        if bad := _fine_too_large(coins, fine):
+            await interaction.response.send_message(f"❌ {bad}", ephemeral=True)
+            return
         
         embed = discord.Embed(
             title="🎯 Custom Mission / Özel Görev",

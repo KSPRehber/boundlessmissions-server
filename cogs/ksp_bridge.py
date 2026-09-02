@@ -20,7 +20,7 @@ from api_auth import (
     get_linked_guild, logout_all_devices,
 )
 from data.store import store, _db
-from data import guild_config
+from data import accounts, guild_config, twofa
 from i18n import S, tp
 
 log = logging.getLogger(__name__)
@@ -30,6 +30,7 @@ S.update({
     "ksp.linkcode.title":  {"en": "🎮 KSP Link Code"},
     "ksp.linkcode.desc":   {"en": "Enter this code in KSP:\n\n# `{code}`\n\n⏰ Expires in 3 minutes."},
     "ksp.linkcode.footer": {"en": "Boundless Missions KSP Mod"},
+    "ksp.linkcode.unavailable": {"en": "⚠️ Couldn't reach the account service to work out which account is yours. No code was issued. Try again in a moment."},
     "ksp.linked.title":    {"en": "✅ KSP Linked"},
     "ksp.linked.desc":     {"en": "Your KSP account has been linked successfully!"},
 })
@@ -116,8 +117,12 @@ async def _post_device_base_ticket(client: discord.Client, data: dict, challenge
     next checks in (see api_server.device_report) — posted into this same ticket.
 
     Falls back to CONTRACT_MOD_CHANNEL_ID if the ticket system is unconfigured."""
+    # The username is the player's own string and this embed lands in a moderator
+    # ticket, where a masked link is aimed at whoever holds the console. The device
+    # id and IP sit in code spans, which markdown does not render.
     desc = (
-        f"**User:** {data.get('username')} (`{data.get('user_id')}`)\n"
+        f"**User:** {discord.utils.escape_markdown(str(data.get('username') or ''))} "
+        f"(`{data.get('user_id')}`)\n"
         f"**Unrecognized device:** `{data.get('device_id')}`\n"
         f"**IP:** `{data.get('client_ip') or 'unknown'}`\n\n"
         "The user reports this device isn't theirs. Awaiting the client's "
@@ -256,19 +261,158 @@ class DeviceApprovalView(View):
 
 # ── Data deletion (user "delete my data") ─────────────────────────────────────
 
-def _delete_part_catalog(gid: int, uid: int):
+def _delete_avatar(uid: str) -> None:
+    """Drop the account's uploaded profile picture. The path is fixed by the
+    uploader (`avatars/{account_id}` in api_server), so this needs no lookup; a
+    player who never uploaded one simply has nothing to delete."""
     try:
-        _db.collection("guilds").document(str(gid)).collection(
-            "part_catalogs").document(str(uid)).delete()
+        from data.contracts import delete_stored_file
+        delete_stored_file(f"avatars/{uid}")
     except Exception as exc:
-        log.warning("Could not delete part catalog for %s/%s: %s", gid, uid, exc)
+        log.warning("Could not delete avatar for %s: %s", uid, exc)
+
+
+def _delete_part_catalogs_everywhere(uid: str) -> int:
+    """Drop this player's uploaded part catalog in EVERY guild, not just one.
+
+    The catalog is a full list of the mods installed on their machine, and the caller
+    used to pass the guild the slash command happened to be run in — so a player in two
+    servers deleted one copy and kept the other. Nothing about the catalog is
+    guild-specific; only its storage path is.
+    """
+    n = 0
+    try:
+        for gdoc in _db.collection("guilds").stream():
+            try:
+                ref = gdoc.reference.collection("part_catalogs").document(uid)
+                if ref.get().exists:
+                    ref.delete()
+                    n += 1
+            except Exception as exc:
+                log.warning("Could not delete part catalog for %s in %s: %s",
+                            uid, gdoc.id, exc)
+    except Exception as exc:
+        log.warning("Could not enumerate guilds for part-catalog purge of %s: %s", uid, exc)
+    return n
+
+
+def _delete_subcollection(ref, *, batch: int = 300) -> int:
+    """Delete every document under `ref`, in pages. Returns how many went."""
+    n = 0
+    while True:
+        docs = list(ref.limit(batch).stream())
+        if not docs:
+            return n
+        for d in docs:
+            d.reference.delete()
+            n += 1
+        if len(docs) < batch:
+            return n
+
+
+def _purge_player_records(uid: str) -> dict:
+    """Everything that is unambiguously THIS player's and has no counterparty.
+
+    The self-service and moderator delete paths had drifted in both directions — one
+    removed the avatar and a single guild's part catalog, the other removed neither —
+    so this is the one function both call, and the place to add anything new.
+
+    What is deliberately NOT here: contracts, auctions, marketplace listings, tickets,
+    reports and moderation records. Each has another party whose own history would be
+    falsified by removing it, which is what the confirmation message tells the player.
+    Their listings are DELISTED rather than deleted, so nothing new is sold on behalf
+    of an account that is gone while existing buyers keep their downloads.
+    """
+    out = {"achievements": False, "votes": False, "catalogs": 0,
+           "notifications": 0, "imports": 0, "corp": False, "listings_delisted": 0}
+
+    # Achievement progress and marketplace votes: one document each, keyed by the
+    # player, meaningful to nobody else. Both were unknown to every deletion path.
+    for coll, key in (("ksp_achievements", "achievements"), ("marketplace_votes", "votes")):
+        try:
+            ref = _db.collection(coll).document(uid)
+            if ref.get().exists:
+                ref.delete()
+                out[key] = True
+        except Exception as exc:
+            log.warning("Could not delete %s for %s: %s", coll, uid, exc)
+
+    out["catalogs"] = _delete_part_catalogs_everywhere(uid)
+
+    # The notification feed and the craft-import queue are per-guild subtrees. The feed
+    # is unbounded (reads cap at 50, the collection does not) and holds a readable
+    # history of who this player dealt with; the import queue holds pending deliveries.
+    try:
+        for gdoc in _db.collection("guilds").stream():
+            for coll, key in (("ksp_notifications", "notifications"),
+                              ("ksp_craft_imports", "imports")):
+                try:
+                    out[key] += _delete_subcollection(
+                        gdoc.reference.collection(coll).document(uid).collection("items"))
+                    gdoc.reference.collection(coll).document(uid).delete()
+                except Exception as exc:
+                    log.warning("Could not purge %s for %s in %s: %s", coll, uid, gdoc.id, exc)
+    except Exception as exc:
+        log.warning("Could not enumerate guilds for feed purge of %s: %s", uid, exc)
+
+    # The corporation record carries their display name and avatar and is served to
+    # every other player by the pickers, so it outlived them in other people's UI.
+    # The CHANNEL is left to the caller, which has a bot instance to delete it with.
+    try:
+        from cogs import corps as _corps
+        where = _corps.get_user_corp_global(int(uid)) if uid.isdigit() else None
+        if where:
+            _corps._delete_corp(int(where["guild_id"]), int(uid))
+            _corps._owner_ref(int(uid)).delete()
+            out["corp"] = True
+    except Exception as exc:
+        log.warning("Could not delete corp record for %s: %s", uid, exc)
+
+    # Listings are delisted, never deleted: the ToS distinguishes stopping further
+    # distribution from recalling copies already delivered, and a buyer's re-download
+    # must keep working.
+    try:
+        from data import marketplace as _mkt
+        for doc in _db.collection("marketplace").where("seller_id", "==", uid).stream():
+            if (doc.to_dict() or {}).get("status") == "active":
+                doc.reference.update({"status": "delisted"})
+                out["listings_delisted"] += 1
+    except Exception as exc:
+        log.warning("Could not delist listings for %s: %s", uid, exc)
+
+    return out
+
+
+def _purge_player(uid: str) -> None:
+    """The identity half of a deletion, run in a thread.
+
+    `store.delete_user` and `purge_ksp_user_data` erase the *player* — the wallet,
+    the XP, the session and the device bindings. They do not touch the **account**:
+    the record holding the email address, the display name, the avatar, the username
+    reservation, the friend graph, the crew hand-over ledger and the TOTP secret all
+    survived a self-service deletion that told the player everything was gone. The
+    moderator path (`api_server.admin_user_delete`) already did all of this and says
+    in its own comment that it leaves no more behind than this one does; that is now
+    true. Run AFTER the sessions are revoked, so there is no window where the account
+    record is gone but a live token still resolves to it.
+    """
+    _purge_player_records(uid)         # achievements, votes, catalogs, feeds, corp, listings
+    accounts.delete_account(uid)       # account doc, username, indexes, friends, crew ledger,
+                                       # and the Firebase Authentication user (the email)
+    twofa.purge(uid)                   # the second factor is part of the identity
+    _delete_avatar(uid)                # the one item that lives in Storage, not Firestore
 
 
 class DeleteDataModal(discord.ui.Modal):
     """Confirmation gate: the user must type their exact Discord username before
-    any data is erased, so deletion can never happen on a single misclick."""
+    any data is erased, so deletion can never happen on a single misclick.
 
-    def __init__(self, gid: int, uid: int, expected_names: list[str], primary_name: str):
+    `uid` is an ACCOUNT id (a snowflake for most players, `a_…` for one who linked
+    Discord onto a website account), resolved by the caller — never a raw snowflake,
+    or this deletes an empty record and reports success.
+    """
+
+    def __init__(self, gid: int, uid: str, expected_names: list[str], primary_name: str):
         super().__init__(title="⚠️ Delete My Data")
         self.gid = gid
         self.uid = uid
@@ -295,7 +439,9 @@ class DeleteDataModal(discord.ui.Modal):
         try:
             await store.delete_user(self.gid, self.uid)
             await asyncio.to_thread(purge_ksp_user_data, str(self.uid))
-            await asyncio.to_thread(_delete_part_catalog, self.gid, self.uid)
+            # `_purge_player` now covers the part catalog in EVERY guild, so the
+            # single-guild call that used to live here is gone rather than duplicated.
+            await asyncio.to_thread(_purge_player, str(self.uid))
         except Exception as exc:
             log.error("delete-my-data failed for %s/%s: %s", self.gid, self.uid, exc)
             await interaction.followup.send(
@@ -307,12 +453,20 @@ class DeleteDataModal(discord.ui.Modal):
 
         await interaction.followup.send(
             "✅ **Your data has been deleted.**\n"
-            "Removed: your profile (XP, balance, levels, language preference), your "
-            "KSP session & device bindings, and your installed-parts catalog. Every "
-            "linked device has been logged out.\n\n"
-            "Records that involve other members (contracts, corporation membership, "
-            "marketplace listings) are kept for those members; ask a moderator if "
-            "you need those removed too.",
+            "Removed: your profile (XP, balance, levels, language preference); your "
+            "account record, including your email address, display name, username "
+            "and profile picture; your sign-in credential itself; two-factor "
+            "enrolment and recovery codes; your friend list (and your entry in other "
+            "players' lists); the crew hand-over ledger; your KSP session & device "
+            "bindings; your installed-parts catalog in every server; your achievement "
+            "progress and marketplace votes; your notification history and pending "
+            "craft deliveries; and your corporation record. Every linked device has "
+            "been logged out, and your marketplace listings have been delisted so "
+            "nothing new is sold.\n\n"
+            "Kept, because they are also somebody else's record: contracts and "
+            "auctions you were party to, support tickets, and craft files already "
+            "bought by other players — a buyer's download has to keep working. Ask a "
+            "moderator if you need any of those looked at.",
             ephemeral=True,
         )
         log.warning("User %s self-deleted their data in guild %s", self.uid, self.gid)
@@ -336,7 +490,16 @@ class KSPBridge(commands.Cog, name="KSPBridge"):
         from (see api_auth.get_linked_guild) — a ban in some unrelated server the
         bot also sits in must not log a player out of their own community."""
         def _revoke() -> bool:
-            uid = str(user.id)
+            # Resolve the snowflake to the ACCOUNT id first. For almost everyone
+            # those are the same string, but a player who linked Discord onto a
+            # website account they already had is keyed on `a_…` — and there the
+            # raw snowflake names a session document that does not exist, so
+            # get_linked_guild returned None, this returned early, and the ban
+            # revoked nothing at all. The player kept the marketplace, contracts
+            # and their wallet for the rest of the token's 30 days, which is
+            # exactly the window this hook exists to close. Same correction
+            # /linkcode and /linkas already had.
+            uid = accounts.account_for_discord(user.id) or str(user.id)
             if get_linked_guild(uid) != str(guild.id):
                 return False
             logout_all_devices(uid)
@@ -361,8 +524,23 @@ class KSPBridge(commands.Cog, name="KSPBridge"):
         uid = interaction.user.id
         username = interaction.user.display_name
 
+        # The code is minted for the ACCOUNT this Discord user signs in as, not
+        # for the snowflake. For almost everyone they are the same string; they
+        # differ for a player who linked Discord onto a website account that
+        # already had history (`accounts.join_accounts` keeps the web side and
+        # points `account_discord/{snowflake}` at it). A code minted on the
+        # snowflake there gave the game a token for an orphan wallet the account
+        # never reads, and a console suspension issued on the account id the
+        # Users tab shows did not cover that token. A failed index read is
+        # refused rather than guessed, for the reason `targets.resolve` gives.
+        account_id = await asyncio.to_thread(accounts.account_for_discord, uid)
+        if account_id is None:
+            await interaction.followup.send(
+                tp(gid, uid, "ksp.linkcode.unavailable"), ephemeral=True)
+            return
+
         # Run the blocking Firestore work off the event loop.
-        code = await asyncio.to_thread(generate_link_code, gid, uid, username)
+        code = await asyncio.to_thread(generate_link_code, gid, account_id, username)
 
         embed = discord.Embed(
             title=tp(gid, uid, "ksp.linkcode.title"),
@@ -394,7 +572,7 @@ class KSPBridge(commands.Cog, name="KSPBridge"):
                 "**Moderation report:** only if *you* file one, it collects that "
                 "device's IP and KSP.log for moderators.\n\n"
                 "**Your controls:**\n"
-                "• Delete everything → **`deletemydata`**\n"
+                "• Delete your profile and account → **`deletemydata`**\n"
                 "• Log out every device → in-game logout"
             ),
         )
@@ -405,7 +583,7 @@ class KSPBridge(commands.Cog, name="KSPBridge"):
         await interaction.response.send_message(embed=e, ephemeral=True)
 
     @app_commands.command(name="deletemydata",
-                          description="Permanently delete all your Boundless Missions data")
+                          description="Permanently delete your profile, account and sign-in")
     async def deletemydata(self, interaction: discord.Interaction):
         """Open a confirmation modal, then erase the user's data."""
         if interaction.guild_id is None:
@@ -413,9 +591,21 @@ class KSPBridge(commands.Cog, name="KSPBridge"):
                 "Please run this in the server, not in DMs.", ephemeral=True)
             return
         u = interaction.user
+        # The data to erase hangs off the ACCOUNT id, which is the snowflake for
+        # almost everybody but `a_…` for a player who linked Discord onto a website
+        # account they already had. Deleting by snowflake there removed an empty
+        # record and reported success while the real wallet, the real session and
+        # every live token survived — a deletion request that deletes nothing is
+        # worse than one that fails, because nobody comes back to check.
+        account_id = await asyncio.to_thread(accounts.account_for_discord, u.id)
+        if not account_id:
+            await interaction.response.send_message(
+                "❌ I couldn't look your account up just now, so **nothing was "
+                "deleted**. Please try again in a moment.", ephemeral=True)
+            return
         # Accept any of the user's visible names (handle / global name / nick).
         names = [u.name, getattr(u, "global_name", None), u.display_name]
-        modal = DeleteDataModal(interaction.guild_id, u.id, names, u.name)
+        modal = DeleteDataModal(interaction.guild_id, account_id, names, u.name)
         await interaction.response.send_modal(modal)
 
 

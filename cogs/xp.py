@@ -14,7 +14,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 import settings
-from cogs import targets
+from cogs import perms, targets
 from data.store import store, xp_for_level
 from data import guild_config
 from i18n import t, tp, load_all_langs
@@ -45,6 +45,17 @@ class XP(commands.Cog, name="XP"):
     # ── Background: auto-save ────────────────────────────────────────────────
     @tasks.loop(seconds=settings.AUTO_SAVE_INTERVAL)
     async def auto_save(self) -> None:
+        # Re-read the wallet first if a budget freeze was the only thing that
+        # stopped it loading at boot. This loop is the heartbeat that already
+        # exists, and without a retry the read-only state outlives its cause: the
+        # guard resets itself on the UTC month rollover, so the bot would go on
+        # refusing every write long after the freeze was gone, with nobody in the
+        # loop to notice. A no-op unless `budget_blocked` and the guard has
+        # actually dropped below FROZEN.
+        try:
+            await store.ensure_loaded()
+        except Exception as exc:                    # never let this kill the loop
+            log.warning("Wallet reload attempt failed: %s", exc)
         await store.save_if_dirty()
 
     # ── Background: scan all members ─────────────────────────────────────────
@@ -210,6 +221,12 @@ class XP(commands.Cog, name="XP"):
             tgt = await targets.resolve(interaction, member, username)
         except targets.TargetError as err:
             await targets.reject(interaction, err)
+            return
+        # Guild-local authority, global records: refuse a target this
+        # moderator's server does not cover. See `perms.moderatable_here`.
+        _no = perms.moderatable_here(interaction, tgt)
+        if _no:
+            await interaction.edit_original_response(content=_no)
             return
         await store.set_xp(gid, tgt.account_id, amount)
         user = store.get_user(gid, tgt.account_id)

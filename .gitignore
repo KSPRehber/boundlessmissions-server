@@ -1,8 +1,14 @@
 # Git version control
 .git/
 
-# Environment secrets – NEVER commit these
+# Environment secrets – NEVER commit these.
+# `.env.*` as well as `.env`: a literal `.env` did not cover the hand-made backups
+# that accumulate next to it (`.env.bak-precheatflag` was a full copy of the live
+# file, untracked by luck rather than by rule). The example is re-included after,
+# since it is the one variant that must be committed.
 .env
+.env.*
+!.env.example
 firebase-key.json
 *-adminsdk-*.json
 *.json.key

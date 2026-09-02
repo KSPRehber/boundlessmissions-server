@@ -68,6 +68,10 @@ async def main():
 
     section("C. winner's active-contract cap")
     wallet("100", balance=0); wallet("200", balance=0)
+    # Sections A and B leave two of the winner's contracts behind (a PENDING offer
+    # and B's contract); the premise here is "exactly at the cap", so start clean.
+    for k in [k for k, c in DB.items() if c["contractor_id"] == "200"]:
+        DB.pop(k)
     for i in range(settings.MAX_ACTIVE_CONTRACTS_PER_USER):
         mk(f"full{i}", status=cdb.ACTIVE, issuer="100", contractor="200")
     auction("a3", "100", "200", start=50, bid=10, fine=0)

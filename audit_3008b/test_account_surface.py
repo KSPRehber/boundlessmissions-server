@@ -44,14 +44,16 @@ before = twofa.is_enabled(ACC)
 attacker = twofa.begin_enroll(ACC, "X")          # what /2fa/begin runs on the record
 mid = twofa.is_enabled(ACC)
 # attacker then confirms THEIR secret -> they own the victim's second factor
-ok, _, codes = twofa.confirm_enroll(ACC, twofa.totp_now(attacker["secret"]))
+ok = False
+if attacker is not None:                          # None = refused (the fix)
+    ok, _, codes = twofa.confirm_enroll(ACC, twofa.totp_now(attacker["secret"]))
 check("begin_enroll must NOT silently disable an already-enabled factor",
       before and mid, f"before={before} after_begin={mid} (record was overwritten with enabled=False)")
 check("a chosen secret must NOT become the account's factor without an existing code",
       not (ok and twofa.is_enabled(ACC)),
       "attacker's authenticator now gates the victim account, with fresh recovery codes")
 check("the /2fa/begin gate should fail CLOSED, but status() fails open to enabled=False",
-      "return True" not in between(src("data/twofa.py"), "def is_enabled", "def begin_enroll")
-      or "status" not in between(s, "async def web_2fa_begin", "\n@app."),
+      "twofa.status" not in between(s, "async def web_2fa_begin", "\n@app.")
+      and "twofa.is_enabled" in between(s, "async def web_2fa_begin", "\n@app."),
       "is_enabled fails closed; status() (what the gate reads) returns enabled=False on a read error")
 finish()

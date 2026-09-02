@@ -17,6 +17,8 @@ from __future__ import annotations
 import io
 import logging
 
+import settings
+
 log = logging.getLogger(__name__)
 
 # Stamp wording + look
@@ -67,7 +69,18 @@ def make_watermarked(image_bytes: bytes) -> bytes:
         return _placeholder()
 
     try:
-        base = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
+        # Open is lazy — it reads the header, not the pixels — so the size is known
+        # before anything is decoded. The convert below is where a decompression
+        # bomb goes off (a 13000×13000 PNG is ~1 MB on the wire and ~680 MB as
+        # RGBA), and the input is an attachment the contractor chose; refuse past
+        # the bot-wide ceiling rather than find out.
+        base = Image.open(io.BytesIO(image_bytes))
+        w, h = base.size
+        if w * h > settings.MAX_IMAGE_PIXELS:
+            log.warning("flag_preview: refusing %dx%d image (%d px > %d)",
+                        w, h, w * h, settings.MAX_IMAGE_PIXELS)
+            return _placeholder()
+        base = base.convert("RGBA")
     except Exception as exc:
         log.warning("flag_preview: could not open submitted image (%s)", exc)
         return _placeholder()

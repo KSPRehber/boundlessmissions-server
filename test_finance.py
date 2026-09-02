@@ -16,10 +16,20 @@ What is worth testing here is the part that cannot be read off a call site:
   • and the fact that garnishment writes **two** entries, one per side, since the
     creditor is not the party making the call and nothing else would explain the
     money arriving in their wallet.
+
+Plus `api_server._escrow_held`, which is not part of the ledger at all: an escrow
+that ends by paying the contractor is recorded on the *contractor's* ledger, so the
+issuer's own history cannot say how much of what they escrowed is still locked. It
+is derived from the contracts and the open auctions instead, and what is worth
+testing is exactly the set it counts.
 """
 
 import asyncio
+import os
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+os.environ.setdefault("DISCORD_TOKEN", "x")
 
 from data import store as store_mod
 from data.store import store
@@ -184,6 +194,64 @@ async def main():
           all(c in store_mod.TX_LABELS
               for c in (v for k, v in vars(store_mod).items()
                         if k.startswith("TX_") and isinstance(v, str))))
+
+    print("\nescrow is derived from the contracts, not from the ledger")
+    import api_server
+    from data import contracts as cdb
+
+    ISSUER = str(PAYER)
+    rows = [
+        # Counted: every status in which the payment has not been released yet.
+        {"issuer_id": ISSUER, "status": cdb.PENDING, "payment": 100},
+        {"issuer_id": ISSUER, "status": cdb.ACTIVE, "payment": 50},
+        {"issuer_id": ISSUER, "status": cdb.SUBMITTED, "payment": 25},
+        {"issuer_id": ISSUER, "status": cdb.DISPUTED, "payment": 10},
+        {"issuer_id": ISSUER, "status": cdb.MOD_REVIEW, "payment": 5},
+        # Not counted: settled either way, so the money has already moved.
+        {"issuer_id": ISSUER, "status": cdb.COMPLETED, "payment": 900},
+        {"issuer_id": ISSUER, "status": cdb.CANCELLED, "payment": 900},
+        # Not counted: they are the contractor here — nothing of theirs is held.
+        {"issuer_id": str(PAYEE), "contractor_id": ISSUER,
+         "status": cdb.ACTIVE, "payment": 700},
+    ]
+    auctions = [
+        {"issuer_id": ISSUER, "start_value": 40},
+        {"issuer_id": str(PAYEE), "start_value": 800},
+    ]
+
+    real_contracts, real_auctions = cdb.iter_user_contracts, api_server.aucdb.list_open
+    # `**_kw` because the caller now narrows the query itself (statuses=/limit=,
+    # added for UP21 so the escrow figure stops reading a whole contract history).
+    # The stub deliberately ignores the filter and returns every row, which keeps
+    # `_escrow_held`'s own status check under test rather than assuming the query
+    # did it — the two must agree, and only one of them is in this process.
+    cdb.iter_user_contracts = lambda gid, uid, **_kw: list(rows)
+    api_server.aucdb.list_open = lambda gid: list(auctions)
+    try:
+        total, n_contracts, n_auctions = api_server._escrow_held(0, ISSUER)
+        check("only unsettled contracts the player issued are counted",
+              (total, n_contracts, n_auctions) == (230, 5, 1),
+              f"{(total, n_contracts, n_auctions)}")
+
+        # An issuer id stored as an int (older documents) must still match the
+        # string the endpoint keys on, or the whole figure silently reads zero.
+        cdb.iter_user_contracts = lambda gid, uid, **_kw: [
+            {"issuer_id": PAYER, "status": cdb.ACTIVE, "payment": 60}]
+        api_server.aucdb.list_open = lambda gid: []
+        check("an int issuer id still matches",
+              api_server._escrow_held(0, ISSUER) == (60, 1, 0))
+
+        # One line on a summary card must never take the history tab down with it.
+        def boom(*_a, **_k):
+            raise RuntimeError("firestore is having a day")
+
+        cdb.iter_user_contracts = boom
+        api_server.aucdb.list_open = lambda gid: [{"issuer_id": ISSUER, "start_value": 7}]
+        check("a failing read reports zero rather than raising",
+              api_server._escrow_held(0, ISSUER) == (7, 0, 1))
+    finally:
+        cdb.iter_user_contracts = real_contracts
+        api_server.aucdb.list_open = real_auctions
 
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0

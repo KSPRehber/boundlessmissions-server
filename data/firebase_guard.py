@@ -140,8 +140,17 @@ class _GuardedRef:
         return f"_GuardedRef({self._obj!r})"
 
 
+# Storage operations billed as Class A that are not uploads. `make_public` is an
+# ACL write and `patch` a metadata write, and both were matching none of the
+# branches below: neither gated by `require_firebase` nor counted, so a public
+# upload — every one of which is `upload_from_string` followed immediately by
+# `make_public` (data/contracts.py, data/marketplace.py, data/imports.py) — was
+# two priced operations recorded as one free byte-write.
+_BLOB_CLASS_A = {"make_public", "patch", "compose", "rewrite", "update"}
+
+
 class _GuardedBlob:
-    """Proxy over a Storage Blob: gates + meters byte transfers."""
+    """Proxy over a Storage Blob: gates + meters byte transfers and operations."""
 
     __slots__ = ("_blob",)
 
@@ -155,16 +164,41 @@ class _GuardedBlob:
 
         def method(*args, **kwargs):
             uploading = name.startswith("upload")
-            if uploading or name.startswith("download") or name == "delete":
+            class_a = uploading or name in _BLOB_CLASS_A
+            if class_a or name.startswith("download") or name == "delete":
                 # Uploads are refused a rung early (DEGRADED); the rest only at
-                # the hard stop. See cost_guard.Level.
-                guard.require_firebase(upload=uploading)
+                # the hard stop. See cost_guard.Level. `make_public`/`patch` are
+                # gated as uploads because that is the only thing they are ever
+                # part of here — they always follow an upload that has already
+                # been through this gate, so at DEGRADED they are unreachable
+                # rather than newly refused.
+                guard.require_firebase(upload=class_a)
+            # The size of an object about to be deleted, but ONLY if we already
+            # hold it (a blob that came back from list_blobs carries its
+            # metadata). Reading it is a property access on _properties, never a
+            # round trip: a meter that cost an operation to run would be paying
+            # for the thing it exists to count.
+            gone = 0
+            if name == "delete":
+                try:
+                    gone = int(getattr(self._blob, "size", 0) or 0)
+                except Exception:       # pragma: no cover - defensive
+                    gone = 0
             result = attr(*args, **kwargs)
             try:
-                if uploading and args:
-                    data = args[0]
-                    if isinstance(data, (bytes, bytearray, str)):
-                        guard.note_storage(upload=len(data))
+                if uploading:
+                    data = args[0] if args else None
+                    n = len(data) if isinstance(data, (bytes, bytearray, str)) else 0
+                    # ops=1 even when the byte count is unknown (upload_from_file /
+                    # _filename): the operation is billed whatever we can measure.
+                    guard.note_storage(upload=n, ops=1, stored_delta=n)
+                elif name in _BLOB_CLASS_A:
+                    guard.note_storage(ops=1)
+                elif name == "delete":
+                    # Deletes are free as operations; what they change is the
+                    # standing at-rest total, and only when the size was known.
+                    if gone:
+                        guard.note_storage(stored_delta=-gone)
                 elif name.startswith("download") and isinstance(result, (bytes, bytearray)):
                     guard.note_storage(download=len(result))
                 elif name == "generate_signed_url":
@@ -214,6 +248,14 @@ class _GuardedBucket:
         # generator is a fair substitute for the HTTPIterator.
         if name == "list_blobs" and callable(attr):
             def list_blobs(*args, **kwargs):
+                # One Class-A operation per *page*, and the paging is inside the
+                # iterator where we cannot see it — so one per call is a floor,
+                # which is the honest direction for a listing of a handful of
+                # files (every caller here lists one object prefix).
+                try:
+                    guard.note_storage(ops=1)
+                except Exception:       # pragma: no cover - metering must not throw
+                    pass
                 return (_GuardedBlob(b) for b in attr(*args, **kwargs))
             return list_blobs
         return attr

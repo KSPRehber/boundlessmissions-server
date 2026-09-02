@@ -57,6 +57,15 @@ def up(name, data, ct):
     return UploadFile(io.BytesIO(data), filename=name, headers=Headers({"content-type": ct}))
 
 
+def png(seed: int) -> bytes:
+    """A real, distinct PNG: screenshots are verified as images on submit now, so
+    the "screenshot" must decode — the point is what its NAME can reach."""
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.new("RGB", (2, 2), (seed % 256, 0, 0)).save(buf, format="PNG")
+    return buf.getvalue()
+
+
 async def submit(**files):
     return await api_server._submit_contract_locked(
         CID, craft_file=files.get("craft"), vessel_node=None, loadmeta=None,
@@ -73,7 +82,7 @@ async def main():
     obj = bucket.objects[f"contracts/{CID}/rescue_vessel.cfg"]
     check("wreck is stored private under a server-chosen name", obj["data"] == WRECK and not obj["public"])
 
-    junk = b"VESSEL{ name = 9000-part kraken } "
+    junk = png(1)   # a valid image whose bytes are not the wreck's
     r = await submit(shot=up("rescue_vessel.cfg", junk, "image/png"),
                      craft=up("lander.craft", b"ship = x", "text/plain"))
     check("submission with a screenshot named rescue_vessel.cfg is accepted",
@@ -97,7 +106,7 @@ async def main():
     section("same slot, private overwrite via the craft_file name")
     bucket.objects[f"contracts/{CID}/rescue_vessel.cfg"] = {"data": WRECK, "ct": "application/gzip", "public": False}
     contract["status"] = cdb.ACTIVE
-    r = await submit(shot=up("s.png", b"\x89PNG", "image/png"),
+    r = await submit(shot=up("s.png", png(2), "image/png"),
                      craft=up("rescue_vessel.cfg", b"ship = attacker", "text/plain"))
     obj = bucket.objects[f"contracts/{CID}/rescue_vessel.cfg"]
     check("craft_file cannot be stored over the wreck slot",
@@ -111,10 +120,16 @@ async def main():
     check("marketplace/gift objects live under server-minted uuid ids",
           'path = f"marketplace/{listing_id}/' in src("data/marketplace.py")
           and 'path = f"gifts/{import_id}/' in src("data/imports.py"))
-    check("screenshot bytes are never verified as images on submit",
-          "_looks_like_image" not in src("api_server.py")[src("api_server.py").index("async def _submit_contract_locked"):
-                                                            src("api_server.py").index("async def _ai_review_submission")],
-          "(informational: the has_image gate trusts the client content_type)")
+    check("screenshot bytes are verified as images on submit",
+          "_looks_like_image" in src("api_server.py")[src("api_server.py").index("async def _submit_contract_locked"):
+                                                        src("api_server.py").index("async def _ai_review_submission")],
+          "(the has_image gate trusts the client content_type)")
+    contract["status"] = cdb.ACTIVE
+    n_before = len(bucket.objects)
+    r = await submit(shot=up("s.png", b"VESSEL{ }", "image/png"),
+                     craft=up("lander.craft", b"ship = x", "text/plain"))
+    check("a non-image 'screenshot' is refused before anything is stored",
+          not r.success and len(bucket.objects) == n_before, r.message)
     finish()
 
 asyncio.run(main())

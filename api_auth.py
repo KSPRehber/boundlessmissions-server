@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 
 from firebase_admin import firestore
 
-from data.store import _db
+from data.store import _db, _db_unguarded
 
 log = logging.getLogger(__name__)
 
@@ -76,6 +76,23 @@ def _sessions_col():
     return _db.collection("ksp_sessions")
 
 
+def _sessions_col_unguarded():
+    """`ksp_sessions` off the UNMETERED-BRAKE handle, for the auth-path read only.
+
+    `_get_token_version` runs on the auth dependency of every authenticated route.
+    On the guarded handle it hits `guard.require_firebase()`, which raises at
+    Level.FROZEN — and since the read then fails closed on a cold cache, a budget
+    freeze turned into a 503 on EVERY authenticated route, the admin console
+    included. The console is the documented way to lift a freeze, so the recovery
+    path ran through the thing the freeze had disabled.
+
+    Exempting one keyed read is the right trade: refusing it does not save the
+    request, it only makes the request fail. The read is still reported to the
+    meter by the caller, so it stays on the bill.
+    """
+    return _db_unguarded.collection("ksp_sessions")
+
+
 def _twofa_col():
     return _db.collection("ksp_2fa_challenges")
 
@@ -103,15 +120,38 @@ _TOKEN_VERSION_TTL = 30  # seconds
 _token_versions: dict[str, tuple[int, float]] = {}  # user_id -> (version, fetched_at)
 
 
+class TokenVersionUnavailable(Exception):
+    """The revocation version could not be read and nothing is cached.
+
+    Raised rather than answered with 0, because 0 means "never revoked" — so a
+    Firestore blip during a cold start (an empty cache is exactly the state after
+    a restart) would accept every token this user has ever been issued, including
+    ones revoked by a logout-all, a ban, or a device removal. `verify_session_token`
+    turns this into a *retryable* refusal rather than an invalid-token one: the
+    caller is told to try again shortly, not signed out.
+    """
+
+
 def _get_token_version(user_id: str) -> int:
-    """Current token-revocation version for a user (0 if never revoked)."""
+    """Current token-revocation version for a user (0 if never revoked).
+
+    Raises `TokenVersionUnavailable` when the read fails and there is nothing
+    cached to fall back on — see the class docstring for why that is not 0.
+    """
     cached = _token_versions.get(user_id)
     now = time.time()
     if cached is not None and now - cached[1] < _TOKEN_VERSION_TTL:
         return cached[0]
 
     try:
-        snap = _sessions_col().document(user_id).get()
+        # Unguarded on purpose — see `_sessions_col_unguarded`. Metered by hand so
+        # the exemption is from the brake, not from the bill.
+        snap = _sessions_col_unguarded().document(user_id).get()
+        try:
+            from cost_guard import guard as _cost_guard
+            _cost_guard.note_firestore(reads=1)
+        except Exception:                       # metering must never fail a login
+            pass
         version = int(snap.to_dict().get("token_version", 0) or 0) if snap.exists else 0
     except Exception as exc:
         log.warning("Could not read token version for %s: %s", user_id, exc)
@@ -120,7 +160,14 @@ def _get_token_version(user_id: str) -> int:
         # version for the whole TTL — so a Firestore blip at the wrong moment could
         # keep accepting a just-revoked token even after Firestore recovers. Not
         # caching means the very next request re-reads and picks up the real version.
-        return cached[0] if cached is not None else 0
+        #
+        # With nothing cached there is no last known value, and 0 is not a safe
+        # stand-in for one: it is the specific value meaning "never revoked", so
+        # answering it would honour every token this account has ever held. Refuse
+        # instead, and let the caller make it a retry.
+        if cached is None:
+            raise TokenVersionUnavailable(str(user_id))
+        return cached[0]
 
     _token_versions[user_id] = (version, now)
     return version
@@ -128,14 +175,44 @@ def _get_token_version(user_id: str) -> int:
 
 # ── Link Codes ───────────────────────────────────────────────────────────────
 
+def _claim_unused_code(payload: dict, *, attempts: int = 8) -> str:
+    """Mint a 6-digit code and claim it with `create()`, retrying on a collision.
+
+    The code IS the document id, and this used to be a `set()`, which overwrites
+    unconditionally. Two live codes are drawn from a 10^6 space with a 3-10 minute
+    life, so a collision while both are live silently re-pointed the earlier
+    document at the later user — and `validate_link_code` then handed the first
+    player's typed code back as the SECOND player's identity: a session token for
+    an account that is not theirs, or (the likelier, non-adversarial case) an
+    honest player linking their game to a stranger's wallet with no error anywhere.
+
+    `create()` fails when the id already exists, which turns "improbable" into
+    "impossible": a taken code is simply re-drawn. This is the primitive
+    `weeklymissions._save_selection` already uses for exactly the same reason, and
+    the inconsistency was the whole bug.
+
+    A handful of attempts is ample — with even a thousand live codes the chance of
+    eight consecutive collisions is about 10^-24 — and exhausting them raises
+    rather than falling back to an overwrite.
+    """
+    from google.api_core import exceptions as _gexc
+    for _ in range(attempts):
+        code = _digit_code(6)
+        try:
+            _link_codes_col().document(code).create(payload)
+            return code
+        except _gexc.AlreadyExists:
+            continue
+    raise RuntimeError("Could not allocate an unused link code; try again.")
+
+
 def generate_link_code(guild_id: int, user_id: int, username: str) -> str:
     """Create a 6-digit code, store in Firestore with 10-min expiry. Returns the code."""
     # Invalidate any existing codes for this user
     for doc in _link_codes_col().where("user_id", "==", str(user_id)).stream():
         doc.reference.delete()
 
-    code = _digit_code(6)
-    _link_codes_col().document(code).set({
+    code = _claim_unused_code({
         "guild_id": str(guild_id),
         "user_id": str(user_id),
         "username": username,
@@ -160,9 +237,8 @@ def generate_account_link_code(account_id, guild_id, display_name: str) -> tuple
     for doc in _link_codes_col().where("user_id", "==", aid).stream():
         doc.reference.delete()
 
-    code = _digit_code(6)
     expires_at = time.time() + PANEL_LINK_CODE_LIFETIME
-    _link_codes_col().document(code).set({
+    code = _claim_unused_code({
         "guild_id": str(guild_id),
         "user_id": aid,
         "username": display_name,
@@ -218,13 +294,21 @@ def validate_link_code(code: str) -> dict | None:
 
 def create_approval_challenge(guild_id: str, user_id: str, username: str,
                               client_ip: str = "", source: str = SOURCE_DISCORD,
-                              device_id: str = "") -> str:
+                              device_id: str = "", aud: str = AUD_KSP) -> str:
     """Create a pending login-approval challenge. Returns the challenge_id.
 
-    `source` decides which surface answers it — a DM for a code that came from
-    Discord, the account panel for one that came from the panel. The device id is
-    kept only so the approving surface can show *what* is asking; it is not part of
-    the decision, and the device is trusted by `_issue_link_token` as it always was.
+    `source` decides which surface *answers* it — a DM for a code that came from
+    Discord, the account panel for one that came from the panel. `aud` is the
+    different question of which surface is *asking*, and it is recorded because the
+    whole value of this step is that the player approves a named thing. The prompt
+    said "a KSP client" unconditionally while the same challenge id could be
+    redeemed on the website tier — which has neither device binding nor the
+    mod-version gate — so the sentence they agreed to was not necessarily what
+    happened. `poll_approval` refuses a poll from the other tier.
+
+    The device id is kept only so the approving surface can show *what* is asking;
+    it is not part of the decision, and the device is trusted by
+    `_issue_link_token` as it always was.
     """
     challenge_id = secrets.token_urlsafe(18)
     _twofa_col().document(challenge_id).set({
@@ -234,6 +318,7 @@ def create_approval_challenge(guild_id: str, user_id: str, username: str,
         "status": "pending",
         "client_ip": client_ip,
         "source": source,
+        "aud": aud,
         "device_id": device_id,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "expires_at": time.time() + APPROVAL_LIFETIME,
@@ -268,6 +353,36 @@ def pending_panel_approval(account_id) -> dict | None:
     return None
 
 
+def _owns_challenge(stored_user_id, acting_user_id) -> bool:
+    """Does `acting_user_id` own a challenge recorded against `stored_user_id`?
+
+    The two are not always the same *kind* of id. A challenge stores an **account
+    id** (`cogs/ksp_bridge` resolves `accounts.account_for_discord` before minting
+    the code), while the Discord approval buttons hand back the clicker's raw
+    **snowflake**. For almost everybody those are the same string — but not for an
+    account that joined a website identity to a Discord one, where the account id
+    is `a_…`. A bare `!=` therefore refused the real owner's own click, and since
+    the device-binding gate has no other approval surface, a joined account was
+    permanently locked out of the mod by any device change.
+
+    So the comparison accepts either form: the stored id itself, or a snowflake
+    that resolves to it. Still exact — it never widens ownership to a second
+    account, it only stops one account being mistaken for two.
+    """
+    stored = str(stored_user_id or "")
+    acting = str(acting_user_id or "")
+    if not stored or not acting:
+        return False
+    if stored == acting:
+        return True
+    try:
+        from data import accounts
+        return str(accounts.account_for_discord(acting) or "") == stored
+    except Exception as exc:  # a lookup failure must not approve anything
+        log.warning("Challenge ownership lookup failed for %s: %s", acting, exc)
+        return False
+
+
 def resolve_approval(challenge_id: str, acting_user_id: str, approve: bool) -> bool:
     """Apply the Discord button's decision to a pending challenge.
 
@@ -282,7 +397,7 @@ def resolve_approval(challenge_id: str, acting_user_id: str, approve: bool) -> b
         return False
 
     data = snap.to_dict()
-    if str(data.get("user_id")) != str(acting_user_id):
+    if not _owns_challenge(data.get("user_id"), acting_user_id):
         log.warning("Approval %s: acting user %s is not owner %s, ignored",
                     challenge_id, acting_user_id, data.get("user_id"))
         return False
@@ -295,14 +410,21 @@ def resolve_approval(challenge_id: str, acting_user_id: str, approve: bool) -> b
     return True
 
 
-def poll_approval(challenge_id: str) -> dict:
-    """Poll a challenge on behalf of the waiting KSP client.
+def poll_approval(challenge_id: str, aud: str = AUD_KSP) -> dict:
+    """Poll a challenge on behalf of the waiting client.
+
+    `aud` is the tier doing the polling. A challenge may only be redeemed by the
+    surface it was created for: the approval prompt names one of them out loud, and
+    a challenge answered as "a KSP client wants to sign in" must not turn into a
+    website session. A mismatch reads as expired rather than as a distinct error —
+    it is not a state any honest client reaches, and saying more only helps someone
+    probing for one.
 
     Returns one of:
       {"state": "pending"}
       {"state": "approved", "guild_id", "user_id", "username"}  (consumes it)
       {"state": "denied"}    (consumes it)
-      {"state": "expired"}   (unknown / timed-out)
+      {"state": "expired"}   (unknown / timed-out / wrong tier)
     """
     doc = _twofa_col().document(challenge_id)
     snap = doc.get()
@@ -310,6 +432,11 @@ def poll_approval(challenge_id: str) -> dict:
         return {"state": "expired"}
 
     data = snap.to_dict()
+    # Challenges minted before this field existed carry no `aud`; treat those as
+    # KSP, which is what every one of them was.
+    if str(data.get("aud") or AUD_KSP) != aud:
+        log.warning("Approval challenge %s polled from the wrong tier (%s)", challenge_id, aud)
+        return {"state": "expired"}
     if time.time() > data.get("expires_at", 0):
         doc.delete()
         return {"state": "expired"}
@@ -517,7 +644,7 @@ def resolve_device_challenge(challenge_id: str, acting_user_id: str,
     if not snap.exists:
         return None
     data = snap.to_dict()
-    if str(data.get("user_id")) != str(acting_user_id):
+    if not _owns_challenge(data.get("user_id"), acting_user_id):
         log.warning("Device challenge %s: acting user %s is not owner %s, ignored",
                     challenge_id, acting_user_id, data.get("user_id"))
         return None
@@ -548,7 +675,7 @@ def request_device_ping(challenge_id: str, acting_user_id: str) -> bool:
     if not snap.exists:
         return False
     data = snap.to_dict()
-    if str(data.get("user_id")) != str(acting_user_id):
+    if not _owns_challenge(data.get("user_id"), acting_user_id):
         return False
     if data.get("status") != "pending" or time.time() > data.get("expires_at", 0):
         return False
@@ -567,18 +694,38 @@ def set_device_ticket_channel(challenge_id: str, channel_id: int | str) -> None:
         log.warning("Could not set ticket channel for challenge %s: %s", challenge_id, exc)
 
 
-def poll_device_challenge(challenge_id: str) -> dict:
+def poll_device_challenge(challenge_id: str, owner_id: str | None = None) -> dict:
     """For the blocked KSP client. Returns:
        {"state":"pending", "ping"?} | {"state":"approved"} (consumes) |
-       {"state":"denied", "report_id"?} | {"state":"expired"}."""
+       {"state":"denied", "report_id"?} | {"state":"expired"}.
+
+    `owner_id` is the caller's account id. When given, a challenge belonging to
+    somebody else is answered "expired" rather than served: every sibling endpoint
+    checks this and this one did not, so any token holder who learned a challenge
+    id could consume its `approved` state (spending the challenge and leaving the
+    real owner's client polling forever), swallow the owner's "Ping this PC" —
+    the one interactive check the approval DM offers — and read its `report_id`.
+    Answering "expired" rather than 403 keeps the endpoint from confirming that
+    an id someone guessed exists at all."""
     doc = _device_chal_col().document(challenge_id)
     snap = doc.get()
     if not snap.exists:
         return {"state": "expired"}
     data = snap.to_dict()
+    if owner_id is not None and str(data.get("user_id") or "") != str(owner_id):
+        return {"state": "expired"}
     status = data.get("status", "pending")
     if status == "pending":
         if time.time() > data.get("expires_at", 0):
+            # Delete rather than merely report. This branch used to return and leave the
+            # document in place forever, and the document carries `client_ip` — which,
+            # with uvicorn's access log off and Caddy configured without one, makes this
+            # collection the only durable store of IP addresses in the whole system. The
+            # privacy policy describes IP retention as being for "connection integrity,
+            # rate limiting and abuse prevention", which does not describe keeping one
+            # indefinitely against an account id and username. `poll_approval` already
+            # deletes on expiry and on every terminal state; this is the same rule.
+            doc.delete()
             return {"state": "expired"}
         out = {"state": "pending"}
         if data.get("ping_pending"):
@@ -592,6 +739,16 @@ def poll_device_challenge(challenge_id: str) -> dict:
     out = {"state": "denied"}
     if data.get("report_requested") and not data.get("report_done"):
         out["report_id"] = data.get("report_id")
+    else:
+        # A denied challenge with nothing outstanding has served its purpose. The row is
+        # kept (it is the record of a refusal a moderator may ask about) but the address
+        # is not: once the diagnostics upload is done or was never asked for, `client_ip`
+        # is evidence with no remaining use, and the ticket holds whatever was needed.
+        if data.get("client_ip"):
+            try:
+                doc.update({"client_ip": firestore.DELETE_FIELD})
+            except Exception as exc:  # noqa: BLE001 - best effort, never fail the poll
+                log.debug("Could not clear client_ip on challenge %s: %s", challenge_id, exc)
     return out
 
 
@@ -746,7 +903,7 @@ def create_session_token(guild_id: str, user_id: str, username: str, secret: str
 
     # Store session reference in Firestore. merge=True preserves token_version if
     # a previous logout_all_devices already set it for this user.
-    _sessions_col().document(user_id).set({
+    record = {
         "guild_id": guild_id,
         "user_id": user_id,
         "username": username,
@@ -754,7 +911,23 @@ def create_session_token(guild_id: str, user_id: str, username: str, secret: str
         "expires_at": payload["exp"],
         "token_version": version,
         "active": True,
-    }, merge=True)
+    }
+    # The KSP guild, kept apart from `guild_id` and written only by a KSP mint.
+    #
+    # There is one session document per account, shared by both audiences, so the
+    # *last* login wins `guild_id` — and a website sign-in always mints under the
+    # home guild (`_account_guild_id`). A player who linked KSP in another guild
+    # and later signed in on the site therefore left a record claiming the home
+    # guild, while their game client goes on polling the guild it linked in. That
+    # matters because the notification feed and the craft import queue are both
+    # keyed by guild: anything written for them off this record would land where
+    # they never look, and for a quicksent live vessel a stranded return entry
+    # means the ship is in neither save. `merge=True` is what makes this survive
+    # every later web login, so it stays the answer to "where does their game
+    # read" rather than "where did they last sign in".
+    if aud == AUD_KSP:
+        record["ksp_guild_id"] = guild_id
+    _sessions_col().document(user_id).set(record, merge=True)
 
     log.info("Created session token for user %s (guild %s)", user_id, guild_id)
     return token
@@ -781,6 +954,10 @@ def verify_session_token(token: str, secret: "str | list[str] | tuple") -> dict 
     # Reject tokens minted before the user's last "log out of all devices".
     # Legacy tokens predating versioning carry no "tv" (treated as 0) and stay
     # valid until the first logout_all_devices bumps the version above 0.
+    # `TokenVersionUnavailable` is deliberately NOT caught here: it means we cannot
+    # tell whether this token was revoked, which is neither "valid" (None would be
+    # wrong) nor "invalid" (the client would clear a good session on the 401). The
+    # dependency turns it into a 503 the client retries.
     if int(payload.get("tv", 0)) < _get_token_version(payload["uid"]):
         return None
 

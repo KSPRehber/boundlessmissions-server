@@ -20,6 +20,7 @@ is the only automatic path left; `/corpsetup` (explicit) and `/admin corpsgenera
 """
 
 import asyncio
+import re
 import logging
 import datetime
 import discord
@@ -31,6 +32,7 @@ log = logging.getLogger(__name__)
 # Import the shared Firestore client
 from data.store import _db
 import settings
+from cogs import perms
 from data import guild_config
 from i18n import t, tp
 # gkchannels is imported lazily at each call site, not bound here: corps loads
@@ -352,6 +354,23 @@ def _get_corp(guild_id: int, user_id: int) -> dict | None:
                 d = d2.to_dict()
                 d.setdefault("guild_id", str(og))
                 return d
+    # Last resort: this may be an ACCOUNT id where corps are keyed by the Discord
+    # snowflake. `ensure_corp_for_linked_user` is handed an account id but resolves
+    # a member and keys everything on `member.id`, so a joined account (`a_…`) owns
+    # a corp that a lookup by account id cannot see. Callers that correctly resolve
+    # the account id first — the weekly-mission buttons, `select_mission` — were
+    # therefore told "you need a corporation first" by their own correction. Resolve
+    # back and retry once; for everybody else `discord_for_account` returns the id
+    # unchanged and this costs one cheap read that was already going to miss.
+    try:
+        from data import accounts
+        did = accounts.discord_for_account(str(user_id))
+    except Exception as exc:
+        log.warning("Corp lookup could not resolve account %s to a snowflake: %s",
+                    user_id, exc)
+        return None
+    if did and str(did) != str(user_id):
+        return _get_corp(guild_id, did)
     return None
 
 
@@ -441,6 +460,17 @@ class CorpReplaceView(discord.ui.View):
 
 # ── Cog ──────────────────────────────────────────────────────────────────────
 
+def _is_admin():
+    """Mapped bot-admin role or owner (`perms.is_admin_user`); guild
+    administrators are not auto-admins. `@default_permissions` above each
+    command is only Discord's *default* — a server admin can widen it to any
+    role in Integrations, and until this check existed the bot then ran the
+    command with no gate of its own."""
+    async def predicate(interaction: discord.Interaction) -> bool:
+        return perms.is_admin_user(interaction)
+    return app_commands.check(predicate)
+
+
 class Corps(commands.Cog, name="Corps"):
     """Corporation management system."""
 
@@ -454,8 +484,18 @@ class Corps(commands.Cog, name="Corps"):
         description="Establish a new corporation with its own text channel",
     )
     @app_commands.describe(name="Name for your corporation")
+    # Bounded and throttled. This is self-service guild-CHANNEL creation: `name`
+    # went verbatim into `create_text_channel`, where anything over Discord's
+    # 100-character limit is a 400 — and because the handler has already deferred,
+    # the cog's error handler saw `is_done()` and sent nothing at all, leaving the
+    # user on a permanent "thinking…". The replace flow is a delete plus a create
+    # per invocation, on a Discord bucket that is severe and shared bot-wide with
+    # ticket intake, so one member looping it stalled channel operations for the
+    # whole deployment.
+    @app_commands.checks.cooldown(2, 600.0, key=lambda i: (i.guild_id, i.user.id))
     async def corpsetup(
-        self, interaction: discord.Interaction, name: str
+        self, interaction: discord.Interaction,
+        name: app_commands.Range[str, 1, 32],
     ) -> None:
         if not interaction.guild:
             await interaction.response.send_message(
@@ -466,6 +506,18 @@ class Corps(commands.Cog, name="Corps"):
         guild = interaction.guild
         member = interaction.user
         gid = guild.id
+
+        # Collapse whitespace and drop anything that is not plausibly a name. The
+        # Range above bounds the length; this bounds the content, because the value
+        # is published into the channel topic, the pinned embed and the in-game
+        # player pickers that other people read.
+        name = re.sub(r"\s+", " ", name).strip()
+        name = re.sub(r"[^\w \-'&.]", "", name, flags=re.UNICODE).strip()
+        if not name:
+            await interaction.response.send_message(
+                "❌ That corporation name has no usable characters in it.",
+                ephemeral=True)
+            return
 
         # One corp per user GLOBALLY — check whether they own one in any server.
         existing = get_user_corp_global(member.id)
@@ -594,6 +646,7 @@ class Corps(commands.Cog, name="Corps"):
         description="Create a corporation for every linked member that doesn't have one",
     )
     @app_commands.default_permissions(administrator=True)
+    @_is_admin()
     async def corpsgenerate(self, interaction: discord.Interaction) -> None:
         """Backfill for players who linked before corps were created on link.
 
@@ -656,6 +709,7 @@ class Corps(commands.Cog, name="Corps"):
         description="Make every existing corporation channel private (corp + mods only)",
     )
     @app_commands.default_permissions(administrator=True)
+    @_is_admin()
     async def corpsprivacy(self, interaction: discord.Interaction) -> None:
         """One-time migration: apply the private overwrites `_create_corp_channel`
         now sets to corp channels created before privacy existed. Discord
@@ -704,11 +758,27 @@ class Corps(commands.Cog, name="Corps"):
     async def cog_app_command_error(
         self, interaction: discord.Interaction, error: app_commands.AppCommandError
     ) -> None:
+        # `is_done()` is True after a DEFER as well as after a reply, so the old
+        # "only speak if nothing was sent" test stayed silent for exactly the
+        # commands that had deferred — leaving the user on a permanent "thinking…"
+        # with no error at all. Follow up instead when the response is already used.
+        async def _say(msg: str) -> None:
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send(msg, ephemeral=True)
+                else:
+                    await interaction.response.send_message(msg, ephemeral=True)
+            except Exception:            # the error path must not raise its own
+                log.debug("Could not deliver the corps error message", exc_info=True)
+
+        if isinstance(error, app_commands.CommandOnCooldown):
+            await _say(f"⏳ Slow down — try again in {error.retry_after:.0f}s.")
+            return
+        if isinstance(error, app_commands.CheckFailure):
+            await _say(tp(interaction.guild_id, interaction.user.id, "common.no_perm"))
+            return
         log.error("Corps cog error: %s", error, exc_info=True)
-        if not interaction.response.is_done():
-            await interaction.response.send_message(
-                t(interaction.guild_id, "common.error"), ephemeral=True
-            )
+        await _say(t(interaction.guild_id, "common.error"))
 
 
 async def setup(bot: commands.Bot) -> None:

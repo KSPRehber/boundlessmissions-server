@@ -1013,11 +1013,14 @@ async def get_web_user(authorization: str = Header(default="")) -> dict:
 
 
 def enforce_mod_version(x_mod_hash: str) -> None:
-    """Hard-block outdated / modified clients on gated endpoints by comparing the
-    client's reported DLL hash (X-Mod-Hash) against the published latest.
+    """Hard-block outdated / modified clients on gated endpoints, by asking
+    `mver.acceptance` whether the client's reported DLL hash (X-Mod-Hash) may still
+    talk to this server.
 
     Fail-open to match /version/check: a no-op when the gate is disabled or nothing
-    has been published yet. Otherwise a mismatch raises 426 `update_required`, which
+    has been published yet. A build inside its grace window is let through — it is
+    out of date, and being out of date for a few days while CKAN catches up is not
+    grounds for refusing the game. Anything else raises 426 `update_required`, which
     the client turns into its blocking "update required" window.
     """
     if not cfg.KSP_VERSION_CHECK_ENABLED:
@@ -1038,17 +1041,19 @@ def enforce_mod_version(x_mod_hash: str) -> None:
         log.warning("Mod version gate: could not read the published config (%s) — "
                     "allowing the request.", exc)
         return
-    latest_hash = (cfg_doc.get("latest_hash") or "").lower()
-    if not latest_hash:
+    # ONE decision, shared with /version/check via mver.acceptance — see its docstring.
+    # A client told at startup that it may proceed and then 426'd by every call it
+    # makes does not look out of date, it looks broken, so the two must not drift.
+    verdict = mver.acceptance(x_mod_hash, cfg_doc)
+    if verdict["state"] in ("current", "grace"):
         return
-    if (x_mod_hash or "").strip().lower() != latest_hash:
-        raise HTTPException(status_code=426, detail={
-            "code": "update_required",
-            "latest_version": cfg_doc.get("latest_version"),
-            "latest_hash": latest_hash,
-            "download_url": cfg_doc.get("download_url"),
-            "message": "Your Boundless Missions mod is out of date. Update to keep playing.",
-        })
+    raise HTTPException(status_code=426, detail={
+        "code": "update_required",
+        "latest_version": verdict["latest_version"],
+        "latest_hash": verdict["latest_hash"],
+        "download_url": cfg_doc.get("download_url"),
+        "message": "Your Boundless Missions mod is out of date. Update to keep playing.",
+    })
 
 
 async def get_current_user(request: Request,
@@ -3889,6 +3894,61 @@ async def report_contract(contract_id: str, req: ReportRequest, request: Request
 
 # ── Corporations ─────────────────────────────────────────────────────────────
 
+# Boundless usernames for the corps picker, denormalised onto the corp document.
+#
+# The picker draws a username under every display name, and the username lives on
+# the account document — so read naively this endpoint would go from one collection
+# scan to one extra Firestore read per player on every open, on the project whose
+# `cost_guard` exists because that bill is the thing being defended against. The
+# answer is `sync_web_corp_profile`'s: denormalise it onto the corp.
+#
+# What makes that safe here — and unlike the display name, which is refreshed from
+# the member cache on every row precisely because it changes — is that a username is
+# **permanent**. `accounts.claim_username` refuses to change one that is already set,
+# so a copy of it cannot go stale. The only transition is "" → set, which is why an
+# empty answer is never written down: it would freeze a player who claims a username
+# tomorrow as having none forever.
+#
+# So the read below is a one-time backfill per player, not a per-open cost: corps
+# missing the field are resolved off-thread and written back, and every later open
+# reads them out of the scan it was already paying for. The in-process cache is what
+# stops the players who genuinely have no username yet — an account whose Discord
+# name was taken, a web account mid-onboarding — being re-read on every open, since
+# there is nothing to write back for them.
+_CORP_UNAME_TTL = 300.0
+_corp_uname_cache: dict[str, tuple[float, str]] = {}
+
+
+def _corp_usernames(pending: list[str]) -> dict[str, str]:
+    """Boundless usernames for account ids whose corp document has none.
+
+    Blocking; call from a thread. Never raises: a row with no username under it
+    still draws, and a failed read that took the whole picker down with it would
+    make hiring unusable exactly when someone is trying to offer work.
+    """
+    now = time.time()
+    out: dict[str, str] = {}
+    wanted: list[str] = []
+    for aid in pending:
+        hit = _corp_uname_cache.get(aid)
+        if hit and now - hit[0] < _CORP_UNAME_TTL:
+            out[aid] = hit[1]
+        else:
+            wanted.append(aid)
+    for aid in wanted:
+        try:
+            acct = accounts.get_account(aid) or {}
+        except Exception as exc:                   # pragma: no cover - defensive
+            log.warning("Corp username read failed for %s: %s", aid, exc)
+            continue                               # not cached: retry next open
+        uname = str(acct.get("username") or "")
+        _corp_uname_cache[aid] = (now, uname)
+        out[aid] = uname
+    if len(_corp_uname_cache) > 512:
+        _corp_uname_cache.clear()
+    return out
+
+
 @app.get("/api/v1/corps/list", response_model=CorpListResponse)
 async def list_corps(user: dict = Depends(get_current_user)):
     """
@@ -3907,6 +3967,14 @@ async def list_corps(user: dict = Depends(get_current_user)):
     weekly mission's contractor), and the picker was the one place still printing raw
     account handles. The stored value is the fallback for anyone the cache has no
     member for — someone who has left, or a shard that has not filled yet.
+
+    `username` is the line the pickers draw *under* that name, where they used to
+    draw the corp name. A corp name is decoration — auto-generated as "{display
+    name} Space Agency" for almost everybody, so it repeated the line above it and
+    told a player nothing about who they were about to hire. A username is the one
+    handle that identifies this player across every server and never changes, which
+    is what makes it worth the second line. See `_corp_usernames` for why it costs
+    no per-row read to get there.
     """
     gid = int(user["guild_id"])
     guild = _bot_instance.get_guild(gid) if _bot_instance else None
@@ -3933,9 +4001,34 @@ async def list_corps(user: dict = Depends(get_current_user)):
             # as well would quietly widen who each server can see each other.
             rows += [d for d in _corps_col(home).stream()
                      if (d.to_dict() or {}).get("web_only")]
-        return rows
 
-    docs = await asyncio.to_thread(_scan)
+        # Usernames for the corps that have not got one stored yet, resolved and
+        # written back here so this is a one-time cost per player rather than a
+        # read per row per open — see the note above `_corp_usernames`. In the
+        # scan's thread because both halves block, and after the rows are in hand
+        # because only they can say which players are still missing it.
+        # A dict rather than a list: a player with a corp in both this guild and
+        # the home guild appears twice here (the `seen` dedup below runs later, on
+        # the drawing side), and asking for the same account twice would pay for
+        # the read twice.
+        pending = {d.id: None for d in rows if "owner_username" not in (d.to_dict() or {})}
+        resolved = _corp_usernames(list(pending)) if pending else {}
+        for d in rows:
+            uname = resolved.get(d.id)
+            # Only a claimed one is written down. "" is the pre-claim state, not an
+            # answer, and storing it would leave a player who claims a username
+            # tomorrow showing none for as long as the corp document lives.
+            if not uname:
+                continue
+            try:
+                d.reference.set({"owner_username": uname}, merge=True)
+            except Exception as exc:               # pragma: no cover - defensive
+                # The picker has the name in hand either way; failing to cache it
+                # costs a re-read next open and nothing else.
+                log.warning("Could not cache username on corp %s: %s", d.id, exc)
+        return rows, resolved
+
+    docs, resolved_unames = await asyncio.to_thread(_scan)
     seen: set[str] = set()
     for doc in docs:
         if doc.id in seen:
@@ -3989,6 +4082,11 @@ async def list_corps(user: dict = Depends(get_current_user)):
         corps.append(CorpInfo(
             owner_id=doc.id,
             owner_name=owner_name,
+            # Stored first, resolved second: the stored copy is the whole point of
+            # the backfill above, and `resolved` only ever holds the rows that
+            # lacked one — including the ones whose write-back failed or that had
+            # nothing to write back.
+            username=str(d.get("owner_username") or resolved_unames.get(doc.id) or ""),
             corp_name=d.get("name", "Unknown Corp"),
             avatar_url=avatar_url,
             level=level,
@@ -7729,9 +7827,13 @@ async def web_account_claim_username(req: ClaimUsernameRequest, request: Request
     # corp at all and never appeared in anyone's player picker.
     if not accounts.is_discord_account(ctx["account_id"]):
         from cogs.corps import ensure_corp_record_for_account
+        # `message` is the username that was just claimed, so it is both the corp's
+        # display name and the handle the picker draws under it — the one call site
+        # that can hand `list_corps` its answer instead of making it go and read for
+        # it later.
         await asyncio.to_thread(
             ensure_corp_record_for_account, _account_guild_id(),
-            ctx["account_id"], message)
+            ctx["account_id"], message, message)
 
     return AccountActionResult(success=True, message="Username set.", value=message)
 
@@ -9651,6 +9753,12 @@ class AdminChannelLock(BaseModel):
 class AdminControls(BaseModel):
     version_check_enabled: Optional[bool] = None
     device_binding_enabled: Optional[bool] = None
+    # How many days a build stays accepted after it stops being the published latest.
+    # Runtime-settable for the same reason the budgets are: the moment it needs
+    # widening is an incident — a release CKAN has not indexed, or a bad build pulled
+    # back — and "edit .env and restart" is the worst answer to have during one.
+    # 0 disables the window and restores the strict latest-hash-only gate.
+    mod_version_grace_days: Optional[float] = None
     # Cost guard. Budgets are settable at runtime because the failure mode that
     # matters is a *false* stop — wrong price constants freezing a bot that has
     # not actually overspent. Before this, the only way out was editing .env and
@@ -10733,6 +10841,7 @@ async def admin_controls(user: dict = Depends(get_owner)):
         "policy": policy.get_config(),
         "policy_version": policy.get_version(),
         "cost_guard_enabled": settings.COST_GUARD_ENABLED,
+        "mod_version_grace_days": settings.MOD_VERSION_GRACE_DAYS,
         "firebase_budget_usd": settings.FIREBASE_MONTHLY_BUDGET_USD,
         "gemini_budget_usd": settings.GEMINI_MONTHLY_BUDGET_USD,
     }
@@ -10757,16 +10866,23 @@ async def admin_set_controls(req: AdminControls, user: dict = Depends(get_owner)
         settings.FIREBASE_MONTHLY_BUDGET_USD = max(0.0, float(req.firebase_budget_usd))
     if req.gemini_budget_usd is not None:
         settings.GEMINI_MONTHLY_BUDGET_USD = max(0.0, float(req.gemini_budget_usd))
+    if req.mod_version_grace_days is not None:
+        # `mver._grace_days()` reads this attribute on every acceptance decision
+        # rather than caching it, so the new window applies to the very next
+        # request — including retroactively widening one already being refused.
+        settings.MOD_VERSION_GRACE_DAYS = max(0.0, float(req.mod_version_grace_days))
     _admin_audit(user, "controls",
                  f"version_check={req.version_check_enabled} device_binding={req.device_binding_enabled} "
                  f"cost_guard={req.cost_guard_enabled} fb_budget={req.firebase_budget_usd} "
-                 f"gemini_budget={req.gemini_budget_usd}")
+                 f"gemini_budget={req.gemini_budget_usd} "
+                 f"grace_days={req.mod_version_grace_days}")
     return {
         "success": True,
         "persisted": False,
         "version_check_enabled": cfg.KSP_VERSION_CHECK_ENABLED,
         "device_binding_enabled": cfg.KSP_DEVICE_BINDING_ENABLED,
         "cost_guard_enabled": settings.COST_GUARD_ENABLED,
+        "mod_version_grace_days": settings.MOD_VERSION_GRACE_DAYS,
         "firebase_budget_usd": settings.FIREBASE_MONTHLY_BUDGET_USD,
         "gemini_budget_usd": settings.GEMINI_MONTHLY_BUDGET_USD,
         "level": cost_guard.snapshot()["level"],

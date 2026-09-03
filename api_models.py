@@ -235,10 +235,24 @@ class AttestResult(BaseModel):
 class VersionCheckResponse(BaseModel):
     # enabled:    False when the server's version gate is turned off (client must
     #             never block, regardless of up_to_date).
-    # up_to_date: True when the client's DLL hash matches the published latest, or
-    #             when no version has been published yet (fail-open).
+    # up_to_date: "may I proceed" — NOT "am I on the newest build". True when the
+    #             client's hash matches the published latest, when nothing has been
+    #             published yet (fail-open), AND when the build is inside its grace
+    #             window. Every client already in the wild treats False as "raise the
+    #             blocking window", so this is the field that has to carry the gate's
+    #             decision; the two literal questions are answered below instead.
+    #             See data/mod_version.check().
     enabled: bool = True
     up_to_date: bool = True
+    # on_latest:        the client's hash IS the published latest.
+    # update_available: a newer build exists — true for a graced client, which is
+    #                   being told to update without being refused.
+    # grace_until:      ISO8601 instant this build stops being accepted, set only
+    #                   while it is inside the window. Null means there is nothing
+    #                   to count down: either up to date, or already refused.
+    on_latest: bool = True
+    update_available: bool = False
+    grace_until: Optional[str] = None
     latest_version: Optional[str] = None
     # SHA256 of the published-latest GeneKerman.dll. Always returned (null only when
     # no version has been published yet) so a client can confirm exactly which build
@@ -630,6 +644,13 @@ class CorpInfo(BaseModel):
     owner_id: str
     owner_name: str
     corp_name: str
+    # The claimed Boundless username, exactly as FriendInfo carries it and for the
+    # same reason: a display name is a nickname a guild can change, while this is
+    # the permanent handle someone else has to type to find this player. It is what
+    # the pickers draw under the display name — the corp name is still sent because
+    # it is the corp's own name and nothing else answers for it, but no picker draws
+    # it any more. "" for a player who has not claimed one yet.
+    username: str = ""
     # Extras for the mod's player picker. Optional/defaulted so older mod builds,
     # which parse this with MiniJSON and ignore unknown keys, are unaffected.
     avatar_url: Optional[str] = None

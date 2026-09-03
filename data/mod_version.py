@@ -13,8 +13,14 @@ Document shape:
         "latest_hash":    "<sha256 hex>",
         "download_url":   "https://.../download",
         "versions": {                       # history, newest publish wins per label
-            "1.2.0": {"hash": "<sha256>", "download_url": "https://..."},
-            "1.1.0": {"hash": "<sha256>", "download_url": "https://..."}
+            # `published_at` is when the build was registered; `superseded_at` is when
+            # it stopped being latest, and is what the grace window is measured from
+            # (absent on the entry that IS latest, and on anything published before
+            # the grace window existed).
+            "1.2.0": {"hash": "<sha256>", "download_url": "https://...",
+                      "published_at": "<iso8601>"},
+            "1.1.0": {"hash": "<sha256>", "download_url": "https://...",
+                      "published_at": "<iso8601>", "superseded_at": "<iso8601>"}
         },
         "updated_at": "<iso8601>",
         "updated_by": "<discord user>"
@@ -24,8 +30,9 @@ Document shape:
 import logging
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
+import settings
 from data.store import _db, _storage_bucket
 
 log = logging.getLogger(__name__)
@@ -134,17 +141,44 @@ def publish_version(version: str, sha256: str, download_url: str,
     snap = ref.get()
     data = snap.to_dict() if snap.exists else {}
 
+    now_iso = datetime.now(timezone.utc).isoformat()
+
     versions = data.get("versions") or {}
-    versions[version] = {"hash": sha256, "download_url": download_url, "has_dll": has_dll}
+    # `published_at` is preserved when an existing label is re-published (a re-upload
+    # of the same build, or a corrected hash): the grace window is about how long a
+    # build has been stale, and re-registering 1.1.0 does not make it new again.
+    prior = versions.get(version) or {}
+    versions[version] = {
+        "hash": sha256, "download_url": download_url, "has_dll": has_dll,
+        "published_at": prior.get("published_at") or now_iso,
+    }
+    # Re-publishing the label that is currently latest must not leave a stale
+    # `superseded_at` on it — it is not superseded, it is the target.
+    if not (set_latest or not data.get("latest_hash")) and prior.get("superseded_at"):
+        versions[version]["superseded_at"] = prior["superseded_at"]
     data["versions"] = versions
 
     if set_latest or not data.get("latest_hash"):
+        # The outgoing latest stops being latest right now, and that instant — not its
+        # own publish date — is when its holders' copies went stale. It is what
+        # `acceptance()` measures the grace window from, so it is stamped here, at the
+        # one moment the transition happens and the only place that can observe it.
+        outgoing = data.get("latest_version")
+        if outgoing and outgoing != version:
+            prev = versions.get(outgoing)
+            # Only if it still names the hash that was actually latest: a label whose
+            # hash has since been re-published to something else was already replaced,
+            # and stamping it now would restart a window that had already run.
+            if prev and (prev.get("hash") or "").lower() == (data.get("latest_hash") or "").lower():
+                prev.setdefault("superseded_at", now_iso)
+
         data["latest_version"] = version
         data["latest_hash"] = sha256
         data["download_url"] = download_url
         data["has_dll"] = has_dll
+        versions[version].pop("superseded_at", None)
 
-    data["updated_at"] = datetime.now(timezone.utc).isoformat()
+    data["updated_at"] = now_iso
     data["updated_by"] = updated_by
     ref.set(data)
     # The writer refreshes the cache rather than only clearing it: a publish is
@@ -180,29 +214,148 @@ def get_latest_dll_bytes() -> tuple[str, bytes] | None:
         return None
 
 
+def _parse_iso(value) -> datetime | None:
+    """Parse a stored ISO8601 stamp, or None if it is missing or unreadable.
+
+    Unreadable is deliberately the same answer as missing: every caller treats
+    "no stamp" as "no grace", so a corrupted field costs a player the window
+    rather than granting an unbounded one.
+    """
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    # Stamps written here are timezone-aware; one hand-edited in the Firestore
+    # console may not be, and comparing naive to aware raises.
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _grace_days() -> float:
+    """The grace window, read fresh on every call.
+
+    Not cached at import: `admin_set_controls` mutates `settings` in the running
+    process for the cost-guard budgets, so reading the attribute each time is what
+    makes this window adjustable the same way without any further plumbing — and a
+    window that can only be widened by a restart is useless during the outage that
+    would call for widening it.
+    """
+    try:
+        return max(0.0, float(getattr(settings, "MOD_VERSION_GRACE_DAYS", 0) or 0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def acceptance(client_hash: str, cfg_doc: dict | None = None) -> dict:
+    """Decide whether a client's DLL hash may still talk to this server.
+
+    THE single place that answers that question. Both gate call sites — `check()`
+    on the advisory startup route and `enforce_mod_version()` on every authenticated
+    request — go through here, because the two drifting apart is the one failure with
+    no symptom worth reading: the client is told at startup that it may proceed and
+    is then refused 426 by every call it makes, which presents as the mod being broken
+    rather than as being out of date.
+
+    Returns {"state", "version", "grace_until", "latest_hash", "latest_version"} where
+    state is one of:
+
+      "current"  – on the published latest, or nothing is published (fail open).
+      "grace"    – a build we published that stopped being latest recently enough.
+                   Out of date; NOT refused. `grace_until` says when that ends.
+      "blocked"  – refuse. An unknown hash always lands here, which is what keeps
+                   the window from being a hole in the tamper gate: grace is only
+                   ever extended to bytes we ourselves published.
+    """
+    cfg_doc = get_config() if cfg_doc is None else cfg_doc
+    latest_hash = (cfg_doc.get("latest_hash") or "").lower()
+    latest_version = cfg_doc.get("latest_version")
+    h = (client_hash or "").strip().lower()
+
+    base = {"version": None, "grace_until": None,
+            "latest_hash": latest_hash or None, "latest_version": latest_version}
+
+    # Nothing published — there is no target to be behind, so nobody is gated.
+    if not latest_hash:
+        return {**base, "state": "current"}
+    if h and h == latest_hash:
+        return {**base, "state": "current", "version": latest_version}
+
+    days = _grace_days()
+    if days <= 0:
+        return {**base, "state": "blocked"}
+
+    # An empty hash matches no entry and so is never graced, which is the pre-existing
+    # behaviour: a client that will not say what it is running is not out of date, it
+    # is unidentified.
+    label, entry = None, None
+    for name, meta in (cfg_doc.get("versions") or {}).items():
+        if isinstance(meta, dict) and h and (meta.get("hash") or "").lower() == h:
+            label, entry = name, meta
+            break
+    if entry is None:
+        return {**base, "state": "blocked"}
+
+    superseded = _parse_iso(entry.get("superseded_at"))
+    if superseded is None:
+        # Published before this window existed, or currently latest under a second
+        # label. No stamp means no window: falling back to today's strict behaviour
+        # is the answer that cannot accidentally un-gate an ancient build.
+        return {**base, "state": "blocked", "version": label}
+
+    until = superseded + timedelta(days=days)
+    if datetime.now(timezone.utc) < until:
+        return {**base, "state": "grace", "version": label,
+                "grace_until": until.isoformat()}
+    return {**base, "state": "blocked", "version": label}
+
+
 def check(client_hash: str, client_version: str) -> dict:
     """Compare a client's reported DLL hash against the published latest.
 
     Fails open: if nothing is published yet (no latest hash), the client is never
     blocked. Returns a dict matching VersionCheckResponse.
+
+    `up_to_date` answers "may I proceed", NOT "am I on the newest build" — a graced
+    client gets True. That naming is inherited and the distinction is load-bearing,
+    so both literal questions are answered separately by `on_latest` and
+    `update_available`. It has to be this way round: every client already in the
+    wild treats `up_to_date: false` as "raise the blocking window" and knows nothing
+    about grace, so returning False to a build we have decided to accept would leave
+    it self-blocking on a gate the server just opened — and clients already in the
+    wild are precisely who the window exists for. A field only new clients understand
+    cannot carry the decision; the field every client already obeys has to.
     """
     cfg_doc = get_config()
-    latest_hash = (cfg_doc.get("latest_hash") or "").lower()
-    latest_version = cfg_doc.get("latest_version")
-    download_url = cfg_doc.get("download_url")
+    verdict = acceptance(client_hash, cfg_doc)
+    state = verdict["state"]
+    latest_version = verdict["latest_version"]
+    latest_hash = verdict["latest_hash"]
 
     if not latest_hash:
         # Nothing published — don't gate anyone (no hash to advertise yet).
-        return {"enabled": True, "up_to_date": True, "latest_hash": None,
+        return {"enabled": True, "up_to_date": True, "on_latest": True,
+                "update_available": False, "latest_hash": None,
                 "your_version": client_version or None}
 
-    up_to_date = bool(client_hash) and client_hash.strip().lower() == latest_hash
-    return {
+    on_latest = state == "current"
+    resp = {
         "enabled": True,
-        "up_to_date": up_to_date,
+        "up_to_date": state in ("current", "grace"),
+        "on_latest": on_latest,
+        "update_available": not on_latest,
         "latest_version": latest_version,
         "latest_hash": latest_hash,
-        "download_url": download_url,
+        "download_url": cfg_doc.get("download_url"),
         "your_version": client_version or None,
-        "message": None if up_to_date else f"A new version ({latest_version}) is available.",
+        "grace_until": verdict["grace_until"],
+        "message": None,
     }
+    if state == "grace":
+        resp["message"] = (f"A new version ({latest_version}) is available. "
+                           f"This build stops working soon — update through CKAN.")
+    elif state == "blocked":
+        resp["message"] = f"A new version ({latest_version}) is available."
+    return resp

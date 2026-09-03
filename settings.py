@@ -481,6 +481,28 @@ MARKETPLACE_UPLOAD_REWARD_COOLDOWN = 24 * 60 * 60
 # At or below MARKETPLACE_AUTO_DELIST_SCORE the community has buried the craft and
 # it comes off the grid by itself. Set it to 0 (or None) to switch that off entirely
 # and let the score be nothing but a display.
+# ── Mod version gate: the grace window ───────────────────────────────────────
+#
+# The gate is what forces a player onto the current build, and CKAN is what we
+# recommend they update *with*. Those two facts don't compose on their own: NetKAN
+# indexes a release on its own schedule and the player still has to open CKAN, so
+# between a publish and an upgrade being *offered* there is a lag we neither control
+# nor observe. Gating hard on `latest_hash` alone turns that lag into a lockout, and
+# makes a tool we don't run a hard dependency of every login.
+#
+# So a build that was the published latest until recently is still accepted — told
+# it is out of date, never refused. The window is measured from when the build
+# STOPPED being latest (`superseded_at`), not from when it was published: that is the
+# moment the player's copy became stale, it chains correctly across a rapid A→B→C
+# (A ages out on B's clock, not C's), and it cannot be gamed by an old build simply
+# because a new one shipped today.
+#
+# Grace is only ever extended to a hash we ourselves published. An unknown hash — a
+# modified DLL, which is the thing the gate exists for — is refused exactly as before.
+#
+# 0 disables the window and restores the strict latest-hash-only gate.
+MOD_VERSION_GRACE_DAYS = 7
+
 MARKETPLACE_AUTO_DELIST_SCORE = -20
 # What "comes off the grid" means. False delists: the document, the Storage files
 # and every buyer's re-download survive, the seller still sees the craft under My

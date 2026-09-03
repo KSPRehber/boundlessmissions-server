@@ -171,7 +171,8 @@ def _auto_corp_name(member: discord.Member) -> str:
 _ensuring: set[str] = set()
 
 
-def ensure_corp_record_for_account(guild_id, account_id, display_name: str) -> bool:
+def ensure_corp_record_for_account(guild_id, account_id, display_name: str,
+                                   username: str = "") -> bool:
     """Give a player with no Discord a corporation — the record, without a channel.
 
     A corp is two things that had always arrived together: a Firestore record that
@@ -186,6 +187,12 @@ def ensure_corp_record_for_account(guild_id, account_id, display_name: str) -> b
     tests it before posting, so a missing key means "no Discord surface" and the
     delivery falls through to the player's own notification feed, which every
     caller already writes to alongside. Returns True if a record was created.
+
+    `username` is the Boundless handle the picker draws under the display name.
+    Optional because only the caller that has just *claimed* one knows it for
+    free — everyone else leaves it out and `api_server.list_corps` backfills it
+    on the first picker open. Passing it here is only ever an optimisation, never
+    the thing that makes the field appear.
     """
     aid = str(account_id)
     try:
@@ -196,6 +203,10 @@ def ensure_corp_record_for_account(guild_id, account_id, display_name: str) -> b
             "name": f"{display_name} Space Agency",
             "owner_id": aid,
             "owner_name": display_name,
+            # Only when we actually have one. "" is the pre-claim state rather
+            # than an answer, and writing it would tell `list_corps` the question
+            # is settled — see the note above `_corp_usernames`.
+            **({"owner_username": str(username)} if username else {}),
             # No channel_id and no pin_message_id: there is no channel. See above.
             "established_at": now.isoformat(),
             "members": [aid],

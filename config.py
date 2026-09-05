@@ -111,6 +111,15 @@ class Config:
     # Default on (secure); set KSP_DEVICE_BINDING_ENABLED=false in .env to disable.
     KSP_DEVICE_BINDING_ENABLED: bool = _optional("KSP_DEVICE_BINDING_ENABLED", "true").lower() not in ("false", "0", "no", "off")
 
+    # Multiplayer account API (/api/v1/mp/*). Default **off**: this is a brand new
+    # surface for a layer that is not built yet, and a live account service should
+    # not carry an unfinished attack surface on the chance somebody finds it. Turn
+    # it on deliberately with MULTIPLAYER_ENABLED=true once there is a server to
+    # talk to. While off, every /mp/ route answers 404 — not 403 — so the surface
+    # is invisible rather than merely closed, the same posture the admin console
+    # takes toward a non-admin.
+    MULTIPLAYER_ENABLED: bool = _optional("MULTIPLAYER_ENABLED", "false").lower() in ("true", "1", "yes", "on")
+
     # Mod version gate. When on, the KSP client reports its DLL's SHA256 and the
     # server compares it against the published latest hash (see /admin publishversion
     # and config/mod_version in Firestore); an outdated client is blocked in-game
@@ -243,6 +252,7 @@ def insecure_gates() -> list[str]:
         ("KSP_2FA_ENABLED", cfg.KSP_2FA_ENABLED, True),
         ("KSP_CHEAT_DISQUALIFY_ENABLED", cfg.KSP_CHEAT_DISQUALIFY_ENABLED, True),
         ("DEBUG_ENDPOINTS_ENABLED", cfg.DEBUG_ENDPOINTS_ENABLED, False),
+        ("MULTIPLAYER_ENABLED", cfg.MULTIPLAYER_ENABLED, False),
     )
     return [f"{name}={str(value).lower()}"
             for name, value, safe in register if value != safe]

@@ -81,6 +81,7 @@ from data import contracts as cdb
 from data import guild_config
 from data import mod_version as mver
 from data import mp_keys
+from data import mp_servers
 from data import policy as policy
 from data import suspensions
 from data import suspicion as susp
@@ -9697,6 +9698,122 @@ async def mp_token(body: MpTokenRequest, user: dict = Depends(get_current_user))
         # Deliberately not the account id: the client already knows who it is, and
         # this response is one copy-paste away from a server operator's logs.
     }
+
+
+class MpServerRegister(BaseModel):
+    name: str
+
+
+@app.post("/api/v1/mp/servers")
+async def mp_server_register(body: MpServerRegister, user: dict = Depends(get_user_token_only)):
+    """Register a game server and issue its service credential.
+
+    Open to **any linked account**, not just the owner. Anyone can run a game
+    server — that is the hosting model — and gating registration on one person
+    would make that false while looking like a safety measure. What registration
+    actually buys is an identity the master server can verify and that is
+    attributable to a person on the account layer, which is where moderation can
+    act. Capped per account so the listing cannot be flooded.
+
+    `get_user_token_only` rather than `get_current_user`: registering a server is
+    something an operator does from a browser as often as from the game, and the
+    device-binding and mod-hash gates are about a *KSP client*, which this is not.
+    Suspension is still enforced — it lives in this dependency.
+
+    **The credential is returned once and never again.** It is a bearer token
+    good for a year; storing a copy would mean any read of the registry hands out
+    working credentials for every server on the network. A lost one is replaced
+    by re-issuing, which supersedes the old id.
+    """
+    _require_multiplayer()
+    account_id = str(user["user_id"])
+    _rate_limit(f"mp_server_reg:{account_id}", max_hits=10, window=3600.0)
+
+    try:
+        rec = await asyncio.to_thread(mp_servers.register, account_id, body.name)
+    except mp_servers.MpServerError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception:
+        log.exception("mp server registration failed for %s", account_id)
+        raise HTTPException(status_code=503, detail="Could not register a server right now.")
+
+    try:
+        credential, jti, expires = await asyncio.to_thread(
+            mp_keys.mint_service_credential,
+            server_id=rec["server_id"], operator_account=account_id)
+        await asyncio.to_thread(mp_servers.note_issued, rec["server_id"], jti)
+    except Exception:
+        log.exception("mp credential mint failed for %s", rec["server_id"])
+        raise HTTPException(status_code=503, detail="Registered, but the credential could not be issued.")
+
+    return {
+        "server_id": rec["server_id"],
+        "name": rec["name"],
+        "credential": credential,
+        "expires_wc": expires,
+        "note": "Store this credential now — it is not shown again. Re-issue if you lose it.",
+    }
+
+
+@app.get("/api/v1/mp/servers")
+async def mp_server_list(user: dict = Depends(get_user_token_only)):
+    """The caller's own registered servers. Never anyone else's."""
+    _require_multiplayer()
+    account_id = str(user["user_id"])
+    try:
+        return {"servers": await asyncio.to_thread(mp_servers.list_for_account, account_id)}
+    except Exception:
+        log.exception("mp server list failed for %s", account_id)
+        raise HTTPException(status_code=503, detail="Could not read your servers right now.")
+
+
+@app.post("/api/v1/mp/servers/{server_id}/revoke")
+async def mp_server_revoke(server_id: str, user: dict = Depends(get_user_token_only)):
+    """Withdraw a server's credential.
+
+    Answers 404 for a server the caller does not operate — the same shape as one
+    that does not exist, so the endpoint cannot be used to discover which ids are
+    real.
+    """
+    _require_multiplayer()
+    account_id = str(user["user_id"])
+    _rate_limit(f"mp_server_rev:{account_id}", max_hits=30, window=3600.0)
+    try:
+        rec = await asyncio.to_thread(mp_servers.revoke, server_id, account_id)
+    except mp_servers.MpServerError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception:
+        log.exception("mp server revoke failed for %s", server_id)
+        raise HTTPException(status_code=503, detail="Could not revoke that server right now.")
+    return {"server_id": rec["server_id"], "revoked": True}
+
+
+@app.get("/api/v1/mp/servers/revoked")
+async def mp_revoked_credentials(request: Request):
+    """Credential ids the master server must refuse.
+
+    Public, and that is safe: a `jti` identifies a credential without being one,
+    so the list is useless to anyone who does not already hold the token it names
+    — and it has to be reachable by a service that may not hold any account
+    session of its own.
+
+    It exists because the master verifies credentials **offline**, which is what
+    makes it cheap and outage-tolerant and also what makes it unable to notice a
+    withdrawal by itself. A 15-minute player token needs no such list because it
+    simply expires; a one-year service credential does.
+
+    A read failure is a **503, never an empty list**. Returning `[]` would tell
+    the master "nothing is revoked", which is a far stronger claim than "I do not
+    know" — and it would silently re-admit every withdrawn credential for as long
+    as the outage lasted. A 503 lets the master keep the list it already has.
+    """
+    _require_multiplayer()
+    _rate_limit_ip("mp_revoked_ip", request, max_hits=240, window=3600.0)
+    try:
+        return {"revoked": await asyncio.to_thread(mp_servers.revoked_jtis)}
+    except Exception:
+        log.exception("mp revoked list read failed")
+        raise HTTPException(status_code=503, detail="Revocation list unavailable.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════

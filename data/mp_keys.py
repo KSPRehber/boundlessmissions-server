@@ -66,7 +66,13 @@ log = logging.getLogger(__name__)
 ALGORITHM = "EdDSA"
 ISSUER = "boundlessmissions-accounts"
 PLAYER_TOKEN_TTL_SECONDS = 15 * 60
+SERVICE_CREDENTIAL_TTL_SECONDS = 365 * 24 * 3600
 SIGNING_KEY_LIFETIME_SECONDS = 90 * 24 * 3600
+
+#: Who a service credential is *for*. A game server presents it to the master
+#: server; it is not a player token and must never be usable as one.
+MASTER_AUDIENCE = "boundlessmissions-master"
+SCOPE_GAME_SERVER = "game-server"
 # ─────────────────────────────────────────────────────────────────────────────
 
 # The JWKS is read by every game server on a schedule and by every joining
@@ -283,3 +289,57 @@ def mint_player_token(
         headers={"kid": entry["kid"]},
     )
     return token, expires
+
+
+def mint_service_credential(
+    *,
+    server_id: str,
+    operator_account: str,
+    ttl_seconds: int = SERVICE_CREDENTIAL_TTL_SECONDS,
+    at_wc: float | None = None,
+) -> tuple[str, str, int]:
+    """Issue the long-lived credential a registered game server authenticates with.
+
+    Returns ``(credential, jti, expires_wc)``. The `jti` is what the registry
+    stores and what the revocation list names — never the credential itself,
+    which is a bearer token good for a year and is shown to its operator exactly
+    once.
+
+    Signed with the **same key** as player tokens and separated from them by
+    *audience* rather than by a second key. One key means one rotation to operate
+    and one JWKS for everything to fetch, while the audience is what actually
+    keeps the two apart: a player token names a *universe* as its audience and a
+    credential names the master server, so neither verifier will accept the
+    other's token however it is replayed.
+
+    ``operator_account`` is carried so a host's behaviour is attributable to a
+    person on the account layer. That is the design's whole answer to a hostile
+    host — the audit trail, not a technical guarantee — so a credential with no
+    operator is refused rather than issued anonymously.
+    """
+    server_id = str(server_id or "").strip()
+    operator_account = str(operator_account or "").strip()
+    if not server_id:
+        raise MpKeyError("cannot mint a service credential with no server id")
+    if not operator_account:
+        raise MpKeyError("cannot mint a service credential with no operator account")
+
+    now = float(at_wc if at_wc is not None else time.time())
+    entry = get_keyset(at_wc=now)["current"]
+    expires = int(now + ttl_seconds)
+    jti = uuid.uuid4().hex
+
+    claims = {
+        "iss": ISSUER,
+        "sub": server_id,
+        "aud": MASTER_AUDIENCE,
+        "scope": SCOPE_GAME_SERVER,
+        "iat": int(now),
+        "nbf": int(now),
+        "exp": expires,
+        "jti": jti,
+        "operator": operator_account,
+    }
+    token = jwt.encode(claims, entry["pem"], algorithm=ALGORITHM,
+                       headers={"kid": entry["kid"]})
+    return token, jti, expires

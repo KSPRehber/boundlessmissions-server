@@ -80,6 +80,7 @@ from data.store import (store, _db, _storage_bucket, sign_stored,
 from data import contracts as cdb
 from data import guild_config
 from data import mod_version as mver
+from data import mp_keys
 from data import policy as policy
 from data import suspensions
 from data import suspicion as susp
@@ -9558,6 +9559,144 @@ async def web_marketplace_delete(listing_id: str, user: dict = Depends(get_web_u
                     "copies stay downloadable; the listing is off the marketplace.")
     mkt.delete_listing(listing_id)
     return MarketplaceListResult(success=True, message="Craft permanently deleted.", listing_id=listing_id)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Multiplayer account API (/api/v1/mp/...)
+#
+#  The account service's half of the multiplayer trust model. Game servers are
+#  self-hosted and untrusted with respect to this layer, so the whole surface is
+#  two things:
+#
+#    - publish the PUBLIC signing keys, so a host can verify a player token
+#      offline — no round trip per join, and joining survives this service being
+#      down;
+#    - mint a short-lived token scoped to one (account, universe).
+#
+#  A host therefore holds material that can check a token and cannot forge one.
+#  That asymmetry is the entire posture: a compromised game server can corrupt
+#  its own universe and nothing else. Nothing here ever returns private key
+#  material, and `mp_keys.jwks()` builds public JWKs from scratch rather than
+#  reading a stored copy, so there is no field a mistake could serve.
+#
+#  Suspension needs no revocation push to work: a suspended account stops being
+#  minted for (get_current_user refuses it), and every host learns within the
+#  15-minute token life. The push exists for the urgent case and is not what
+#  makes this correct.
+#
+#  Gated by cfg.MULTIPLAYER_ENABLED, default off, answering 404 while off.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _require_multiplayer() -> None:
+    """404, not 403, while the layer is switched off.
+
+    Same posture as the admin console: a surface that is not open should be
+    invisible rather than merely closed, so a probe with a valid session cannot
+    map what exists here before it is finished.
+    """
+    if not cfg.MULTIPLAYER_ENABLED:
+        raise HTTPException(status_code=404, detail="Not found.")
+
+
+class MpTokenRequest(BaseModel):
+    # Which universe the token is for. Required, and never defaulted: a token
+    # naming only the account would let a host admit a player into a universe
+    # they hold nothing in, or replay a token it received into a different one.
+    universe_id: str
+
+
+@app.get("/api/v1/mp/jwks")
+async def mp_jwks(request: Request):
+    """Public signing keys, JWKS-shaped.
+
+    Anonymous on purpose — these are public keys, and a host must be able to
+    fetch them before it has any credential of its own. Memoised in
+    `data/mp_keys` and bounded per IP, for the reason `/version/check` is: an
+    uncached anonymous route on every host's schedule is a metered Firestore
+    operation per request.
+
+    Both the current and the previous key appear whenever a previous one exists.
+    A host that cached this set and then meets a token signed moments before a
+    rotation still finds the key it needs, which is the join outage the overlap
+    exists to prevent.
+    """
+    _require_multiplayer()
+    _rate_limit_ip("mp_jwks_ip", request, max_hits=240, window=3600.0)
+    try:
+        return await asyncio.to_thread(mp_keys.jwks)
+    except Exception:
+        log.exception("mp jwks read failed")
+        # Fails CLOSED, unlike /version/check. An empty key set is not a
+        # degraded answer here — a host that cached it would refuse every player
+        # and report the tokens as forged, which is a far worse failure than a
+        # host that retries. There is nothing safe to substitute.
+        raise HTTPException(status_code=503, detail="Key set unavailable.")
+
+
+@app.post("/api/v1/mp/token")
+async def mp_token(body: MpTokenRequest, user: dict = Depends(get_current_user)):
+    """Mint a 15-minute player token for one universe.
+
+    Behind `get_current_user`, which is the full KSP-tier gate: audience,
+    suspension, the mod version gate and device binding. That is deliberate and
+    is where multiplayer's access control actually lives — a suspended or
+    unverified client never receives a token, so no game server has to be told
+    about either, and hosts see a boolean rather than a reason.
+
+    The handle is the account's claimed username, which `accounts.claim_username`
+    refuses to change once set. Everything in the multiplayer layer that names a
+    player — contracts, disputes, corp membership, combat reports — references
+    that handle rather than the display name, because a display name is editable
+    and renaming to match a trusted trader would otherwise be trivial
+    impersonation among strangers signing binding agreements.
+    """
+    _require_multiplayer()
+    account_id = str(user["user_id"])
+
+    # Per account rather than per IP: the thing worth bounding is one account
+    # minting continuously, and a token is cheap to issue but names a person.
+    _rate_limit(f"mp_token:{account_id}", max_hits=30, window=300.0)
+
+    universe_id = (body.universe_id or "").strip()
+    if not universe_id or len(universe_id) > 64:
+        raise HTTPException(status_code=400, detail="A universe id is required.")
+
+    account = await asyncio.to_thread(accounts.get_account, account_id)
+    handle = str((account or {}).get("username") or "").strip()
+    if not handle:
+        # Refused rather than substituted. Falling back to the display name would
+        # put a mutable string in the one field the whole layer treats as stable,
+        # and falling back to the account id would leak an internal key to every
+        # host. Claiming a username is a one-time action the player can take.
+        raise HTTPException(
+            status_code=409,
+            detail="Choose a Boundless username before joining multiplayer — it is the "
+                   "name other players and every contract will know you by, and it cannot "
+                   "be changed later.")
+
+    try:
+        token, expires_wc = await asyncio.to_thread(
+            mp_keys.mint_player_token,
+            account_id=account_id,
+            handle=handle,
+            universe_id=universe_id,
+            display_name=str((account or {}).get("display_name") or ""),
+        )
+    except mp_keys.MpKeyError as exc:
+        log.warning("mp token mint refused for %s: %s", account_id, exc)
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception:
+        log.exception("mp token mint failed for %s", account_id)
+        raise HTTPException(status_code=503, detail="Could not issue a token right now.")
+
+    return {
+        "token": token,
+        "expires_wc": expires_wc,
+        "universe_id": universe_id,
+        "handle": handle,
+        # Deliberately not the account id: the client already knows who it is, and
+        # this response is one copy-paste away from a server operator's logs.
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════

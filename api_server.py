@@ -10179,6 +10179,78 @@ async def admin_craft_ban_backfill(limit: int = 100, user: dict = Depends(get_ow
 
 # ── User accounts ─────────────────────────────────────────────────────────────
 
+# Names for the console's user list.
+#
+# `users/{id}.username` is a *Discord* handle: cogs/xp stamps it off a
+# discord.Member, so a website sign-up has none at all and the console drew every
+# one of them as "(unknown name)" over a bare `a_…` id — while the mod, the
+# pickers and the site all show that same player by name, because those read the
+# account document. Identity lives on `accounts/{id}`, so the console reads it
+# too, and names a player the way `cogs/targets._label_for` does for a moderator:
+# the display name they are known by, plus the permanent @username that is the
+# same string in every server. Both are shown, because they answer different
+# questions — a display name is what the player calls themselves and two people
+# may share one, the username is the handle a ticket can be checked against.
+#
+# TTL-cached for the reason `_corp_usernames` is: the list draws up to 200 rows
+# and a read per row per open is exactly the Firestore bill cost_guard exists to
+# defend against. Only the rows actually being returned are resolved — the filter
+# and the sort run over the whole store, and paying a read for every user in it
+# to render fifty would be far worse than the "(unknown name)" this replaces.
+_ADMIN_NAME_TTL = 300.0
+_admin_name_cache: dict[str, tuple[float, dict]] = {}
+
+
+def _admin_account_names(ids) -> dict[str, dict]:
+    """{account_id: {"username", "display_name"}} for the rows about to be drawn.
+
+    Blocking; call from a thread. Never raises: a row whose account could not be
+    read still draws under whatever Discord could tell us, and is deliberately
+    *not* cached, so the next open retries rather than remembering a blank.
+    """
+    now = time.time()
+    out: dict[str, dict] = {}
+    wanted: list[str] = []
+    for aid in ids:
+        hit = _admin_name_cache.get(aid)
+        if hit and now - hit[0] < _ADMIN_NAME_TTL:
+            out[aid] = hit[1]
+        else:
+            wanted.append(aid)
+    for aid in wanted:
+        try:
+            acct = accounts.get_account(aid) or {}
+        except Exception as exc:                   # pragma: no cover - defensive
+            log.warning("Admin name read failed for %s: %s", aid, exc)
+            continue
+        names = {"username": str(acct.get("username") or ""),
+                 "display_name": str(acct.get("display_name") or "")}
+        _admin_name_cache[aid] = (now, names)
+        out[aid] = names
+    if len(_admin_name_cache) > 512:
+        _admin_name_cache.clear()
+    return out
+
+
+def _admin_apply_names(rows: list[dict], names: dict[str, dict]) -> None:
+    """Fill the account-held name fields into rows built from the store alone.
+
+    The account's display name wins over Discord's for the same reason
+    `_label_for` prefers it: it is the one the player chose and the one every
+    other surface shows them under. An empty field never overwrites — an account
+    mid-onboarding has no username yet, and a row is better named by a stale
+    Discord handle than by nothing.
+    """
+    for row in rows:
+        n = names.get(row["user_id"])
+        if not n:
+            continue
+        if n["username"]:
+            row["username"] = n["username"]
+        if n["display_name"]:
+            row["display_name"] = n["display_name"]
+
+
 def _admin_user_row(uid: str, u: dict, suspension: dict | None = None) -> dict:
     """One row of the console's user list.
 
@@ -10186,14 +10258,22 @@ def _admin_user_row(uid: str, u: dict, suspension: dict | None = None) -> dict:
     rows and a per-row Firestore read would make the page cost 200 of them, so
     admin_users resolves them all with one `list_active()` query. A single-user
     response (adjust, suspend) passes its own.
+
+    Names are the Discord-side fallbacks only; `_admin_apply_names` puts the
+    account's own on top. `username` starts empty rather than holding the store's
+    Discord handle, because it means the Boundless username here and a field that
+    means two things on adjacent rows is worse than one that is sometimes blank —
+    the Discord handle is a display name, and is used as one.
     """
-    name = u.get("username", "")
-    if not name and _bot_instance is not None:
-        du = _bot_instance.get_user(int(uid)) if uid.isdigit() else None
-        name = str(du) if du else ""
+    shown = str(u.get("username") or "")
+    if _bot_instance is not None and uid.isdigit():
+        du = _bot_instance.get_user(int(uid))
+        if du is not None:
+            shown = du.display_name or str(du)
     return {
         "user_id": uid,
-        "username": name,
+        "username": "",
+        "display_name": shown,
         "xp": u.get("xp", 0),
         "level": u.get("level", 0),
         "balance": u.get("balance", 0),
@@ -10218,14 +10298,33 @@ async def admin_users(q: str = "", limit: int = 50, user: dict = Depends(get_own
     buried at rank 140 by balance is one nobody reviews."""
     needle = q.strip().lower()
     active = {str(r.get("user_id")): r for r in suspensions.list_active()}
+
+    # A Boundless username is not in the store at all, so a search for one has to
+    # go through the reservation collection: one prefix scan over document ids,
+    # no index, at most 25 reads, and it is the only route by which a web-only
+    # player is findable by the name every other surface shows them under.
+    by_username: set[str] = set()
+    if needle:
+        owners = await asyncio.to_thread(accounts.search_username_owners, needle)
+        by_username = {str(v) for v in owners.values()}
+
     rows = []
     for uid, u in store.get_all_users(0).items():
         row = _admin_user_row(uid, u, active.get(str(uid)))
-        if needle and needle not in uid and needle not in row["username"].lower():
+        # `uid.lower()`, not `uid`: a Firebase-origin id is mixed case
+        # (`a_cwLAJyg…`) while the needle is lowercased, so an id typed or pasted
+        # into the box matched nothing at all for exactly the accounts that have
+        # no other name to search by.
+        if needle and needle not in uid.lower() \
+                and needle not in row["display_name"].lower() \
+                and uid not in by_username:
             continue
         rows.append(row)
     rows.sort(key=lambda r: (r["suspension"] is not None, r["balance"]), reverse=True)
-    return {"users": rows[:max(1, min(limit, 200))], "total": len(rows)}
+    page = rows[:max(1, min(limit, 200))]
+    _admin_apply_names(page, await asyncio.to_thread(
+        _admin_account_names, [r["user_id"] for r in page]))
+    return {"users": page, "total": len(rows)}
 
 
 @app.post("/api/v1/web/admin/users/{user_id}/adjust")
@@ -10256,8 +10355,12 @@ async def admin_user_adjust(user_id: str, req: AdminUserAdjust,
     _admin_audit(user, "adjust-user",
                  f"{user_id} balance_set={req.balance_set} balance_delta={req.balance_delta} "
                  f"xp_set={req.xp_set}" + (f" debts_cleared={wiped}" if wiped else ""))
-    return {"success": True, "user": _admin_user_row(user_id, store.get_user(0, uid),
-                                                     suspensions.get_active(user_id))}
+    row = _admin_user_row(user_id, store.get_user(0, uid),
+                          suspensions.get_active(user_id))
+    # One account read, so the row the console swaps in is named the same way the
+    # list named it — without this an edit renames the row to "(unknown name)".
+    _admin_apply_names([row], await asyncio.to_thread(_admin_account_names, [row["user_id"]]))
+    return {"success": True, "user": row}
 
 
 @app.post("/api/v1/web/admin/users/{user_id}/logout_all")

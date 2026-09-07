@@ -630,6 +630,42 @@ def search_usernames(prefix: str, limit: int = 25) -> list[str]:
         return []
 
 
+def search_username_owners(prefix: str, limit: int = 25) -> dict[str, str]:
+    """`search_usernames`, but as {username: account_id}.
+
+    The same one query and the same reads — `stream()` returns whole documents
+    either way, so reading the `account_id` out of them is free — split off rather
+    than folded in because the picker above wants names alone and this wants the
+    accounts behind them. It is what lets a search box match a *Boundless* handle
+    without a read per candidate: the alternative is `owner_of_username` per name,
+    which is `limit` more reads for an answer already in hand.
+
+    Never raises, and cannot distinguish "no matches" from "couldn't read" — that
+    is right here for the same reason it is right in `account_for_username`: both
+    render as no result in a search box. A moderator *acting* on a name must still
+    go through `owner_of_username`.
+    """
+    key = normalize_username(prefix)
+    limit = max(1, min(int(limit or 25), 25))
+    if not key:
+        return {}
+    try:
+        q = (_usernames()
+             .order_by("__name__")
+             .start_at({"__name__": key})
+             .end_at({"__name__": key + "\uf8ff"})
+             .limit(limit))
+        out = {}
+        for doc in q.stream():
+            owner = str((doc.to_dict() or {}).get("account_id") or "")
+            if owner:
+                out[doc.id] = owner
+        return out
+    except Exception as exc:
+        log.warning("Username owner search %r failed: %s", key, exc)
+        return {}
+
+
 # ── Profile fields the player may change ─────────────────────────────────────
 
 DISPLAY_NAME_MAX = 32

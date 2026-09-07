@@ -35,6 +35,14 @@ class Config:
 
     # ── Guild IDs for dev slash-command sync ───
     # e.g. "123456789,987654321"  → [123456789, 987654321]
+    #
+    # NOT an allowlist, and nothing reads it any more. It only ever chose where
+    # slash commands were *registered*, which is discoverability rather than
+    # authority — it did not stop the bot being added to a server, did not cover
+    # prefix or component interactions, and syncing globally when blank (the
+    # shipped default) registered every command everywhere. The guilds the bot
+    # will actually serve are hardcoded in `guild_gate.py`, and `_sync_commands`
+    # now follows that list. Kept only so an existing .env does not fail to load.
     _raw_guilds = _optional("GUILD_IDS", "")
     GUILD_IDS: list[int] = (
         [int(g.strip()) for g in _raw_guilds.split(",") if g.strip()]

@@ -41,6 +41,10 @@ S.update({
 })
 
 
+# NOTE: kept only for a future *guild-local* economy command. Every command in
+# this cog today writes the global `users/{id}` wallet and so uses
+# `perms.global_records_mod_only` instead — see the tier note in cogs/perms.py.
+# Do not reach for this one for anything that moves coins.
 def mod_only():
     """User must have Kick Members or Administrator permission. Gates on the real
     invoker (mimic-safe)."""
@@ -250,7 +254,7 @@ class Economy(commands.Cog, name="Economy"):
     @app_commands.describe(member="Who to give to", username=targets.USERNAME_DESC,
                            amount="Amount to give", reason="Reason (optional)")
     @app_commands.default_permissions(kick_members=True)
-    @mod_only()
+    @perms.global_records_mod_only()
     @targets.username_param
     async def givemoney(
         self, interaction: discord.Interaction, amount: int,
@@ -296,7 +300,7 @@ class Economy(commands.Cog, name="Economy"):
     @app_commands.describe(member="Who to fine", username=targets.USERNAME_DESC,
                            amount="Amount to deduct", reason="Reason (optional)")
     @app_commands.default_permissions(kick_members=True)
-    @mod_only()
+    @perms.global_records_mod_only()
     @targets.username_param
     async def fine(
         self, interaction: discord.Interaction, amount: int,
@@ -355,7 +359,7 @@ class Economy(commands.Cog, name="Economy"):
     @app_commands.describe(member="Target member", username=targets.USERNAME_DESC,
                            amount="New balance amount")
     @app_commands.default_permissions(kick_members=True)
-    @mod_only()
+    @perms.global_records_mod_only()
     @targets.username_param
     async def setbalance(self, interaction: discord.Interaction, amount: int,
                          member: discord.Member | None = None,

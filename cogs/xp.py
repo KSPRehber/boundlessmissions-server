@@ -205,7 +205,13 @@ class XP(commands.Cog, name="XP"):
     @app_commands.describe(member="Target member", username=targets.USERNAME_DESC,
                            amount="XP amount to set")
     @app_commands.default_permissions(administrator=True)
-    @app_commands.checks.has_permissions(administrator=True)
+    # Was `checks.has_permissions(administrator=True)`: a raw Discord permission,
+    # which made the one command that rewrites a player's global XP self-granting
+    # in any server the bot was in, and which reads `interaction.user` (the
+    # mimic-swapped one) rather than the real invoker. The mapped-role gate is
+    # both mimic-safe and deliberate. `default_permissions` stays on top of it, so
+    # this still needs Administrator here unless the server has re-scoped it.
+    @perms.global_records_admin_only()
     @targets.username_param
     async def setxp(
         self,

@@ -15,6 +15,7 @@ command is gated on. The real user is stashed by the mimic patch in
 import logging
 
 import discord
+from discord import app_commands
 
 from config import cfg
 
@@ -93,6 +94,97 @@ def holds_authority_anywhere(client: discord.Client, user_id: int) -> bool:
         if member.guild_permissions.kick_members or member.guild_permissions.administrator:
             return True
     return False
+
+
+# ── The tier that writes GLOBAL records ──────────────────────────────────────
+#
+# `is_mod_user` above ends in `kick_members or administrator`, so anyone holding
+# either in a guild the bot is in passes it with no bot-side configuration at all.
+# That is right for what it was written for — kick, ban, mute, and the other
+# guild-local actions in cogs/moderation.py, which act on guild membership and
+# whose authority genuinely is a Discord permission.
+#
+# It is wrong for the five commands that write records the whole product shares:
+# /givemoney, /fine, /setbalance (the global `users/{id}` wallet), /setxp and
+# /contractreset (the global contract collection). There the fallback means the
+# mod tier is *self-granted* — obtaining it takes no more than a server where you
+# hold administrator, which until guild_gate landed meant any server at all.
+#
+# `moderatable_here` already bounds *who* such a moderator may act on: the target
+# has to be a member of the guild they are moderating in. This bounds the other
+# half — that the authority itself has to have been handed over deliberately,
+# rather than inferred from a Discord permission nobody granted with the shared
+# economy in mind. So: the bot owner, or a holder of the guild's **mapped** mod or
+# admin role (/admin setrole), and nothing else.
+#
+# The admin role counts for the mod tier because it is strictly the higher of the
+# two (`is_admin_user` gates the guild-scoped console surface); an admin who could
+# not run a mod command would be a rung missing from the middle of the ladder.
+
+_MAPPED_TIERS = {"mod": ("mod", "admin"), "admin": ("admin",)}
+
+
+def global_records_refusal(interaction, tier: str = "mod") -> str | None:
+    """Why this invoker may NOT run a command that writes global records, or None.
+
+    Returns a sentence rather than a bool because the two failure modes need
+    different answers and the generic "you don't have permission" is wrong for one
+    of them: an owner whose guild has no mapped role has a *configuration* problem,
+    and telling them it is a permission problem sends them to the wrong screen.
+    """
+    if is_owner_user(interaction):
+        return None
+    guild = getattr(interaction, "guild", None)
+    if guild is None:
+        return ("That command has to be run in a server — it writes records shared "
+                "across every server, so the authority for it has to come from one.")
+    u = real_user(interaction)
+    if not isinstance(u, discord.Member):
+        return "That command can only be run by a member of this server."
+
+    from data import guild_config
+    keys = _MAPPED_TIERS.get(tier, _MAPPED_TIERS["mod"])
+    mapped = [(k, guild_config.resolve_role(guild, k)) for k in keys]
+    for _key, role in mapped:
+        if role is not None and u.get_role(role.id) is not None:
+            return None
+
+    if not any(role is not None for _key, role in mapped):
+        label = "bot-admin" if tier == "admin" else "bot-moderator or bot-admin"
+        return (f"This server has no {label} role mapped, so nobody here can run "
+                f"that command yet. It moves coins, XP and contracts that every "
+                f"server shares, so it is deliberately not granted by a Discord "
+                f"permission — the bot owner maps a role to it with "
+                f"`/admin setrole`.")
+    names = ", ".join(f"@{role.name}" for _k, role in mapped if role is not None)
+    return (f"That command needs {names} in this server. It moves coins, XP and "
+            f"contracts shared across every server, so holding Administrator or "
+            f"Kick Members here is deliberately not enough.")
+
+
+def is_global_records_user(interaction, tier: str = "mod") -> bool:
+    """Bool form of `global_records_refusal`, for a UI that needs to hide a button."""
+    return global_records_refusal(interaction, tier) is None
+
+
+def global_records_mod_only():
+    """Gate for a mod-tier command that writes global records. Mimic-safe."""
+    async def predicate(interaction: discord.Interaction) -> bool:
+        why = global_records_refusal(interaction, "mod")
+        if why is not None:
+            raise app_commands.CheckFailure(why)
+        return True
+    return app_commands.check(predicate)
+
+
+def global_records_admin_only():
+    """Gate for an admin-tier command that writes global records. Mimic-safe."""
+    async def predicate(interaction: discord.Interaction) -> bool:
+        why = global_records_refusal(interaction, "admin")
+        if why is not None:
+            raise app_commands.CheckFailure(why)
+        return True
+    return app_commands.check(predicate)
 
 
 async def block_if_mod_only(interaction: discord.Interaction) -> bool:

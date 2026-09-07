@@ -117,7 +117,7 @@ class Contracts(commands.Cog, name="Contracts"):
     @app_commands.describe(user="The user whose contracts should be cancelled",
                            username=targets.USERNAME_DESC)
     @app_commands.default_permissions(manage_guild=True)
-    @mod_only()
+    @perms.global_records_mod_only()
     @targets.username_param
     async def contractreset(self, interaction: discord.Interaction,
                             user: discord.Member | None = None,

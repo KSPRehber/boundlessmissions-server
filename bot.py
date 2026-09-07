@@ -20,6 +20,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from config import cfg, insecure_gates
+import guild_gate
 
 # Parse --sync flag before the bot starts
 _SYNC_COMMANDS = "--sync" in sys.argv
@@ -85,6 +86,51 @@ def _apply_mimic(bot, interaction, *, exclude=()):
     interaction.user = target
 
 
+# ── Guild allowlist, at the two dispatch points the command tree does not cover ─
+#
+# `GatedCommandTree.interaction_check` below covers slash commands and autocomplete.
+# Buttons and modals never reach the tree — they are dispatched straight out of
+# ViewStore — and a view outlives the message it was sent on, so a guild that is
+# de-listed (or that we have left) can still have our buttons on screen in it.
+# These two hooks are already patched for mimic, so the gate rides along rather
+# than adding a third patch of discord.py internals.
+
+
+async def _refuse_interaction(interaction) -> None:
+    """Answer a gated-off interaction, best effort."""
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.send_message(guild_gate.REFUSAL, ephemeral=True)
+    except Exception:                      # already answered, expired, 403 in a DM…
+        pass
+
+
+def _gate_component(interaction) -> bool:
+    """False when this component/modal interaction must NOT be dispatched.
+
+    Answering matters: an undispatched custom_id renders as "This interaction
+    failed", which reads as the bot being broken rather than as a deliberate
+    refusal — the same reason cogs/marketplace.py survives as a tombstone. Dispatch
+    is synchronous, so the reply is scheduled onto the loop, and every failure in
+    that scheduling is swallowed: the refusal must hold even if the reply cannot.
+    """
+    if guild_gate.is_allowed_interaction(interaction):
+        return True
+    log.warning(
+        "Guild gate: refused a component interaction from guild %s (user %s)",
+        getattr(interaction, "guild_id", None),
+        getattr(getattr(interaction, "user", None), "id", None),
+    )
+    try:
+        client = getattr(interaction, "client", None) or getattr(interaction, "_client", None)
+        loop = getattr(client, "loop", None)
+        if loop is not None:
+            loop.create_task(_refuse_interaction(interaction))
+    except Exception:
+        pass
+    return False
+
+
 # Patch CommandTree._from_interaction (slash commands + autocomplete)
 _original_from_interaction = discord.app_commands.CommandTree._from_interaction
 
@@ -98,6 +144,8 @@ discord.app_commands.CommandTree._from_interaction = _patched_from_interaction
 _original_view_dispatch = discord.ui.view.ViewStore.dispatch_view
 
 def _patched_view_dispatch(self, component_type, custom_id, interaction):
+    if not _gate_component(interaction):
+        return
     bot = getattr(interaction, "client", None) or getattr(interaction, "_client", None)
     if bot:
         _apply_mimic(bot, interaction)
@@ -109,6 +157,8 @@ discord.ui.view.ViewStore.dispatch_view = _patched_view_dispatch
 _original_modal_dispatch = discord.ui.view.ViewStore.dispatch_modal
 
 def _patched_modal_dispatch(self, custom_id, interaction, components, resolved):
+    if not _gate_component(interaction):
+        return
     bot = getattr(interaction, "client", None) or getattr(interaction, "_client", None)
     if bot:
         _apply_mimic(bot, interaction)
@@ -123,6 +173,33 @@ discord.ui.view.ViewStore.dispatch_modal = _patched_modal_dispatch
 intents = discord.Intents.all()
 
 
+# ── Gated command tree ───────────────────────────────────────────────────────
+class GatedCommandTree(app_commands.CommandTree):
+    """The guild allowlist, applied to every slash command and autocomplete.
+
+    Returning False from `interaction_check` makes discord.py set `command_failed`
+    and return *silently* (see CommandTree._call), which Discord renders as "the
+    application did not respond" a few seconds later. So the refusal is spoken
+    here rather than left to the caller's error handler, which never runs on this
+    path. Autocomplete is refused without a reply — it has no response type that
+    can carry a sentence, and an empty list is the correct answer for a guild we
+    do not serve.
+    """
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if guild_gate.is_allowed_interaction(interaction):
+            return True
+        log.warning(
+            "Guild gate: refused /%s from guild %s (user %s)",
+            getattr(getattr(interaction, "command", None), "qualified_name", "?"),
+            interaction.guild_id,
+            getattr(interaction.user, "id", None),
+        )
+        if interaction.type is discord.InteractionType.application_command:
+            await _refuse_interaction(interaction)
+        return False
+
+
 # ── Bot subclass ─────────────────────────────────────────────────────────────
 class GeneKermanBot(commands.Bot):
     def __init__(self) -> None:
@@ -131,9 +208,26 @@ class GeneKermanBot(commands.Bot):
             intents=intents,
             owner_id=cfg.OWNER_ID or None,
             help_command=None,  # We provide our own in cogs/general.py
+            tree_cls=GatedCommandTree,
         )
         self.mimic_map: dict[int, discord.Member] = {}
         self.extlog_enabled = False
+        # Prefix commands (!help) are dispatched by ext.commands and never touch the
+        # app-command tree, so the allowlist has to be added here too. A global check
+        # is the whole surface: it runs for every prefix command in every cog.
+        self.add_check(self._guild_gate_check)
+
+    async def _guild_gate_check(self, ctx: commands.Context) -> bool:
+        """Guild allowlist for prefix commands. Silent by design: an unapproved
+        server should get no reply at all from a `!` message, since answering one
+        confirms the bot is listening and invites a second try."""
+        if ctx.guild is None:
+            return True                      # DMs, as elsewhere — see guild_gate
+        if guild_gate.is_allowed_guild(ctx.guild.id):
+            return True
+        log.warning("Guild gate: refused prefix command in guild %s (user %s)",
+                    ctx.guild.id, getattr(ctx.author, "id", None))
+        return False
 
     async def close(self) -> None:
         """Flush buffered user data before shutting down so a /shutdown or console
@@ -322,30 +416,89 @@ class GeneKermanBot(commands.Bot):
             log.info("Skipping command sync (pass --sync to force)")
 
     async def _sync_commands(self) -> None:
-        """Push the current command tree to Discord's API."""
-        if cfg.GUILD_IDS:
-            for guild_id in cfg.GUILD_IDS:
-                guild = discord.Object(id=guild_id)
-                self.tree.copy_global_to(guild=guild)
-                synced = await self.tree.sync(guild=guild)
-                log.info("Synced %d commands to guild %d", len(synced), guild_id)
-                
-            # Wipe global commands on Discord's side by clearing internal global commands
-            # AFTER we already copied them to the guild.
-            self.tree.clear_commands(guild=None)
-            await self.tree.sync(guild=None)
-            log.info("Wiped any leftover global commands.")
-        else:
-            synced = await self.tree.sync()
-            log.info("Synced %d global slash commands", len(synced))
-            
+        """Push the current command tree to Discord's API, to the allowed guilds only.
+
+        This used to read `cfg.GUILD_IDS`, and when that was empty — the shipped
+        `.env.example` default — it synced *globally*, registering every command in
+        every server the bot had been added to. Registration was never the security
+        boundary (guild_gate is), but a command that is not registered cannot be
+        invoked at all, so the two should not disagree about where the bot works.
+
+        The allowlist is never empty, so there is no global-sync branch any more;
+        the global wipe stays, because a previous global sync has to be undone.
+        """
+        for guild_id in sorted(guild_gate.ALLOWED_GUILD_IDS):
+            guild = discord.Object(id=guild_id)
+            self.tree.copy_global_to(guild=guild)
+            synced = await self.tree.sync(guild=guild)
+            log.info("Synced %d commands to guild %d", len(synced), guild_id)
+
+        # Wipe global commands on Discord's side by clearing internal global commands
+        # AFTER we already copied them to the guild.
+        self.tree.clear_commands(guild=None)
+        await self.tree.sync(guild=None)
+        log.info("Wiped any leftover global commands.")
+        
         self.tree.on_error = self.on_app_command_error
+
+    async def on_guild_join(self, guild: discord.Guild) -> None:
+        """Leave any server that is not on the allowlist, immediately.
+
+        Safe to do unconditionally, unlike the boot sweep: a guild we have just
+        joined holds nothing of ours — no corps, no tickets, no guild_config — so
+        there is no state to destroy, and this is the exact case guild_gate exists
+        for. The interaction gate has already made us inert here, so a failed
+        leave() degrades to "present but useless" rather than to the old behaviour.
+        """
+        if guild_gate.is_allowed_guild(guild.id):
+            log.info("Joined allowed guild %s (%s)", guild.name, guild.id)
+            return
+        log.warning(
+            "Guild gate: left %s (%s, owner %s) — not on the allowlist",
+            guild.name, guild.id, getattr(guild.owner, "id", "?"),
+        )
+        try:
+            await guild.leave()
+        except Exception as exc:
+            log.error("Guild gate: could not leave %s (%s): %s", guild.name, guild.id, exc)
+
+    async def _sweep_disallowed_guilds(self) -> None:
+        """Report guilds we are in but not allowed in. Leaves only on request.
+
+        Deliberately not symmetrical with on_guild_join. A guild we were already in
+        when the allowlist landed may hold corp channels, open tickets and a
+        guild_config nobody can reconstruct, and a restart that silently abandoned
+        one would be a destructive act taken by a deploy rather than by a person.
+        The interaction gate has already stopped us serving it, so reporting is
+        sufficient and leaving is a separate, opt-in decision
+        (GUILD_GATE_LEAVE_ON_BOOT).
+        """
+        stray = [g for g in self.guilds if not guild_gate.is_allowed_guild(g.id)]
+        if not stray:
+            return
+        for g in stray:
+            log.warning("Guild gate: in non-allowed guild %s (%s, %d members) — "
+                        "commands are refused there", g.name, g.id, g.member_count or 0)
+        if not guild_gate.leave_on_boot():
+            log.warning(
+                "Guild gate: %d non-allowed guild(s). Not leaving: set "
+                "GUILD_GATE_LEAVE_ON_BOOT=true to leave them, or add them to "
+                "EXTRA_ALLOWED_GUILD_IDS to serve them.", len(stray))
+            return
+        for g in stray:
+            try:
+                await g.leave()
+                log.warning("Guild gate: left %s (%s) on boot", g.name, g.id)
+            except Exception as exc:
+                log.error("Guild gate: could not leave %s (%s): %s", g.name, g.id, exc)
 
     async def on_ready(self) -> None:
         log.info("=" * 50)
         log.info("Bot ready!  Logged in as %s (ID: %s)", self.user, self.user.id)
         log.info("Guilds: %d", len(self.guilds))
+        log.info("Guild gate: %s", guild_gate.describe())
         log.info("=" * 50)
+        await self._sweep_disallowed_guilds()
         await self.change_presence(
             activity=discord.Activity(
                 type=discord.ActivityType.playing,
@@ -447,10 +600,15 @@ class GeneKermanBot(commands.Bot):
             # as "no permission" followed by "an unexpected error occurred" and a
             # DM to the maintainer for every non-mod who tried a mod command.
             # Only answer if the cog has not.
+            # Prefer the sentence the check itself raised. Several checks build a
+            # specific one — which permission is missing (cogs/moderation.mod_only),
+            # or that no mod role is mapped in this server (cogs/perms) — and the
+            # generic "no permission" used to discard all of it, sending an owner
+            # hunting for a permission problem that was really a configuration one.
+            detail = str(error).strip()
+            msg = detail or tp(interaction.guild_id, interaction.user.id, "common.no_perm")
             if not interaction.response.is_done():
-                await interaction.response.send_message(
-                    tp(interaction.guild_id, interaction.user.id, "common.no_perm"),
-                    ephemeral=True)
+                await interaction.response.send_message(msg, ephemeral=True)
             return
 
         log.error("Unhandled app command error: %s", error, exc_info=True)

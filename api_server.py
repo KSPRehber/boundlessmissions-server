@@ -1359,7 +1359,8 @@ async def auth_link(req: LinkRequest, request: Request,
         # This is also the path a Discord-less account uses, which has no DM to
         # send to, and it sidesteps the failure below entirely.
         log.info("KSP: panel login-approval challenge issued for %s", result["user_id"])
-        return LinkResponse(status="approval_required", challenge_id=challenge_id)
+        return LinkResponse(status="approval_required", challenge_id=challenge_id,
+                            approve_via="panel")
 
     sent = await _dm_login_approval(result["user_id"], challenge_id, client_ip)
     if not sent:
@@ -1371,7 +1372,8 @@ async def auth_link(req: LinkRequest, request: Request,
         )
 
     log.info("KSP: login-approval challenge issued for %s", result["username"])
-    return LinkResponse(status="approval_required", challenge_id=challenge_id)
+    return LinkResponse(status="approval_required", challenge_id=challenge_id,
+                        approve_via="discord")
 
 
 @app.post("/api/v1/auth/link/poll", response_model=LinkResponse)
@@ -2379,7 +2381,31 @@ async def _classify_missions(missions: list[dict], week_key: str) -> list[dict]:
     AI-classify each mission as 'craft_build' or 'active_vessel' with
     required_situation and required_body. Results are cached in Firestore
     so AI is only called once per week.
+
+    A mission that already carries a `mission_type` is left exactly as it is, and
+    is not sent to the model or looked up in the cache. Every entry in
+    `data/mission_templates.TEMPLATES` now authors those three fields, so in
+    practice this function returns immediately for a normal week — which is the
+    point: the submit gate enforces body and situation, so what it will demand of
+    a mission we wrote ourselves is a fact to write down, not one to re-infer.
+    Inference stays here for anything that arrives without it (an older stored
+    week, a mission from somewhere else).
+
+    The early return also has to skip the *cache*, not just the model: a cache
+    entry for this week may predate the authored values and would otherwise put
+    a stale guess back over them.
     """
+    pending = [m for m in missions if not m.get("mission_type")]
+    if pending:
+        # Every path below mutates the dicts it is given in place, so classifying
+        # the pending subset annotates the very objects in `missions`.
+        await _classify_unclassified(pending, week_key)
+    return missions
+
+
+async def _classify_unclassified(missions: list[dict], week_key: str) -> list[dict]:
+    """Infer mission_type/required_situation/required_body for missions that carry
+    none. Cached in Firestore per week; falls back to `_classify_heuristic`."""
     # Check cache first
     ref = _classification_ref(week_key)
     snap = ref.get()
@@ -7502,7 +7528,8 @@ async def web_auth_link(req: LinkRequest, request: Request,
         # the same reason `auth_link` does — and because a website-only account
         # has no DM for the path below to reach.
         log.info("WEB: panel login-approval challenge issued for %s", result["user_id"])
-        return LinkResponse(status="approval_required", challenge_id=challenge_id)
+        return LinkResponse(status="approval_required", challenge_id=challenge_id,
+                            approve_via="panel")
 
     sent = await _dm_login_approval(result["user_id"], challenge_id, client_ip, aud=AUD_WEB)
     if not sent:
@@ -7513,7 +7540,8 @@ async def web_auth_link(req: LinkRequest, request: Request,
                    "from your account page and approve it there.",
         )
     log.info("WEB: login-approval challenge issued for %s", result["username"])
-    return LinkResponse(status="approval_required", challenge_id=challenge_id)
+    return LinkResponse(status="approval_required", challenge_id=challenge_id,
+                        approve_via="discord")
 
 
 @app.post("/api/v1/web/auth/link/poll", response_model=LinkResponse)

@@ -287,14 +287,27 @@ def has_activity(account_id) -> bool:
     So the question is whether the record has anything IN it: progress, money
     that isn't the starting float, a rescue, an unlocked achievement level. A
     freshly created account has none of those and can be safely absorbed.
+
+    Two balances mean "nothing has happened yet", not one. `STARTING_BALANCE` was
+    0 until 2026-09-08, so a record created before that opens at 0 and one created
+    after opens at the float; comparing against the current float alone read every
+    legacy zero-balance account as a real history and refused every genuine link.
+    Both are untouched, and the day the float is retuned again the same is true of
+    the old value, which is why the ledger is consulted as well: it is the exact
+    signal the balance can only proxy for. An untouched record holds either no
+    entries at all (created before the ledger existed) or the single opening one,
+    so anything past that is money that actually moved, including money that moved
+    out and left the balance back on a number that looks like an opening balance.
     """
     import settings
     if not store.has_user(account_id):
         return False
     u = store.get_user(0, account_id)
+    bal = int(u.get("balance", 0) or 0)
     return bool(
         int(u.get("xp", 0) or 0) > 0
-        or int(u.get("balance", 0) or 0) != int(settings.STARTING_BALANCE)
+        or (bal != 0 and bal != int(settings.STARTING_BALANCE))
+        or len(u.get("tx") or []) > 1
         or int(u.get("rescues", 0) or 0) > 0
         or (u.get("unlocked_levels") or [])
     )

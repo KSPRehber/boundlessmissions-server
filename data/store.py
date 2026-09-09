@@ -334,15 +334,31 @@ def tx_detail(text: str, fallback: str = "", limit: int = 60) -> str:
     return cleaned
 
 
-def _default_user() -> UserData:
-    """Return a fresh user record with default values."""
+def _default_user(*, opening_balance: bool = True) -> UserData:
+    """Return a fresh user record with default values.
+
+    `opening_balance=False` is for the three callers that are not minting a new
+    player: the template `load()` lays under a stored document, the accumulator
+    the per-guild migration builds, and the detached record `get_user` returns
+    when the store failed to load. None of those is somebody arriving, and a
+    non-zero `STARTING_BALANCE` would credit all three.
+
+    The load template is the one that would actually corrupt something. A record
+    written before the ledger existed carries no `tx`, so the seeded opening
+    entry survives `merged.update(doc)` and claims a payment the player never
+    received, sitting next to a balance that does not account for it. The
+    detached one is quieter but no better: the documented contract there is that
+    reads degrade to zeros, and a balance of 1000 reported during a Firestore
+    outage is a number somebody could try to spend.
+    """
+    seed = int(settings.STARTING_BALANCE) if opening_balance else 0
     return {
         "user_id": "",
         "username": "",
         "language": "",
         "xp": 0,
         "level": 0,
-        "balance": settings.STARTING_BALANCE,
+        "balance": seed,
         "messages": 0,
         "last_xp_time": 0.0,
         "joined_at": "",
@@ -377,17 +393,18 @@ def _default_user() -> UserData:
         # lifetime per-category totals that survive entries rolling off the end.
         # See the "Transaction ledger" section below for why it lives here.
         #
-        # Seeded with the opening balance when there is one. `STARTING_BALANCE` is 0
-        # today, which makes this a no-op — but the ledger's whole claim is that its
-        # entries add up to the balance they explain, and money placed in a wallet by
-        # the schema rather than by a call would break that silently the day someone
-        # changed the setting. Cheaper to be right now than to debug later.
-        "tx": ([{"t": round(time.time(), 3), "a": int(settings.STARTING_BALANCE),
+        # Seeded with the opening balance when there is one, because the ledger's
+        # whole claim is that its entries add up to the balance they explain, and
+        # money placed in a wallet by the schema rather than by a call would break
+        # that silently. `STARTING_BALANCE` was 0 when this was written, so the
+        # seeding was dead code kept for the day the setting changed; that day was
+        # 2026-09-08, and this is the line that makes the new player's Finance tab
+        # say where their coins came from instead of showing 1000 and no history.
+        "tx": ([{"t": round(time.time(), 3), "a": seed,
                  "c": TX_REWARD, "d": "Opening balance", "p": ""}]
-               if settings.STARTING_BALANCE else []),
-        "tx_totals": ({TX_REWARD: {"in": int(settings.STARTING_BALANCE),
-                                   "out": 0, "n": 1}}
-                      if settings.STARTING_BALANCE else {}),
+               if seed else []),
+        "tx_totals": ({TX_REWARD: {"in": seed, "out": 0, "n": 1}}
+                      if seed else {}),
     }
 
 
@@ -578,7 +595,7 @@ class UserStore:
         total = 0
         try:
             for user_doc in _db.collection("users").stream():
-                merged = _default_user()
+                merged = _default_user(opening_balance=False)
                 merged.update(user_doc.to_dict() or {})
                 self._users[user_doc.id] = merged
                 total += 1
@@ -654,7 +671,7 @@ class UserStore:
                     uid = udoc.id
                     rec = acc.get(uid)
                     if rec is None:
-                        rec = _default_user()
+                        rec = _default_user(opening_balance=False)
                         rec.update({"user_id": uid, "balance": 0, "xp": 0, "messages": 0,
                                     "rescues": 0, "unlocked_levels": [], "last_xp_time": 0.0,
                                     "joined_at": "", "language": "", "username": ""})
@@ -810,7 +827,7 @@ class UserStore:
                 # Firestore over the top of somebody's real record. Hand back a
                 # detached default instead: reads degrade to zeros, mutations go
                 # nowhere, and nothing is remembered or written.
-                return _default_user()
+                return _default_user(opening_balance=False)
             self._users[key] = _default_user()
             # Only queue it if the wallet is actually loaded. `load()` merges into
             # `_users` rather than replacing it, so a record minted before a load

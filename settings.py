@@ -30,6 +30,15 @@ def _env_float(key: str, default: float) -> float:
         return default
 
 
+def _env_int(key: str, default: int) -> int:
+    """Read an int from .env, falling back to the default below if unset/blank."""
+    raw = _os.getenv(key, "")
+    try:
+        return int(raw) if raw.strip() else default
+    except ValueError:
+        return default
+
+
 def _env_id(key: str) -> int | None:
     """Read a Discord snowflake from .env; None when unset/blank/unparseable."""
     raw = _os.getenv(key, "")
@@ -220,8 +229,26 @@ LEVEL_UP_CHANNEL_ID: int | None = None
 
 # ── Economy ──────────────────────────────────────────────────────────────────
 
-# Starting balance for new users
-STARTING_BALANCE = 0
+# Starting balance for a brand-new player, overridable with STARTING_BALANCE in
+# .env. This is the one place in the economy that creates coins from nothing, so
+# two things about it are worth stating rather than leaving to be discovered.
+#
+# It is paid at record CREATION and nowhere else, so it reaches exactly the
+# players who arrive after it is set: everyone already in the store keeps the
+# balance they have. Raising it later is not a payout to the existing server.
+#
+# And a record is created by `store.get_user`, which `cogs/xp._scan_all_members`
+# calls every 15 minutes for every non-bot member of every guild the bot is in.
+# So a non-zero value here is seed money for Discord *membership*, not for
+# playing: a lurker who never installs the mod is paid the same as a player.
+# That is the deliberate reading of "starting coins" and not an accident. To pay
+# it on linking a game instead, the grant has to move out of the schema and onto
+# `_issue_ksp_link_token`.
+#
+# Negative is clamped to 0. `add_balance` clamps at zero anyway, so a negative
+# opening balance would be a wallet whose ledger disagreed with it from its
+# first entry, and the ledger's one claim is that it adds up to the balance.
+STARTING_BALANCE: int = max(0, _env_int("STARTING_BALANCE", 1000))
 CURRENCY_NAME = "KCoins"
 CURRENCY_SYMBOL = "<:KCoin:1510200111253291258>"
 

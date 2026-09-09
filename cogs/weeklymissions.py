@@ -105,7 +105,8 @@ def _generate_missions(week_key: str, count: int = 20) -> list[dict]:
     pick.sort(key=lambda x: x[2])
 
     missions = []
-    for i, (desc_en, desc_tr, diff, cat) in enumerate(pick[:count], 1):
+    for i, tpl in enumerate(pick[:count], 1):
+        desc_en, desc_tr, diff, cat, mtype, sit, body = tpl
         xp = diff * settings.WEEKLY_XP_PER_DIFFICULTY
         coins = diff * settings.WEEKLY_COINS_PER_DIFFICULTY
         fine = int(coins * settings.WEEKLY_FINE_PERCENT / 100)
@@ -118,6 +119,15 @@ def _generate_missions(week_key: str, count: int = 20) -> list[dict]:
             "xp": xp,
             "coins": coins,
             "fine": fine,
+            # Authored in data/mission_templates.py rather than inferred. These are
+            # what the submit gate enforces (SubmissionSession.ValidateVesselState on
+            # the client, _bot_mission_evidence_problem on the server), so writing
+            # them down beside the text is what makes "this mission is submittable"
+            # a property of the pool instead of a guess `_classify_missions` has to
+            # re-derive. That function leaves a mission carrying a mission_type alone.
+            "mission_type": mtype,
+            "required_situation": sit,
+            "required_body": body,
         })
     return missions
 
@@ -446,6 +456,35 @@ async def _handle_selection(interaction: discord.Interaction, week_key: str, gui
         raise
 
     link_selection_contract(guild_id, week_key, uid, mission["id"], c["contract_id"])
+
+    # Store what the submit gate will demand of this contract — the same three
+    # fields (plus the part/crew limits read out of the mission text) that
+    # api_server.select_mission writes on the KSP selection path.
+    #
+    # This path wrote none of them. A weekly mission taken from Discord therefore
+    # reached the submit gate with no required body and no required situation:
+    # `_bot_mission_evidence_problem` fell back to "active_vessel" with nothing to
+    # compare, and `SubmissionSession` had nothing to validate, so the mission was
+    # judged on the screenshot alone. The same mission taken from the mod was
+    # gated properly. Now that the requirement is authored per template
+    # (data/mission_templates.py) that split is the difference between the pool
+    # meaning something and not, so both entry points record it.
+    try:
+        from data import mission_constraints as mc
+        cdb.update_contract(
+            guild_id, c["contract_id"],
+            mission_type=mission.get("mission_type", "active_vessel"),
+            required_situation=mission.get("required_situation"),
+            required_body=mission.get("required_body"),
+            constraints=(mission.get("constraints")
+                         or mc.extract_heuristic(mission.get("desc_en", ""))),
+        )
+    except Exception as exc:  # noqa: BLE001 - the contract exists and is playable
+        # Deliberately not fatal, and deliberately not rolled back: a contract
+        # without its limits is a looser contract, not a broken one, and undoing a
+        # selection the player successfully made would cost them the mission.
+        log.warning("Could not store the mission gate on weekly contract %s: %s",
+                    c["contract_id"], exc)
 
     # Build embed for corp channel
     embed = discord.Embed(
@@ -806,6 +845,89 @@ class WeeklyMissions(commands.Cog, name="WeeklyMissions"):
 
         await channel.send(embed=embed, view=view)
         await interaction.response.send_message("✅ Custom mission posted to mission-control.", ephemeral=True)
+
+    @app_commands.command(
+        name="regenmissions",
+        description="Rebuild this week's mission board from the current mission pool (Admin only)")
+    @app_commands.default_permissions(administrator=True)
+    async def regenmissions(self, interaction: discord.Interaction):
+        """Re-draw this week's board from `data/mission_templates.TEMPLATES`.
+
+        `_ensure_embed` generates a week's missions once and then only ever edits
+        the message, so a change to the pool does not reach a board that is already
+        up — it waits for Monday. That is right for the ordinary case and wrong for
+        the one this exists for: a mission the submission system cannot accept is a
+        bot-issued contract with a due date and a fine on it, and leaving it on the
+        board for the rest of the week is not a neutral choice.
+
+        Selections are deliberately **not** cleared. A claim is the only thing
+        standing between a weekly mission and being paid twice (see
+        `_selection_ref`), and a contract already minted carries its own copy of the
+        mission text, so it is unaffected by the board changing under it. The cost
+        is that a player who already claimed, say, mission #7 cannot claim the new
+        #7 — which is the conservative direction: it loses one selection rather than
+        minting one unearned payout.
+
+        Guild-scoped, like the gate that guards it: it rebuilds the board in the
+        guild it is run in and leaves every other guild's alone.
+        """
+        from cogs.perms import is_admin_user
+        if not is_admin_user(interaction):
+            await interaction.response.send_message("❌ Admin only.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        gid = interaction.guild_id
+        channel = guild_config.resolve_channel(interaction.client, gid, "weekly_missions")
+        if channel is None:
+            await interaction.followup.send(
+                "❌ No weekly-missions channel is configured for this server. "
+                "Set one with `/admin setchannel`.", ephemeral=True)
+            return
+
+        wk = _week_key()
+        missions = _generate_missions(wk, settings.WEEKLY_MISSIONS_COUNT)
+        _, old_msg_id = _load_missions(gid, wk)
+
+        embed = _build_embed(gid, missions, wk)
+        view = MissionSelectView(wk, gid, missions)
+
+        # Edit the board in place where it still exists: a fresh post would re-ping
+        # the notification role for a week that was already announced.
+        msg = None
+        if old_msg_id:
+            try:
+                msg = await channel.fetch_message(old_msg_id)
+                await msg.edit(embed=embed, view=view)
+            except discord.NotFound:
+                msg = None
+        if msg is None:
+            msg = await channel.send(embed=embed, view=view)
+
+        _save_missions(gid, wk, missions, msg.id)
+
+        # The per-week classification cache is now stale for this week. Every
+        # template authors its own mission_type, so nothing reads it for these
+        # missions any more, but a stale entry left behind would be read by any
+        # guild still holding pre-authoring missions for the same week.
+        try:
+            _db.collection("mission_classifications").document(wk).delete()
+        except Exception as exc:  # noqa: BLE001 - the board is already rebuilt
+            log.warning("Could not clear the classification cache for %s: %s", wk, exc)
+
+        # Let the 30-minute loop know this guild is current for this week, so it
+        # does not immediately reload the row we just wrote.
+        self._ensured[gid] = wk
+        self._missions = missions
+        self._current_week = wk
+
+        log.info("Weekly missions regenerated for week %s (guild %s) by %s",
+                 wk, gid, interaction.user.id)
+        await interaction.followup.send(
+            f"✅ Rebuilt the board for {wk} with {len(missions)} missions from the "
+            f"current pool.\nSelections already made this week were kept, so a "
+            f"player who claimed a mission number cannot claim the new mission "
+            f"under that number.", ephemeral=True)
 
 
 async def setup(bot: commands.Bot):

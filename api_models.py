@@ -31,6 +31,15 @@ class LinkResponse(BaseModel):
     guild_id: str = ""
     user_id: str = ""
     challenge_id: Optional[str] = None
+    # WHERE an "approval_required" challenge is answered: "discord" (the DM the bot
+    # just sent) or "panel" (the account page on the website that minted the code —
+    # which is also the only route an account with no Discord ever takes). The client
+    # cannot derive this: both routes return the same status and the same
+    # challenge_id, so without it the waiting screen has to guess, and it guessed
+    # Discord, telling a website player to check DMs they do not have. Empty means an
+    # older server that never sent it, and a client reading it must then name both
+    # surfaces rather than pick one.
+    approve_via: str = ""
 
 # ── Website accounts (Google / email sign-in) ────────────────────────────────
 

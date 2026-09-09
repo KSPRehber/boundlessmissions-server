@@ -246,8 +246,9 @@ class VersionCheckResponse(BaseModel):
     #             never block, regardless of up_to_date).
     # up_to_date: "may I proceed" — NOT "am I on the newest build". True when the
     #             client's hash matches the published latest, when nothing has been
-    #             published yet (fail-open), AND when the build is inside its grace
-    #             window. Every client already in the wild treats False as "raise the
+    #             published yet (fail-open), when the build is out of date with no
+    #             mandatory release above it, AND when it is inside its grace window.
+    #             Every client already in the wild treats False as "raise the
     #             blocking window", so this is the field that has to carry the gate's
     #             decision; the two literal questions are answered below instead.
     #             See data/mod_version.check().
@@ -258,7 +259,9 @@ class VersionCheckResponse(BaseModel):
     #                   being told to update without being refused.
     # grace_until:      ISO8601 instant this build stops being accepted, set only
     #                   while it is inside the window. Null means there is nothing
-    #                   to count down: either up to date, or already refused.
+    #                   to count down — up to date, already refused, or (the ordinary
+    #                   case) behind with no mandatory release above it, which is
+    #                   accepted for as long as that stays true.
     on_latest: bool = True
     update_available: bool = False
     grace_until: Optional[str] = None

@@ -1020,10 +1020,12 @@ def enforce_mod_version(x_mod_hash: str) -> None:
     talk to this server.
 
     Fail-open to match /version/check: a no-op when the gate is disabled or nothing
-    has been published yet. A build inside its grace window is let through — it is
-    out of date, and being out of date for a few days while CKAN catches up is not
-    grounds for refusing the game. Anything else raises 426 `update_required`, which
-    the client turns into its blocking "update required" window.
+    has been published yet. A build we published with no mandatory release above it
+    is let through indefinitely, and one inside its grace window is let through too —
+    being out of date is not by itself grounds for refusing someone their game, and
+    being out of date for a few days while CKAN catches up is not grounds even when
+    the release above it IS mandatory. Anything else raises 426 `update_required`,
+    which the client turns into its blocking "update required" window.
     """
     if not cfg.KSP_VERSION_CHECK_ENABLED:
         return
@@ -1047,7 +1049,7 @@ def enforce_mod_version(x_mod_hash: str) -> None:
     # A client told at startup that it may proceed and then 426'd by every call it
     # makes does not look out of date, it looks broken, so the two must not drift.
     verdict = mver.acceptance(x_mod_hash, cfg_doc)
-    if verdict["state"] in ("current", "grace"):
+    if verdict["state"] in ("current", "optional", "grace"):
         return
     raise HTTPException(status_code=426, detail={
         "code": "update_required",
@@ -11122,12 +11124,17 @@ async def admin_publish_version(
     download_url: str = Form(""),
     set_latest: bool = Form(True),
     sha256: str = Form(""),
+    mandatory: Optional[bool] = Form(None),
     dll: UploadFile | None = File(None),
     user: dict = Depends(get_owner),
 ):
     """Publish a mod version from the website — the web twin of /publishversion.
     Upload the DLL itself (preferred: enables challenge-response attestation and
-    auto-computes the hash) or provide a bare sha256."""
+    auto-computes the hash) or provide a bare sha256.
+
+    `mandatory` decides whether the builds below this one are eventually refused;
+    omitted, it leaves an existing label's answer alone (see `mver.publish_version`)
+    and registers a new one as not mandatory."""
     if not version.strip():
         raise HTTPException(status_code=422, detail="A version label is required.")
     dll_bytes = None
@@ -11152,14 +11159,44 @@ async def admin_publish_version(
 
     record = await asyncio.to_thread(
         mver.publish_version, version, digest, download_url, set_latest,
-        f"{user['username']} (web console)", dll_bytes)
+        f"{user['username']} (web console)", dll_bytes, mandatory)
     # The config document is memoised for 60 s; a publish must be visible now,
     # not a minute from now, because the version poke goes out on the next line.
     mver.invalidate()
     if set_latest or record.get("latest_version") == version.strip():
         broadcast_version_update()
     _admin_audit(user, "publish-version",
-                 f"{version} sha256={digest[:12]} latest={set_latest} dll={'yes' if dll_bytes else 'no'}")
+                 f"{version} sha256={digest[:12]} latest={set_latest} "
+                 f"mandatory={mandatory} dll={'yes' if dll_bytes else 'no'}")
+    return {"success": True, "config": record}
+
+
+class ModVersionMandatoryRequest(BaseModel):
+    version: str
+    mandatory: bool
+
+
+@app.post("/api/v1/web/admin/modversion/mandatory")
+async def admin_modversion_mandatory(req: ModVersionMandatoryRequest,
+                                     user: dict = Depends(get_owner)):
+    """Force (or stop forcing) an already-published version.
+
+    Its own endpoint rather than a re-publish because the two are asked at different
+    times — see `mver.set_mandatory`. Live clients are poked afterwards for the same
+    reason a publish pokes them: this is the moment a running player's build starts
+    counting down, and finding that out on their next restart is finding out late.
+    """
+    try:
+        record = await asyncio.to_thread(
+            mver.set_mandatory, req.version, req.mandatory,
+            f"{user['username']} (web console)")
+    except KeyError:
+        raise HTTPException(status_code=404,
+                            detail=f"No published version labelled {req.version!r}.")
+    mver.invalidate()
+    broadcast_version_update()
+    _admin_audit(user, "modversion-mandatory",
+                 f"{req.version} mandatory={req.mandatory}")
     return {"success": True, "config": record}
 
 

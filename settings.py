@@ -510,6 +510,12 @@ MARKETPLACE_UPLOAD_REWARD_COOLDOWN = 24 * 60 * 60
 # and let the score be nothing but a display.
 # ── Mod version gate: the grace window ───────────────────────────────────────
 #
+# Read this second. The window only ever runs for a build that a MANDATORY release
+# outranks — publishing a new version no longer starts a clock on the old one by
+# itself, it just tells its holders an update exists (see data/mod_version.py's
+# `acceptance`). So this number is not "how long may a player be behind"; it is
+# "how long do they get once we have decided they may not stay where they are".
+#
 # The gate is what forces a player onto the current build, and CKAN is what we
 # recommend they update *with*. Those two facts don't compose on their own: NetKAN
 # indexes a release on its own schedule and the player still has to open CKAN, so
@@ -518,7 +524,8 @@ MARKETPLACE_UPLOAD_REWARD_COOLDOWN = 24 * 60 * 60
 # makes a tool we don't run a hard dependency of every login.
 #
 # So a build that was the published latest until recently is still accepted — told
-# it is out of date, never refused. The window is measured from when the build
+# it is out of date, never refused; and one with nothing mandatory above it is
+# accepted for as long as that holds, with no clock at all. The window is measured from when the build
 # STOPPED being latest (`superseded_at`), not from when it was published: that is the
 # moment the player's copy became stale, it chains correctly across a rapid A→B→C
 # (A ages out on B's clock, not C's), and it cannot be gamed by an old build simply
@@ -527,7 +534,8 @@ MARKETPLACE_UPLOAD_REWARD_COOLDOWN = 24 * 60 * 60
 # Grace is only ever extended to a hash we ourselves published. An unknown hash — a
 # modified DLL, which is the thing the gate exists for — is refused exactly as before.
 #
-# 0 disables the window and restores the strict latest-hash-only gate.
+# 0 disables the window, so a build a mandatory release outranks is refused at once
+# (an unforced build is still accepted — the flag decides that, not this number).
 MOD_VERSION_GRACE_DAYS = 7
 
 MARKETPLACE_AUTO_DELIST_SCORE = -20

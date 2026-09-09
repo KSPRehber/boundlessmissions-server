@@ -10,6 +10,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from discord.ui import View, Select, Button, Modal, TextInput
+import settings
 from config import cfg
 from cogs import perms
 from api_auth import generate_link_code
@@ -644,7 +645,8 @@ class Admin(commands.Cog, name="Admin"):
         download_url="Where players download this version",
         dll="Upload GeneKerman.dll to auto-compute its SHA256 (preferred)",
         sha256="Paste the DLL's SHA256 instead of uploading (optional)",
-        set_latest="Make this the required latest version (default: yes)",
+        set_latest="Make this the newest published version (default: yes)",
+        mandatory="Force everyone below this build off it after the grace window (default: no)",
     )
     @is_owner()
     async def publishversion(
@@ -655,6 +657,7 @@ class Admin(commands.Cog, name="Admin"):
         dll: discord.Attachment | None = None,
         sha256: str | None = None,
         set_latest: bool = True,
+        mandatory: bool | None = None,
     ) -> None:
         await interaction.response.defer(ephemeral=True)
 
@@ -678,7 +681,7 @@ class Admin(commands.Cog, name="Admin"):
         try:
             rec = await asyncio.to_thread(
                 mver.publish_version, version, digest, download_url, set_latest,
-                str(interaction.user), dll_bytes
+                str(interaction.user), dll_bytes, mandatory
             )
         except ValueError as exc:
             # publish_version now enforces the https rule the web console always had.
@@ -695,13 +698,26 @@ class Admin(commands.Cog, name="Admin"):
             except Exception as exc:
                 log.warning("Could not broadcast version update: %s", exc)
 
+        # Quoted back to the owner, so it must be the number the gate will actually
+        # use: the window is runtime-mutable from the console's Controls tab, and
+        # `mver._grace_days` reads an unusable value as 0 rather than raising. The
+        # embed must not be the one place that does.
+        try:
+            grace_days = int(float(settings.MOD_VERSION_GRACE_DAYS))
+        except (TypeError, ValueError):
+            grace_days = 0
+
         embed = discord.Embed(
             title="✅ Mod version published",
             description=(
                 f"**Version:** `{version}`\n"
                 f"**SHA256:** `{digest}`\n"
                 f"**Download:** {download_url}\n"
-                f"**Latest now:** `{rec.get('latest_version')}`"
+                f"**Latest now:** `{rec.get('latest_version')}`\n"
+                + ("**Mandatory:** yes — builds below this one stop working "
+                   f"{grace_days} days after they were superseded."
+                   if rec.get("versions", {}).get(version.strip(), {}).get("mandatory") else
+                   "**Mandatory:** no — older builds keep working, with an update notice.")
                 + ("\n📡 Live clients poked to re-check." if broadcast else "")
                 + ("\n🛡️ Attestation enabled (pristine DLL stored)."
                    if rec.get("versions", {}).get(version.strip(), {}).get("has_dll") else
